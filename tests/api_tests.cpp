@@ -4,8 +4,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -382,15 +384,662 @@ static void test_heap_slot_recycling() {
     printf("  PASS (first recycled slot: %u)\n", first_reuse);
 }
 
+static void sleep_ms(uint32_t ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+#endif
+}
+
+// --- Test 6: Semaphore signal/wait + deferred completion callback ------------------------
+static void test_semaphore_and_callback() {
+    printf("--- Test: semaphores ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    Handle<Semaphore> sem = create_semaphore(d, 0);
+    CHECK(sem.h != 0, "create_semaphore failed");
+
+    GpuPtr src = malloc(d, 64, Memory::Default);
+    GpuPtr dst = malloc(d, 64, Memory::Default);
+    CHECK(src != 0 && dst != 0, "malloc failed");
+    auto* src_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, src));
+    src_host[0] = 0x12345678u;
+    src_host[1] = 0x9ABCDEF0u;
+
+    Queue q = get_queue(d);
+    CHECK(q != nullptr, "get_queue failed");
+
+    // Register the completion callback before the submit.
+    bool callback_fired = false;
+    queue_on_submitted_work_completed(q,
+                                      [](void* userdata) {
+                                          *static_cast<bool*>(userdata) = true;
+                                      },
+                                      &callback_fired);
+
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "queue_start_command_recording failed");
+    cmd_memcpy(cmd, dst, src, 64);
+    cmd_finalize(cmd);
+
+    SemaphoreInfo signal{.semaphore = sem, .value = 1, .stage = StageFlags::Transfer};
+    queue_submit(q, {&cmd, 1}, {}, Span<const SemaphoreInfo>(&signal, 1));
+
+    // Blocking host wait on the signaled value; returning exercises the signal path.
+    wait_semaphore(d, sem, 1);
+
+    // Poll until the deferred completion callback fires.
+    for (int i = 0; i < 200 && !callback_fired; ++i) {
+        queue_process_events(q);
+        sleep_ms(10);
+    }
+    CHECK(callback_fired, "queue_on_submitted_work_completed callback never fired");
+
+    auto* dst_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst));
+    CHECK(dst_host[0] == 0x12345678u && dst_host[1] == 0x9ABCDEF0u,
+          "memcpy result wrong after semaphore wait");
+
+    free(d, sem);
+    free(d, src);
+    free(d, dst);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 7: Indirect dispatch -------------------------------------------------------------
+static void test_dispatch_indirect() {
+    printf("--- Test: dispatch indirect ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("memcpy_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource shader_src{
+        .source      = spirv,
+        .entry_point = "compute_main"_sv,
+    };
+    Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+    CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+    if (pipeline.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    constexpr uint32_t kCount = 1024;
+    GpuPtr src_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr dst_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr args_buf = malloc(d, 32, Memory::Default); // CopyData struct
+    GpuPtr groups_buf = malloc(d, 3 * sizeof(uint32_t), Memory::Default);
+    CHECK(src_buf != 0 && dst_buf != 0 && args_buf != 0 && groups_buf != 0, "malloc failed");
+
+    auto* src_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, src_buf));
+    for (uint32_t i = 0; i < kCount; ++i) { src_host[i] = i; }
+
+    struct CopyData {
+        uint64_t dst;
+        uint64_t src;
+        uint32_t count;
+        uint32_t pad;
+    };
+    auto* args_host = reinterpret_cast<CopyData*>(get_host_pointer(d, args_buf));
+    args_host->dst   = dst_buf;
+    args_host->src   = src_buf;
+    args_host->count = kCount;
+    args_host->pad   = 0;
+
+    auto* groups = reinterpret_cast<uint32_t*>(get_host_pointer(d, groups_buf));
+    groups[0] = (kCount + 63) / 64;
+    groups[1] = 1;
+    groups[2] = 1;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_dispatch_indirect(cmd, args_buf, groups_buf);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* dst_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst_buf));
+    bool match = true;
+    for (uint32_t i = 0; i < kCount; ++i) {
+        uint32_t expected = i * 2 + 1;
+        if (dst_host[i] != expected) {
+            printf("  Mismatch at %u: expected %u, got %u\n", i, expected, dst_host[i]);
+            match = false;
+            break;
+        }
+    }
+    CHECK(match, "indirect dispatch dst[i] = src[i]*2+1 verification failed");
+
+    free(d, src_buf);
+    free(d, dst_buf);
+    free(d, args_buf);
+    free(d, groups_buf);
+    free(d, pipeline);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 8: Specialization constants ------------------------------------------------------
+static void test_spec_constants() {
+    printf("--- Test: spec constants ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("spec_mul_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load spec_mul_kernel.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource shader_src{
+        .source      = spirv,
+        .entry_point = "compute_main"_sv,
+    };
+
+    // Override kMul (spec constant id 0, default 1) with 5.
+    SpecializationConstant sc{
+        .constant_id = 0,
+        .int_val     = 5,
+        .type        = SpecializationConstantType::UInt32,
+    };
+    Handle<Pipeline> pipeline = create_compute_pipeline(
+        d, shader_src, Span<const SpecializationConstant>(&sc, 1));
+    CHECK(pipeline.h != 0, "create_compute_pipeline (spec constants) failed");
+    if (pipeline.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    constexpr uint32_t kCount = 256;
+    GpuPtr src_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr dst_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr args_buf = malloc(d, 32, Memory::Default);
+    CHECK(src_buf != 0 && dst_buf != 0 && args_buf != 0, "malloc failed");
+
+    auto* src_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, src_buf));
+    for (uint32_t i = 0; i < kCount; ++i) { src_host[i] = i + 1; }
+
+    struct CopyData {
+        uint64_t dst;
+        uint64_t src;
+        uint32_t count;
+        uint32_t pad;
+    };
+    auto* args_host = reinterpret_cast<CopyData*>(get_host_pointer(d, args_buf));
+    args_host->dst   = dst_buf;
+    args_host->src   = src_buf;
+    args_host->count = kCount;
+    args_host->pad   = 0;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_set_pipeline(cmd, pipeline);
+    Dimension3D groups{(kCount + 63) / 64, 1, 1};
+    cmd_dispatch(cmd, args_buf, groups);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* dst_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst_buf));
+    bool match = true;
+    for (uint32_t i = 0; i < kCount; ++i) {
+        uint32_t expected = (i + 1) * 5; // kMul overridden 1 -> 5
+        if (dst_host[i] != expected) {
+            printf("  Mismatch at %u: expected %u, got %u\n", i, expected, dst_host[i]);
+            match = false;
+            break;
+        }
+    }
+    CHECK(match, "spec constant kMul=5 not applied (shader default is 1)");
+
+    free(d, src_buf);
+    free(d, dst_buf);
+    free(d, args_buf);
+    free(d, pipeline);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 9: Headless indirect draws (single + multi) --------------------------------------
+static void test_draw_indirect() {
+    printf("--- Test: draw indirect ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    constexpr uint32_t kSize    = 64; // 64x64 headless color target
+    constexpr uint32_t kTexBytes = kSize * kSize * 4;
+
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::BGRA8Unorm,
+        .usage      = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> color_tex = create_texture(d, tex_desc);
+    CHECK(color_tex.h != 0, "create_texture (color target) failed");
+    if (color_tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("offscreen_triangle.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        free(d, color_tex);
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vertex_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fragment_src{.source = spirv, .entry_point = "fragment_main"_sv};
+    ColorTarget color_target{.format = Format::BGRA8Unorm};
+    RasterDesc raster_desc{
+        .color_targets = Span<const ColorTarget>(&color_target, 1),
+    };
+    Handle<Pipeline> pipeline = create_graphics_pipeline(d, vertex_src, fragment_src, raster_desc);
+    CHECK(pipeline.h != 0, "create_graphics_pipeline failed");
+    if (pipeline.h == 0) {
+        free(d, color_tex);
+        destroy_device(d);
+        return;
+    }
+
+    // Index buffer + indirect args + draw-count buffer
+    GpuPtr idx_buf   = malloc(d, sizeof(uint16_t) * 3, Memory::Default);
+    GpuPtr args_buf  = malloc(d, sizeof(DrawIndexedIndirectGpuArgs), Memory::Default);
+    GpuPtr count_buf = malloc(d, sizeof(uint32_t), Memory::Default);
+    CHECK(idx_buf != 0 && args_buf != 0 && count_buf != 0, "malloc failed");
+    auto* idx_host = reinterpret_cast<uint16_t*>(get_host_pointer(d, idx_buf));
+    idx_host[0] = 0;
+    idx_host[1] = 1;
+    idx_host[2] = 2;
+    auto* args_host = reinterpret_cast<DrawIndexedIndirectGpuArgs*>(get_host_pointer(d, args_buf));
+    *args_host = DrawIndexedIndirectGpuArgs{
+        .index_count    = 3,
+        .instance_count = 1,
+        .first_index    = 0,
+        .vertex_offset  = 0,
+        .first_instance = 0,
+    };
+    *reinterpret_cast<uint32_t*>(get_host_pointer(d, count_buf)) = 1;
+
+    Queue q = get_queue(d);
+    GpuPtr readback_a = malloc(d, kTexBytes, Memory::Readback);
+    GpuPtr readback_b = malloc(d, kTexBytes, Memory::Readback);
+    CHECK(readback_a != 0 && readback_b != 0, "readback malloc failed");
+
+    RenderAttachment color_att{
+        .texture     = color_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{0, 0, 0, 255},
+    };
+    RenderPassDesc pass_desc{
+        .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+        .render_area       = Rect2D{.width = kSize, .height = kSize},
+    };
+    BufferTextureCopyInfo copy_info{.image_extent = {kSize, kSize, 1}};
+
+    // Pass A: single indirect indexed draw
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw_indexed_instanced_indirect(cmd, DrawIndexedIndirectInfo{
+        .vertexDataGpu   = 0,
+        .fragmentDataGpu = 0,
+        .indicesGpu      = idx_buf,
+        .argsGpu         = args_buf,
+        .type            = IndexType::UInt16,
+    });
+    cmd_end_render_pass(cmd);
+    cmd_barrier(cmd, StageFlags::RasterColorOut, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, color_tex, readback_a, copy_info);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb_a = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback_a));
+    // BGRA bytes: [2]=R, [1]=G
+    CHECK(rb_a[(32 * kSize + 32) * 4 + 2] == 255 && rb_a[(32 * kSize + 32) * 4 + 1] == 0,
+          "pass A: center pixel not red");
+    CHECK(rb_a[2] == 0 && rb_a[1] == 0 && rb_a[0] == 0, "pass A: corner pixel not black");
+
+    // Pass B: multi indirect indexed draw (drawCountGpu = 1, maxDraws = 1)
+    cmd = queue_start_command_recording(q);
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw_indexed_instanced_indirect_multi(cmd, MultiDrawIndirectInfo{
+        .vertexDataGpu = 0,
+        .pixelDataGpu  = 0,
+        .indicesGpu    = idx_buf,
+        .argsGpu       = args_buf,
+        .drawCountGpu  = count_buf,
+        .maxDraws      = 1,
+        .type          = IndexType::UInt16,
+    });
+    cmd_end_render_pass(cmd);
+    cmd_barrier(cmd, StageFlags::RasterColorOut, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, color_tex, readback_b, copy_info);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb_b = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback_b));
+    CHECK(rb_b[(32 * kSize + 32) * 4 + 2] == 255 && rb_b[(32 * kSize + 32) * 4 + 1] == 0,
+          "pass B: center pixel not red");
+    CHECK(rb_b[2] == 0 && rb_b[1] == 0 && rb_b[0] == 0, "pass B: corner pixel not black");
+
+    free(d, readback_a);
+    free(d, readback_b);
+    free(d, idx_buf);
+    free(d, args_buf);
+    free(d, count_buf);
+    free(d, pipeline);
+    free(d, color_tex);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 10: get_texture_size_align + placed texture creation ----------------------------
+static void test_texture_size_align_placement() {
+    printf("--- Test: size/align placement ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    constexpr uint32_t kSize  = 128;
+    constexpr uint32_t kBytes = kSize * kSize * 4;
+
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
+    };
+    TextureSizeAlign sa = get_texture_size_align(d, tex_desc);
+    CHECK(sa.size > 0, "get_texture_size_align returned size 0");
+    if (sa.size == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    GpuPtr mem = malloc(d, sa.size, sa.align, Memory::Gpu);
+    CHECK(mem != 0, "malloc (placed) failed");
+    Handle<Texture> tex = create_texture(d, tex_desc, mem);
+    CHECK(tex.h != 0, "create_texture (placed) failed");
+    if (tex.h == 0) {
+        free(d, mem);
+        destroy_device(d);
+        return;
+    }
+
+    // Gradient upload + readback (same sequence as test_texture_copy)
+    GpuPtr staging  = malloc(d, kBytes, Memory::Default);
+    GpuPtr readback = malloc(d, kBytes, Memory::Readback);
+    CHECK(staging != 0 && readback != 0, "malloc failed");
+    auto* st = reinterpret_cast<uint8_t*>(get_host_pointer(d, staging));
+    for (uint32_t y = 0; y < kSize; ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            uint32_t idx = (y * kSize + x) * 4;
+            st[idx + 0] = static_cast<uint8_t>(x);
+            st[idx + 1] = static_cast<uint8_t>(y);
+            st[idx + 2] = static_cast<uint8_t>(x ^ y);
+            st[idx + 3] = 0xFF;
+        }
+    }
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_copy_to_texture(cmd, staging, tex, BufferTextureCopyInfo{.image_extent = {kSize, kSize, 1}});
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, tex, readback, BufferTextureCopyInfo{.image_extent = {kSize, kSize, 1}});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    CHECK(memcmp(rb, st, kBytes) == 0, "placed texture upload/readback mismatch");
+
+    free(d, tex);
+    free(d, mem);
+    free(d, staging);
+    free(d, readback);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 11: Mip-chain and cube subresource copies ---------------------------------------
+static void test_mip_and_cube() {
+    printf("--- Test: mip + cube ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    // Mip chain: 8x8, 4 mips
+    TextureDesc mip_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {8, 8, 1},
+        .mip_count  = 4,
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
+    };
+    Handle<Texture> mip_tex = create_texture(d, mip_desc);
+    CHECK(mip_tex.h != 0, "create_texture (mips) failed");
+    if (mip_tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    GpuPtr mip0_src = malloc(d, 8 * 8 * 4, Memory::Default);
+    GpuPtr mip2_src = malloc(d, 2 * 2 * 4, Memory::Default);
+    GpuPtr mip2_rb  = malloc(d, 2 * 2 * 4, Memory::Readback);
+    CHECK(mip0_src != 0 && mip2_src != 0 && mip2_rb != 0, "malloc failed");
+    auto* mip0_host = reinterpret_cast<uint8_t*>(get_host_pointer(d, mip0_src));
+    for (int p = 0; p < 8 * 8; ++p) {
+        mip0_host[p * 4 + 0] = 10;
+        mip0_host[p * 4 + 1] = 20;
+        mip0_host[p * 4 + 2] = 30;
+        mip0_host[p * 4 + 3] = 255;
+    }
+    auto* mip2_host = reinterpret_cast<uint8_t*>(get_host_pointer(d, mip2_src));
+    for (int p = 0; p < 2 * 2; ++p) {
+        mip2_host[p * 4 + 0] = 200;
+        mip2_host[p * 4 + 1] = 100;
+        mip2_host[p * 4 + 2] = 50;
+        mip2_host[p * 4 + 3] = 255;
+    }
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_copy_to_texture(cmd, mip0_src, mip_tex, BufferTextureCopyInfo{.image_extent = {8, 8, 1}});
+    cmd_copy_to_texture(cmd, mip2_src, mip_tex,
+                        BufferTextureCopyInfo{.image_extent = {2, 2, 1}, .base_mip = 2});
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, mip_tex, mip2_rb,
+                          BufferTextureCopyInfo{.image_extent = {2, 2, 1}, .base_mip = 2});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* mip2_out = reinterpret_cast<uint8_t*>(get_host_pointer(d, mip2_rb));
+    bool mip_ok = true;
+    for (int p = 0; p < 2 * 2; ++p) {
+        if (mip2_out[p * 4 + 0] != 200 || mip2_out[p * 4 + 1] != 100 ||
+            mip2_out[p * 4 + 2] != 50 || mip2_out[p * 4 + 3] != 255) {
+            mip_ok = false;
+        }
+    }
+    CHECK(mip_ok, "mip 2 subresource readback mismatch");
+
+    free(d, mip0_src);
+    free(d, mip2_src);
+    free(d, mip2_rb);
+    free(d, mip_tex);
+
+    // Cube: 16x16, 6 faces (array_count 1 -> backend creates 6 layers)
+    TextureDesc cube_desc{
+        .type       = TextureType::TexCube,
+        .dimensions = {16, 16, 1},
+        .array_count = 1,
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
+    };
+    Handle<Texture> cube_tex = create_texture(d, cube_desc);
+    CHECK(cube_tex.h != 0, "create_texture (cube) failed");
+    if (cube_tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    GpuPtr face_src = malloc(d, 16 * 16 * 4, Memory::Default);
+    GpuPtr face_rb  = malloc(d, 16 * 16 * 4, Memory::Readback);
+    CHECK(face_src != 0 && face_rb != 0, "malloc failed");
+    auto* face_host = reinterpret_cast<uint8_t*>(get_host_pointer(d, face_src));
+    for (int p = 0; p < 16 * 16; ++p) {
+        face_host[p * 4 + 0] = 60;
+        face_host[p * 4 + 1] = 70;
+        face_host[p * 4 + 2] = 80;
+        face_host[p * 4 + 3] = 255;
+    }
+
+    cmd = queue_start_command_recording(q);
+    cmd_copy_to_texture(cmd, face_src, cube_tex,
+                        BufferTextureCopyInfo{.image_extent = {16, 16, 1}, .base_layer = 3});
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, cube_tex, face_rb,
+                          BufferTextureCopyInfo{.image_extent = {16, 16, 1}, .base_layer = 3});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* face_out = reinterpret_cast<uint8_t*>(get_host_pointer(d, face_rb));
+    bool cube_ok = true;
+    for (int p = 0; p < 16 * 16; ++p) {
+        if (face_out[p * 4 + 0] != 60 || face_out[p * 4 + 1] != 70 ||
+            face_out[p * 4 + 2] != 80 || face_out[p * 4 + 3] != 255) {
+            cube_ok = false;
+        }
+    }
+    CHECK(cube_ok, "cube face 3 subresource readback mismatch");
+
+    free(d, face_src);
+    free(d, face_rb);
+    free(d, cube_tex);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 12: BC1 block-compressed copy roundtrip -----------------------------------------
+static void test_bc1_roundtrip() {
+    printf("--- Test: BC1 roundtrip ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {64, 64, 1},
+        .format     = Format::BC1RGBAUnorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
+    };
+    Handle<Texture> tex = create_texture(d, tex_desc);
+    if (tex.h == 0) {
+        printf("  SKIP (BC1 unsupported)\n");
+        destroy_device(d);
+        return;
+    }
+
+    constexpr uint32_t kBytes = 2048; // 16x16 blocks x 8 bytes/block
+    GpuPtr staging  = malloc(d, kBytes, Memory::Default);
+    GpuPtr readback = malloc(d, kBytes, Memory::Readback);
+    CHECK(staging != 0 && readback != 0, "malloc failed");
+    auto* st = reinterpret_cast<uint8_t*>(get_host_pointer(d, staging));
+    for (uint32_t i = 0; i < kBytes; ++i) { st[i] = static_cast<uint8_t>(i * 7 + 3); }
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_copy_to_texture(cmd, staging, tex, BufferTextureCopyInfo{.image_extent = {64, 64, 1}});
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, tex, readback, BufferTextureCopyInfo{.image_extent = {64, 64, 1}});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    CHECK(memcmp(rb, st, kBytes) == 0, "BC1 copy roundtrip mismatch");
+
+    free(d, tex);
+    free(d, staging);
+    free(d, readback);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
+
+    // CI runners have no Vulkan driver; allow an explicit opt-in skip.
+    if (std::getenv("IZANAGI_TESTS_ALLOW_SKIP")) {
+        DeviceDesc probe_desc{.log_callback = test_log_callback, .log_level = LogLevel::Error};
+        Device probe = create_device(probe_desc);
+        if (!probe) {
+            printf("SKIPPED: no Vulkan device available\n");
+            return 0;
+        }
+        destroy_device(probe);
+    }
 
     test_device_create_destroy();
     test_malloc_host_pointer();
     test_compute();
     test_texture_copy();
     test_heap_slot_recycling();
+    test_semaphore_and_callback();
+    test_dispatch_indirect();
+    test_spec_constants();
+    test_draw_indirect();
+    test_texture_size_align_placement();
+    test_mip_and_cube();
+    test_bc1_roundtrip();
 
     printf("\n=================\n");
     if (g_failures == 0) {

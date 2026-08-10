@@ -114,10 +114,21 @@ if(IZANAGI_BUILD_TESTS)
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/memcpy_kernel.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/memcpy_kernel.spv
     )
+    add_slang_shader(izanagi_test_shaders2
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/spec_mul_kernel.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/spec_mul_kernel.spv
+    )
+    add_slang_shader(izanagi_test_shaders3
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/offscreen_triangle.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/offscreen_triangle.spv
+    )
 
     add_executable(izanagi_tests tests/api_tests.cpp)
     target_link_libraries(izanagi_tests PRIVATE izanagi)
-    add_dependencies(izanagi_tests izanagi_test_shaders)
+    add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3)
+
+    enable_testing()
+    add_test(NAME api_tests COMMAND izanagi_tests)
 endif()
 
 # --- Examples ------------------------------------------------------------------

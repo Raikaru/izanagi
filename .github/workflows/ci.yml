@@ -1,0 +1,19 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build --preset dev-windows-msvc
+      - name: Build
+        run: cmake --build build --config Debug
+      - name: Test
+        env:
+          IZANAGI_TESTS_ALLOW_SKIP: 1
+        run: ctest --test-dir build -C Debug --output-on-failure

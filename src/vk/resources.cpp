@@ -141,9 +141,13 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc, GpuPtr locat
 
     VkImage       image      = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
+    const bool    placed     = (location != 0);
 
-    if (location != 0) {
-        // Placement: bind image into an existing allocation
+    if (placed) {
+        // Placement: bind image into an existing allocation. The allocation
+        // stays owned by the caller's buffer (freed via free(d, location));
+        // TextureImpl.vk_allocation must remain null so texture erase only
+        // destroys the VkImage object, never the external memory.
         if (!IZ_CHK(d, vkCreateImage(d->device, &info, nullptr, &image),
                     "create_texture: vkCreateImage failed")) {
             return {};
@@ -154,7 +158,6 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc, GpuPtr locat
             vkDestroyImage(d->device, image, nullptr);
             return {};
         }
-        allocation = mem.alloc;
     } else {
         VmaAllocationCreateInfo alloc_info{
             .flags          = 0,
@@ -195,7 +198,9 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc, GpuPtr locat
         };
         if (!IZ_CHK(d, vkCreateImageView(d->device, &view_info, nullptr, &default_image_view),
                     "create_texture: vkCreateImageView failed")) {
-            if (allocation != VK_NULL_HANDLE) {
+            if (placed) {
+                vkDestroyImage(d->device, image, nullptr);
+            } else if (allocation != VK_NULL_HANDLE) {
                 vmaDestroyImage(d->vma, image, allocation);
             } else {
                 vkDestroyImage(d->device, image, nullptr);
