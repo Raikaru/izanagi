@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# Downloaded toolchain (slangc prebuilt)
+third_party/slang/
+third_party/slang.zip
+
+# Screenshots / debug artifacts
+*.png
+*.log
+*.spv
+*.spv.dep
+
+# IDE
+.vs/
+.vscode/
+*.user
