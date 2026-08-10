@@ -85,6 +85,39 @@ Shaders are compiled at build time by `slangc` to SPIR-V and loaded from
 `<exe_dir>/shaders/` — the executables are self-contained relative to their
 own directory (no CWD dependence).
 
+## Using Izanagi in your project
+
+**Option A — FetchContent** (simplest; pulls the source, builds the static lib):
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(izanagi
+    GIT_REPOSITORY https://github.com/Raikaru/izanagi.git
+    GIT_TAG        main)
+FetchContent_MakeAvailable(izanagi)
+
+target_link_libraries(your_app PRIVATE Izanagi::izanagi)
+```
+
+As a subproject, `IZANAGI_BUILD_TESTS` and `IZANAGI_BUILD_EXAMPLES` default to
+OFF — only the library is built, and slangc is not downloaded.
+
+**Option B — install + find_package**:
+
+```sh
+cmake -S . -B build --preset dev-windows-msvc
+cmake --install build --config Debug --prefix <install-prefix>
+```
+
+```cmake
+find_package(Izanagi CONFIG REQUIRED)
+target_link_libraries(your_app PRIVATE Izanagi::izanagi)
+```
+
+The public header `izanagi/gpu.h` is Vulkan-free (no Vk* types, no volk
+include); consumers only need the include dir + the compiled lib. The API is
+Windows-only in v1 (Vulkan 1.4 backend).
+
 ## Examples
 
 1. **hello_triangle** — classic RGB triangle. No heap use; exercises
@@ -107,9 +140,9 @@ own directory (no CWD dependence).
 ## Repository layout
 
 ```
-CMakeLists.txt / CMakePresets.json   build config
-cmake/CompileSlangShader.cmake       slangc → SPIR-V build step
-include/izanagi/gpu.h                full public API (Vulkan backend impl)
+CMakeLists.txt / CMakePresets.json   build config + install/export rules
+cmake/                               CompileSlangShader.cmake, IzanagiConfig.cmake.in
+include/izanagi/gpu.h                full public API (Vulkan-free header)
 src/common/                          containers (Span, SlotMap, TwoLevelBitset)
 src/vk/                              Vulkan 1.4 backend
 shaders/izanagi.slang                shared prelude (heap access helpers)
