@@ -126,3 +126,12 @@ third_party/                         FetchContent deps (volk, VMA, Vulkan-Header
   `create_texture`.
 - Slang shaders are compiled with `-matrix-layout-row-major`; CPU-side math
   (see `examples/common/math.h`) transposes at the upload boundary.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The API design and enum value sets are derived
+from [loon_gpu](https://github.com/rkevingibson/loon_gpu) (MIT); the
+descriptor-heap mechanics follow NVIDIA's
+[vk_minimal_latest](https://github.com/nvpro-samples/vk_minimal_latest)
+(Apache-2.0) samples. `examples/common/stb_image_write.h` is public domain
+(stb, nothings.org).
