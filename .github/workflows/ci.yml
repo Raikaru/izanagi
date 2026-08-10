@@ -6,7 +6,9 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    # windows-latest moved to VS 18 2026; the dev-windows-msvc preset
+    # targets VS 17 2022, so pin the image that still ships it.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - name: Configure
