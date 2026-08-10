@@ -1013,6 +1013,176 @@ static void test_bc1_roundtrip() {
     printf("  PASS\n");
 }
 
+// --- Test 13: MSAA render + resolve -------------------------------------------------------
+static void test_msaa_resolve() {
+    printf("--- Test: MSAA resolve ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    constexpr uint32_t kSize     = 64;
+    constexpr uint32_t kTexBytes = kSize * kSize * 4;
+
+    // 4x MSAA color target; resolve target is sample_count 1
+    TextureDesc msaa_desc{
+        .type         = TextureType::Tex2D,
+        .dimensions   = {kSize, kSize, 1},
+        .sample_count = 4,
+        .format       = Format::BGRA8Unorm,
+        .usage        = UsageFlags::ColorAttachment,
+    };
+    Handle<Texture> msaa_tex = create_texture(d, msaa_desc);
+    CHECK(msaa_tex.h != 0, "create_texture (MSAA target) failed");
+    TextureDesc resolve_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::BGRA8Unorm,
+        .usage      = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> resolve_tex = create_texture(d, resolve_desc);
+    CHECK(resolve_tex.h != 0, "create_texture (resolve target) failed");
+    if (msaa_tex.h == 0 || resolve_tex.h == 0) {
+        if (msaa_tex.h != 0) { free(d, msaa_tex); }
+        if (resolve_tex.h != 0) { free(d, resolve_tex); }
+        destroy_device(d);
+        return;
+    }
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("offscreen_triangle.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        free(d, msaa_tex);
+        free(d, resolve_tex);
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vertex_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fragment_src{.source = spirv, .entry_point = "fragment_main"_sv};
+    ColorTarget color_target{.format = Format::BGRA8Unorm};
+    RasterDesc raster_desc{
+        .sample_count  = 4,
+        .color_targets = Span<const ColorTarget>(&color_target, 1),
+    };
+    Handle<Pipeline> pipeline = create_graphics_pipeline(d, vertex_src, fragment_src, raster_desc);
+    CHECK(pipeline.h != 0, "create_graphics_pipeline (MSAA) failed");
+    if (pipeline.h == 0) {
+        free(d, msaa_tex);
+        free(d, resolve_tex);
+        destroy_device(d);
+        return;
+    }
+
+    RenderAttachment color_att{
+        .texture         = msaa_tex,
+        .load_op         = LoadOp::Clear,
+        .store_op        = StoreOp::Store,
+        .clear_color     = Color{0, 0, 0, 255},
+        .resolve_texture = resolve_tex,
+    };
+    RenderPassDesc pass_desc{
+        .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+        .render_area       = Rect2D{.width = kSize, .height = kSize},
+    };
+
+    GpuPtr readback = malloc(d, kTexBytes, Memory::Readback);
+    CHECK(readback != 0, "readback malloc failed");
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw(cmd, 0, 0, 3, 1);
+    cmd_end_render_pass(cmd);
+    cmd_barrier(cmd, StageFlags::RasterColorOut, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, resolve_tex, readback,
+                          BufferTextureCopyInfo{.image_extent = {kSize, kSize, 1}});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    // Readback is from the RESOLVE target: center red, corner black.
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    CHECK(rb[(32 * kSize + 32) * 4 + 2] == 255 && rb[(32 * kSize + 32) * 4 + 1] == 0,
+          "center pixel not red after MSAA resolve");
+    CHECK(rb[2] == 0 && rb[1] == 0 && rb[0] == 0, "corner pixel not black after MSAA resolve");
+
+    free(d, readback);
+    free(d, pipeline);
+    free(d, msaa_tex);
+    free(d, resolve_tex);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 14: Generate mipmaps -------------------------------------------------------------
+static void test_generate_mipmaps() {
+    printf("--- Test: generate mipmaps ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {8, 8, 1},
+        .mip_count  = 4,
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
+    };
+    Handle<Texture> tex = create_texture(d, tex_desc);
+    CHECK(tex.h != 0, "create_texture failed");
+    if (tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    // Solid color in mip 0 only; mips 1..3 must be derived by the blit chain.
+    const uint8_t kColor[4] = {200, 100, 50, 255};
+    GpuPtr mip0_src = malloc(d, 8 * 8 * 4, Memory::Default);
+    GpuPtr mip3_rb  = malloc(d, 4, Memory::Readback);
+    CHECK(mip0_src != 0 && mip3_rb != 0, "malloc failed");
+    auto* mip0_host = reinterpret_cast<uint8_t*>(get_host_pointer(d, mip0_src));
+    for (int p = 0; p < 8 * 8; ++p) {
+        mip0_host[p * 4 + 0] = kColor[0];
+        mip0_host[p * 4 + 1] = kColor[1];
+        mip0_host[p * 4 + 2] = kColor[2];
+        mip0_host[p * 4 + 3] = kColor[3];
+    }
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_copy_to_texture(cmd, mip0_src, tex, BufferTextureCopyInfo{.image_extent = {8, 8, 1}});
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_generate_mipmaps(cmd, tex);
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, tex, mip3_rb,
+                          BufferTextureCopyInfo{.image_extent = {1, 1, 1}, .base_mip = 3});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, mip3_rb));
+    bool ok  = true;
+    for (int c = 0; c < 4; ++c) {
+        int diff = static_cast<int>(rb[c]) - static_cast<int>(kColor[c]);
+        if (diff < -2 || diff > 2) { ok = false; }
+    }
+    CHECK(ok, "mip 3 not generated from mip 0 (linear filter, tolerance +-2)");
+
+    free(d, mip0_src);
+    free(d, mip3_rb);
+    free(d, tex);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -1040,6 +1210,8 @@ int main() {
     test_texture_size_align_placement();
     test_mip_and_cube();
     test_bc1_roundtrip();
+    test_msaa_resolve();
+    test_generate_mipmaps();
 
     printf("\n=================\n");
     if (g_failures == 0) {

@@ -1,5 +1,7 @@
 // commands.cpp — all cmd_* recording, command pool management, queue submission.
 
+#include <algorithm>
+
 #include "internal.h"
 
 namespace gpu {
@@ -456,6 +458,62 @@ void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
     vkCmdPipelineBarrier2(cmd->buffer, &info);
 }
 
+void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
+    auto* d   = cmd->device;
+    auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
+
+    const uint32_t aspect = aspects_for_format(tex.format);
+    const uint32_t w      = tex.dimensions.x;
+    const uint32_t h      = tex.dimensions.y;
+
+    // Successive linear blits: mip i-1 -> mip i, layer 0 only.
+    for (uint32_t i = 1; i < tex.mip_count; ++i) {
+        const VkImageBlit2 region{
+            .sType          = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+            .pNext          = nullptr,
+            .srcSubresource = {
+                .aspectMask     = aspect,
+                .mipLevel       = i - 1,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+            .srcOffsets = {
+                {0, 0, 0},
+                {static_cast<int32_t>(std::max(w >> (i - 1), 1u)),
+                 static_cast<int32_t>(std::max(h >> (i - 1), 1u)), 1},
+            },
+            .dstSubresource = {
+                .aspectMask     = aspect,
+                .mipLevel       = i,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+            .dstOffsets = {
+                {0, 0, 0},
+                {static_cast<int32_t>(std::max(w >> i, 1u)),
+                 static_cast<int32_t>(std::max(h >> i, 1u)), 1},
+            },
+        };
+        const VkBlitImageInfo2 info{
+            .sType          = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+            .pNext          = nullptr,
+            .srcImage       = tex.vk_image,
+            .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .dstImage       = tex.vk_image,
+            .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .regionCount    = 1,
+            .pRegions       = &region,
+            .filter         = VK_FILTER_LINEAR,
+        };
+        vkCmdBlitImage2(cmd->buffer, &info);
+
+        // Serialize blit write (mip i) vs next blit read (mip i).
+        if (i + 1 < tex.mip_count) {
+            cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+        }
+    }
+}
+
 void cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
     auto* d = cmd->device;
     auto& p = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)];
@@ -560,23 +618,29 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     Span<VkRenderingAttachmentInfo> color_attachments{};
 
     for (const auto& attachment : desc.color_attachments) {
-        color_attachments = concat(
-            arena, color_attachments,
-            VkRenderingAttachmentInfo{
-                .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .pNext              = nullptr,
-                .imageView          = d->texture_pool[handle_cast<TextureImpl>(attachment.texture)].default_image_view,
-                .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
-                .resolveMode        = VK_RESOLVE_MODE_NONE,
-                .resolveImageView   = VK_NULL_HANDLE,
-                .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .loadOp             = bridge(attachment.load_op),
-                .storeOp            = bridge(attachment.store_op),
-                .clearValue         = {.color = {.float32 = {attachment.clear_color.r / 255.0f,
-                                                              attachment.clear_color.g / 255.0f,
-                                                              attachment.clear_color.b / 255.0f,
-                                                              attachment.clear_color.a / 255.0f}}},
-            });
+        VkRenderingAttachmentInfo info{
+            .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext              = nullptr,
+            .imageView          = d->texture_pool[handle_cast<TextureImpl>(attachment.texture)].default_image_view,
+            .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode        = VK_RESOLVE_MODE_NONE,
+            .resolveImageView   = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp             = bridge(attachment.load_op),
+            .storeOp            = bridge(attachment.store_op),
+            .clearValue         = {.color = {.float32 = {attachment.clear_color.r / 255.0f,
+                                                          attachment.clear_color.g / 255.0f,
+                                                          attachment.clear_color.b / 255.0f,
+                                                          attachment.clear_color.a / 255.0f}}},
+        };
+        if (attachment.resolve_texture.h != 0) {
+            // MSAA color resolve (sample_count 1 target); depth/stencil
+            // attachments never resolve.
+            info.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
+            info.resolveImageView   = d->texture_pool[handle_cast<TextureImpl>(attachment.resolve_texture)].default_image_view;
+            info.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+        color_attachments = concat(arena, color_attachments, info);
     }
 
     const bool has_depth = desc.depth_attachment.texture.h != 0;

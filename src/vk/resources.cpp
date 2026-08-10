@@ -84,7 +84,7 @@ TextureSizeAlign get_texture_size_align(Device dev, const TextureDesc& desc) {
                            .depth  = desc.dimensions.z},
         .mipLevels     = desc.mip_count,
         .arrayLayers   = is_cubemap ? 6 * desc.array_count : desc.array_count,
-        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .samples       = static_cast<VkSampleCountFlagBits>(desc.sample_count == 0 ? 1 : desc.sample_count),
         .tiling        = VK_IMAGE_TILING_OPTIMAL,
         .usage         = bridge_usage_flags(desc.usage),
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
@@ -130,7 +130,7 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc, GpuPtr locat
                            .depth  = desc.dimensions.z},
         .mipLevels     = desc.mip_count,
         .arrayLayers   = is_cubemap ? 6 * desc.array_count : desc.array_count,
-        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .samples       = static_cast<VkSampleCountFlagBits>(desc.sample_count == 0 ? 1 : desc.sample_count),
         .tiling        = VK_IMAGE_TILING_OPTIMAL,
         .usage         = bridge_usage_flags(desc.usage),
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
@@ -216,6 +216,8 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc, GpuPtr locat
         .vk_type            = bridge_view_type(desc.type),
         .format             = desc.format,
         .is_swapchain_image = false,
+        .mip_count          = desc.mip_count,
+        .dimensions         = desc.dimensions,
     }));
 
     mutex_lock(&d->texture_init_lock);

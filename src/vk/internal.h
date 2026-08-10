@@ -46,6 +46,8 @@ struct TextureImpl {
     VkImageViewType vk_type           = VK_IMAGE_VIEW_TYPE_2D;
     Format         format             = Format::None;
     bool           is_swapchain_image = false;
+    uint32_t       mip_count          = 1;
+    Dimension3D    dimensions         = {};
 };
 
 struct DepthStencilState {

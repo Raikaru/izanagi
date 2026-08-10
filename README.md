@@ -37,6 +37,10 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
 - **Minimal PSOs, dynamic rendering.** No render-pass objects, no pipeline
   layouts. Graphics pipelines are created from a `RasterDesc` (color targets +
   optional depth format) and use dynamic rendering (`vkCmdBeginRendering`).
+- **MSAA render targets with resolve.** A color attachment may name a
+  sample-count-1 resolve target; the pass resolves into it at end (average).
+- **`cmd_generate_mipmaps`.** Successive linear blits build mips 1..N-1 from
+  mip 0 in one command (layer 0 only).
 
 ## Requirements
 
@@ -136,6 +140,15 @@ Windows-only in v1 (Vulkan 1.4 backend).
 3. Compute end-to-end (`memcpy_kernel.slang`: `dst[i] = src[i] * 2 + 1`)
 4. Texture upload + readback
 5. Heap slot recycling (indices reused, no leaks)
+6. Semaphores: signal/wait + deferred completion callback
+7. Indirect dispatch (`cmd_dispatch_indirect`)
+8. Specialization constants (`kMul` overridden 1 → 5)
+9. Indirect draws — single + multi
+10. `get_texture_size_align` + placed texture creation
+11. Mip-chain + cube-face subresource copies
+12. BC1 block-compressed copy roundtrip
+13. MSAA 4x render + resolve
+14. `cmd_generate_mipmaps` (mip 0 → mip 3 chain)
 
 ## Repository layout
 

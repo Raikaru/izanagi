@@ -83,6 +83,10 @@ barrier (`cmd_barrier`) is the exact shape Metal supports; there is no
 `cmd_image_transition` in the public surface, and v1's Vulkan impl keeps images
 in GENERAL layout for the same reason.
 
+**Render-pass resolve:** `RenderAttachment.resolve_texture` maps to
+`MTLRenderPassColorAttachmentDescriptor.resolveTexture` with
+`storeAction = .multisampleResolve`.
+
 ## Memory
 
 | Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
@@ -102,6 +106,7 @@ in GENERAL layout for the same reason.
 | `create_sampler` | `vkWriteSamplerDescriptorsEXT` into the sampler heap | `MTLSamplerState.gpuResourceID` |
 | `free_texture_view` / `free_sampler` | heap-slot recycling (deferred until safe by timeline value) | release `MTLResourceID` from pool (no CPU heap to recycle — Metal does this internally) |
 | `getTexture2D(handle)` / `getSampler(handle)` (shader prelude) | unpack uint64 → heap index → read through heap buffer | unpack uint64 → `MTLResourceID` → direct resource access (Metal's native indexing) |
+| `cmd_generate_mipmaps` | `vkCmdBlitImage2` chain, mip i-1 → i, linear filter, GENERAL layout | `MTL4BlitCommandEncoder.generateMipmaps(for:)` |
 
 **Format note:** the `Format` enum keeps ETC2/ASTC entries for the future Metal
 backend; the v1 Vulkan backend logs an error and returns a null handle for

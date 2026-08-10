@@ -206,6 +206,8 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
             .vk_type            = VK_IMAGE_VIEW_TYPE_2D,
             .format             = config.format,
             .is_swapchain_image = true,
+            .mip_count          = 1,
+            .dimensions         = {config.width, config.height, 1},
         }));
     }
 

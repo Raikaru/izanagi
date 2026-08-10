@@ -422,11 +422,16 @@ struct RasterDesc {
     Format                  stencil_format    = Format::None;
     Span<const ColorTarget> color_targets     = {};
 };
+// Color attachments may set resolve_texture (a sample_count 1 texture of the
+// same format/size) to have the MSAA result resolved into it at pass end.
+// Depth/stencil attachments do not support resolve; any resolve_texture set
+// on them is ignored.
 struct RenderAttachment {
     Handle<Texture> texture = {0};
     LoadOp          load_op;
     StoreOp         store_op;
     Color           clear_color;
+    Handle<Texture> resolve_texture = {0};
 };
 struct RenderPassDesc {
     Span<const RenderAttachment> color_attachments;
@@ -592,6 +597,12 @@ void              queue_process_events(Queue);
 void cmd_memcpy(CommandBuffer, GpuPtr dst, GpuPtr src, size_t size);
 void cmd_copy_to_texture(CommandBuffer, GpuPtr src, Handle<Texture>, const BufferTextureCopyInfo&);
 void cmd_copy_from_texture(CommandBuffer, Handle<Texture>, GpuPtr dst, const BufferTextureCopyInfo&);
+// Generate mips 1..N-1 from mip 0 by successive linear blits (layer 0 only;
+// cube faces / array layers are not generated).
+// Texture must have UsageFlags::TransferSrc | TransferDst.
+// Caller barriers: writes to mip 0 -> StageFlags::Transfer before,
+// StageFlags::Transfer -> consumer stage after.
+void cmd_generate_mipmaps(CommandBuffer, Handle<Texture>);
 void cmd_barrier(CommandBuffer, StageFlags before, StageFlags after);
 void cmd_set_pipeline(CommandBuffer, Handle<Pipeline>);
 void cmd_set_depth_stencil_state(CommandBuffer, Handle<DepthStencilState>);

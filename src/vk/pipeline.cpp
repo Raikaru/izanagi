@@ -235,7 +235,7 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
         .sType                 = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .pNext                 = nullptr,
         .flags                 = 0,
-        .rasterizationSamples  = VK_SAMPLE_COUNT_1_BIT,
+        .rasterizationSamples  = static_cast<VkSampleCountFlagBits>(desc.sample_count == 0 ? 1 : desc.sample_count),
         .sampleShadingEnable   = false,
         .minSampleShading      = 1.0f,
         .pSampleMask           = nullptr,
