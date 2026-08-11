@@ -1,13 +1,9 @@
 # add_slang_shader(TARGET <t> SOURCE <f.slang> OUTPUT <f.spv> [NATIVE_ONLY])
 #
 # Compiles a .slang file to SPIR-V at build time using slangc, for BOTH
-# capability profiles: vk_native_spv16 (SPIR-V 1.6 + spvDescriptorHeapEXT)
-# and vk_bindless_spv15 (SPIR-V 1.5, descriptor-indexing arrays, no
-# descriptor-heap capability). One .spv per profile containing ALL
-# [shader(...)] entry points; ShaderSource.entry_point selects at pipeline
-# creation. Artifact identity = source name + profile/SPIR-V version
-# directory (+ entry points + profile version, verified by the extracted
-# manifest test), so Native and Bindless artifacts never collide.
+# capability profiles: vk_<backend>_<N>_spv<VV> directories (profile + profile
+# version + SPIR-V version). One .spv per profile containing ALL [shader(...)]
+# entry points; ShaderSource.entry_point selects at pipeline creation.
 #
 # NATIVE_ONLY marks a shader that is legitimately Native-profile-only (e.g.
 # the negative compile test): the Bindless variant is not built for it.
@@ -17,6 +13,16 @@
 # Directory of THIS file (function bodies see the CALLER's list dir, so the
 # helper scripts must be referenced through this captured path).
 set(IZ_COMPILE_SLANG_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
+# Artifact identity tags: vk_<backend>_<profile version>_spv<version>.
+# The profile version suffix comes from the profile NAME, so bumping a
+# profile version changes the directory and old artifacts cannot collide.
+string(REGEX MATCH "_([0-9]+)$" _m "${IZANAGI_VK_NATIVE_PROFILE_NAME}")
+set(IZANAGI_VK_PROFILE_VERSION_NATIVE "${CMAKE_MATCH_1}")
+string(REGEX MATCH "_([0-9]+)$" _m "${IZANAGI_VK_BINDLESS_PROFILE_NAME}")
+set(IZANAGI_VK_PROFILE_VERSION_BINDLESS "${CMAKE_MATCH_1}")
+set(IZANAGI_VK_NATIVE_TAG   "vk_native_${IZANAGI_VK_PROFILE_VERSION_NATIVE}_spv16")
+set(IZANAGI_VK_BINDLESS_TAG "vk_bindless_${IZANAGI_VK_PROFILE_VERSION_BINDLESS}_spv15")
 
 function(add_slang_shader TARGET_NAME)
     cmake_parse_arguments(ARG "NATIVE_ONLY" "SOURCE;OUTPUT" "" ${ARGN})
@@ -30,17 +36,17 @@ function(add_slang_shader TARGET_NAME)
 
     set(_base_output "${ARG_OUTPUT}")
     # Artifact identity scheme (ABI requirements): the artifact path encodes
-    #   <source>.<ext>               -> source identity (the file name)
-    #   vk_native_spv16|vk_bindless_spv15 -> backend profile + target SPIR-V
-    #                                        version
-    # and IZ_PROFILE (compile-time) identifies the profile version. The
-    # extracted-manifest test verifies the SPIR-V header version matches the
-    # directory and enumerates the entry points from the artifact. Native and
-    # Bindless artifacts can therefore never collide, even across profile or
-    # SPIR-V version changes.
-    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1vk_native_spv16/\\2" _native "${_base_output}")
-    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1vk_bindless_spv15/\\2" _bindless "${_base_output}")
-    if(NOT _native MATCHES "vk_native_spv16/" OR NOT _bindless MATCHES "vk_bindless_spv15/")
+    #   <source>.<ext>                   -> source identity (the file name)
+    #   vk_<backend>_<N>_spv<VV>          -> backend profile + profile version
+    #                                        + target SPIR-V version
+    # The extracted-manifest test verifies the SPIR-V header version matches
+    # the directory, enumerates the entry points from the artifact, and checks
+    # the compile-time profile-name version matches the directory version.
+    # Artifacts from different profiles, SPIR-V versions, or profile versions
+    # can therefore never collide.
+    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1${IZANAGI_VK_NATIVE_TAG}/\\2" _native "${_base_output}")
+    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1${IZANAGI_VK_BINDLESS_TAG}/\\2" _bindless "${_base_output}")
+    if(NOT _native MATCHES "${IZANAGI_VK_NATIVE_TAG}/" OR NOT _bindless MATCHES "${IZANAGI_VK_BINDLESS_TAG}/")
         message(FATAL_ERROR "add_slang_shader: OUTPUT must be under a /shaders/ directory")
     endif()
 

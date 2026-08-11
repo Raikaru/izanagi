@@ -89,9 +89,11 @@ static std::string find_shader_path(const char* name) {
     // Artifact identity: <profile>_spv<version> directory (see
     // cmake/CompileSlangShader.cmake); fall back to the plain dir for older
     // build trees.
-    const char* profile_dir = "shaders/vk_native_spv16/";
+    // Artifact identity: shaders/<tag>/ with the tag encoding profile +
+    // profile version + SPIR-V version (see cmake/CompileSlangShader.cmake).
+    const char* profile_dir = "shaders/" IZ_NATIVE_ARTIFACT_TAG "/";
 #if defined(IZ_VK_PROFILE_BINDLESS)
-    profile_dir = "shaders/vk_bindless_spv15/";
+    profile_dir = "shaders/" IZ_BINDLESS_ARTIFACT_TAG "/";
 #endif
     // Resolve relative to the executable directory so tests run from any CWD.
 #ifdef _WIN32
@@ -110,13 +112,13 @@ static std::string find_shader_path(const char* name) {
 #endif
     // Fallback: try relative candidates
     const char* candidates[] = {
-        "shaders/vk_native_spv16/",
+        "shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
         "shaders/",
-        "../shaders/vk_native_spv16/",
+        "../shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
         "../shaders/",
-        "../../shaders/vk_native_spv16/",
+        "../../shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
         "../../shaders/",
-        "../../../shaders/vk_native_spv16/",
+        "../../../shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
         "../../../shaders/",
     };
     for (auto* prefix : candidates) {

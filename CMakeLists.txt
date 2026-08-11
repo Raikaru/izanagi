@@ -34,8 +34,13 @@ set_property(CACHE IZANAGI_WSI PROPERTY STRINGS AUTO HEADLESS WIN32 XCB WAYLAND 
 # host package (see third_party/CMakeLists.txt).
 set(IZANAGI_SLANGC "" CACHE FILEPATH "Path to a host slangc executable (empty = auto-discover)")
 
-# Backend profile name advertised in the capability report.
-set(IZANAGI_PROFILE "IZANAGI_VK_NATIVE_1" CACHE STRING "Capability profile name")
+# Backend profile names. The trailing version suffix is PART of the shader
+# artifact key (shaders/vk_<backend>_<N>_spv<VV>/): bumping a profile version
+# changes the artifact directory, so old artifacts can never be mistaken for
+# new ones. IZANAGI_PROFILE is the selected profile's advertised name.
+set(IZANAGI_VK_NATIVE_PROFILE_NAME   "IZANAGI_VK_NATIVE_1"   CACHE STRING "Native profile name (version suffix is part of the artifact key)")
+set(IZANAGI_VK_BINDLESS_PROFILE_NAME "IZANAGI_VK_BINDLESS_1" CACHE STRING "Bindless profile name (version suffix is part of the artifact key)")
+set(IZANAGI_PROFILE "${IZANAGI_VK_NATIVE_PROFILE_NAME}" CACHE STRING "Capability profile name")
 
 # Vulkan capability profile: which private mechanism implements the public
 # model. NATIVE = the modern descriptor-heap path (Vulkan 1.4 + descriptor
@@ -244,7 +249,12 @@ if(IZANAGI_BUILD_TESTS)
     add_executable(izanagi_tests tests/api_tests.cpp)
     target_link_libraries(izanagi_tests PRIVATE izanagi)
     target_include_directories(izanagi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(izanagi_tests PRIVATE IZ_VK_PROFILE_${IZANAGI_VK_PROFILE})
+    target_compile_definitions(izanagi_tests PRIVATE
+        IZ_VK_PROFILE_${IZANAGI_VK_PROFILE}
+        IZ_NATIVE_ARTIFACT_TAG="${IZANAGI_VK_NATIVE_TAG}"
+        IZ_BINDLESS_ARTIFACT_TAG="${IZANAGI_VK_BINDLESS_TAG}"
+        IZ_PROFILE_VERSION_NATIVE="${IZANAGI_VK_PROFILE_VERSION_NATIVE}"
+        IZ_PROFILE_VERSION_BINDLESS="${IZANAGI_VK_PROFILE_VERSION_BINDLESS}")
     add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3
                      izanagi_test_shaders4 izanagi_test_shaders5 izanagi_test_shaders6
                      izanagi_test_shaders7
@@ -261,6 +271,12 @@ if(IZANAGI_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    target_compile_definitions(izanagi_common_tests PRIVATE
+        IZ_NATIVE_ARTIFACT_TAG="${IZANAGI_VK_NATIVE_TAG}"
+        IZ_BINDLESS_ARTIFACT_TAG="${IZANAGI_VK_BINDLESS_TAG}"
+        IZ_PROFILE="${IZANAGI_PROFILE}"
+        IZ_PROFILE_VERSION_NATIVE="${IZANAGI_VK_PROFILE_VERSION_NATIVE}"
+        IZ_PROFILE_VERSION_BINDLESS="${IZANAGI_VK_PROFILE_VERSION_BINDLESS}")
     # The extracted shader-layout manifest test (common_tests) reads the
     # compiled artifacts, so the common tests depend on the ABI shaders too.
     add_dependencies(izanagi_common_tests
@@ -309,6 +325,8 @@ if(IZANAGI_BUILD_EXAMPLES AND IZANAGI_WSI STREQUAL "WIN32")
     )
     target_include_directories(izanagi_examples PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
     target_link_libraries(izanagi_examples PRIVATE izanagi)
-    target_compile_definitions(izanagi_examples PRIVATE IZ_VK_PROFILE_${IZANAGI_VK_PROFILE})
+    target_compile_definitions(izanagi_examples PRIVATE
+        IZ_VK_PROFILE_${IZANAGI_VK_PROFILE}
+        IZ_NATIVE_ARTIFACT_TAG="${IZANAGI_VK_NATIVE_TAG}")
     add_dependencies(izanagi_examples izanagi_example_shaders izanagi_example_shaders2 izanagi_example_shaders3)
 endif()

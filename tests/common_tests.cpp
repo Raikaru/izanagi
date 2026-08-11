@@ -819,45 +819,48 @@ uint32_t type_size(const Module& m, uint32_t id, uint32_t depth = 0) {
 
 // Finds a compiled shader artifact (exe-relative then cwd-relative candidates).
 static std::string find_shader_artifact(const char* name) {
-    // Multi-config (Debug/Release subdir) and single-config layouts.
+    // Multi-config (Debug/Release subdir) and single-config layouts. The tag
+    // encodes profile + profile version + SPIR-V version, so artifacts from a
+    // different profile version can never be loaded by mistake.
+    const std::string native_dir = "shaders/" IZ_NATIVE_ARTIFACT_TAG "/";
     const std::string candidates[] = {
-        "shaders/vk_native_spv16/",
-        "bin/shaders/vk_native_spv16/",
-        "../bin/shaders/vk_native_spv16/",
-        "bin/Debug/shaders/vk_native_spv16/",
-        "../bin/Debug/shaders/vk_native_spv16/",
-        "bin/Release/shaders/vk_native_spv16/",
-        "../bin/Release/shaders/vk_native_spv16/",
-        "build/bin/shaders/vk_native_spv16/",
-        "build/bin/Debug/shaders/vk_native_spv16/",
-        "build/bin/Release/shaders/vk_native_spv16/",
+        native_dir,
+        "bin/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "../bin/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "bin/Debug/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "../bin/Debug/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "bin/Release/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "../bin/Release/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "build/bin/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "build/bin/Debug/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
+        "build/bin/Release/shaders/" IZ_NATIVE_ARTIFACT_TAG "/",
     };
     for (auto& c : candidates) {
         std::string p = c + name;
         if (std::filesystem::exists(p)) { return p; }
     }
-    return std::string("shaders/vk_native_spv16/") + name;
+    return std::string("shaders/") + IZ_NATIVE_ARTIFACT_TAG + "/" + name;
 }
 
 // Bindless variant of find_shader_artifact (SPIR-V 1.5 directory).
 static std::string find_shader_artifact_bindless(const char* name) {
     const std::string candidates[] = {
-        "shaders/vk_bindless_spv15/",
-        "bin/shaders/vk_bindless_spv15/",
-        "../bin/shaders/vk_bindless_spv15/",
-        "bin/Debug/shaders/vk_bindless_spv15/",
-        "../bin/Debug/shaders/vk_bindless_spv15/",
-        "bin/Release/shaders/vk_bindless_spv15/",
-        "../bin/Release/shaders/vk_bindless_spv15/",
-        "build/bin/shaders/vk_bindless_spv15/",
-        "build/bin/Debug/shaders/vk_bindless_spv15/",
-        "build/bin/Release/shaders/vk_bindless_spv15/",
+        "shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "bin/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "../bin/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "bin/Debug/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "../bin/Debug/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "bin/Release/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "../bin/Release/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "build/bin/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "build/bin/Debug/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
+        "build/bin/Release/shaders/" IZ_BINDLESS_ARTIFACT_TAG "/",
     };
     for (auto& c : candidates) {
         std::string p = c + name;
         if (std::filesystem::exists(p)) { return p; }
     }
-    return std::string("shaders/vk_bindless_spv15/") + name;
+    return std::string("shaders/") + IZ_BINDLESS_ARTIFACT_TAG + "/" + name;
 }
 
 static std::vector<uint8_t> read_file(const std::string& path) {
@@ -988,6 +991,11 @@ static void check_artifact_identity(const std::vector<uint8_t>& spv,
                                     uint32_t expected_spv_version,
                                     const std::vector<std::string>& expected_entries,
                                     const char* label) {
+    // Profile-version identity: the compile-time profile name's version
+    // suffix must equal the version encoded in the artifact directory tag.
+    CHECK(strcmp(IZ_PROFILE, "IZANAGI_VK_NATIVE_" IZ_PROFILE_VERSION_NATIVE) == 0 ||
+              strcmp(IZ_PROFILE, "IZANAGI_VK_BINDLESS_" IZ_PROFILE_VERSION_BINDLESS) == 0,
+          "profile name version matches the artifact tag version");
     CHECK(spirv_header_version(spv) == expected_spv_version,
           "artifact SPIR-V version matches the profile directory");
     auto entries = spirv_entry_points(spv);
