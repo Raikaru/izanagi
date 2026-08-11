@@ -681,6 +681,7 @@ Device create_device(const DeviceDesc& desc) {
         props2.pNext = &id_props;
         vkGetPhysicalDeviceProperties2(d->physical_device, &props2);
         d->cache_identity.backend   = Backend::Vulkan;
+        d->cache_identity.profile   = device_backend_profile();
         d->cache_identity.vendor_id = props2.properties.vendorID;
         d->cache_identity.device_id = props2.properties.deviceID;
         memcpy(d->cache_identity.driver_uuid, id_props.driverUUID,
@@ -908,6 +909,14 @@ void destroy_device(Device dev) {
 
 Backend device_backend() {
     return Backend::Vulkan;
+}
+
+BackendProfile device_backend_profile() {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    return BackendProfile::VulkanBindless;
+#else
+    return BackendProfile::VulkanNative;
+#endif
 }
 
 DeviceLimits device_limits(Device dev) {

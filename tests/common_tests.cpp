@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/containers.h"
+#include "common/profile_report.h"
 
 using namespace gpu;
 
@@ -417,6 +418,157 @@ static void test_vector_nontrivial_insert() {
     printf("  PASS\n");
 }
 
+// --- Bindless profile capability evaluation -----------------------------------
+// Negative capability tests: the evaluator must reject a device lacking ANY
+// mandatory requirement with the exact requirement listed, must accept
+// optional-feature absence (selecting fallbacks), and must never gate on the
+// Vulkan version or generation name.
+
+static VulkanProfileFeatures full_features() {
+    VulkanProfileFeatures f;
+    f.api_version                    = (1u << 22) | (2u << 12);  // 1.2
+    f.buffer_device_address          = true;
+    f.shader_int64                   = true;
+    f.scalar_block_layout            = true;
+    f.sampled_image_nonuniform_indexing = true;
+    f.storage_image_nonuniform_indexing = true;
+    f.sampler_array_indexing            = true;
+    f.sampled_image_update_after_bind   = true;
+    f.storage_image_update_after_bind   = true;
+    f.descriptor_binding_partially_bound              = true;
+    f.runtime_descriptor_array                        = true;
+    f.descriptor_binding_update_unused_while_pending  = true;
+    f.draw_indirect_count = true;
+    f.timeline_semaphore  = true;
+    f.dynamic_rendering   = true;
+    f.synchronization2    = true;
+    f.max_sampled_descriptors = 1'000'000;
+    f.max_storage_descriptors = 1'000'000;
+    f.max_samplers            = 1'000'000;
+    return f;
+}
+
+static bool report_has(const VulkanProfileReport& r, VulkanProfileRequirement req) {
+    return r.missing_has(req);
+}
+
+static void test_profile_report() {
+    printf("--- Test: bindless profile evaluation ---\n");
+
+    // Full feature set -> supported, direct descriptor path, capacities
+    // clamped to the profile floor (not the raw limit).
+    {
+        VulkanProfileReport r = evaluate_vulkan_bindless_profile(full_features());
+        CHECK(r.supported, "full feature set must be supported");
+        CHECK(r.missing_count == 0, "full feature set must have no missing requirements");
+        CHECK(r.descriptor_snapshots == 1, "update-unused-while-pending -> direct path (1 snapshot)");
+        CHECK(r.sampled_image_capacity == kMinBindlessSampledImages, "capacity clamps to profile floor");
+        CHECK(r.storage_image_capacity == kMinBindlessStorageImages, "storage capacity clamps to floor");
+        CHECK(r.sampler_capacity == kMinBindlessSamplers, "sampler capacity clamps to floor");
+        CHECK(r.dynamic_rendering && r.synchronization2, "optional conveniences echoed");
+        CHECK(!r.missing_has(VulkanProfileRequirement::BufferDeviceAddress), "missing_has false when nothing missing");
+    }
+
+    // Every mandatory requirement, individually absent -> unsupported + listed.
+    struct ReqCase {
+        VulkanProfileRequirement req;
+        void (*apply)(VulkanProfileFeatures&);
+    };
+    ReqCase cases[] = {
+        {VulkanProfileRequirement::BufferDeviceAddress, [](VulkanProfileFeatures& f) { f.buffer_device_address = false; }},
+        {VulkanProfileRequirement::ShaderInt64, [](VulkanProfileFeatures& f) { f.shader_int64 = false; }},
+        {VulkanProfileRequirement::ScalarBlockLayout, [](VulkanProfileFeatures& f) { f.scalar_block_layout = false; }},
+        {VulkanProfileRequirement::SampledNonUniformIndexing, [](VulkanProfileFeatures& f) { f.sampled_image_nonuniform_indexing = false; }},
+        {VulkanProfileRequirement::StorageNonUniformIndexing, [](VulkanProfileFeatures& f) { f.storage_image_nonuniform_indexing = false; }},
+        {VulkanProfileRequirement::SamplerArrayIndexing, [](VulkanProfileFeatures& f) { f.sampler_array_indexing = false; }},
+        {VulkanProfileRequirement::SampledUpdateAfterBind, [](VulkanProfileFeatures& f) { f.sampled_image_update_after_bind = false; }},
+        {VulkanProfileRequirement::StorageUpdateAfterBind, [](VulkanProfileFeatures& f) { f.storage_image_update_after_bind = false; }},
+        {VulkanProfileRequirement::PartiallyBound, [](VulkanProfileFeatures& f) { f.descriptor_binding_partially_bound = false; }},
+        {VulkanProfileRequirement::RuntimeDescriptorArray, [](VulkanProfileFeatures& f) { f.runtime_descriptor_array = false; }},
+        {VulkanProfileRequirement::DrawIndirectCount, [](VulkanProfileFeatures& f) { f.draw_indirect_count = false; }},
+        {VulkanProfileRequirement::TimelineSemaphore, [](VulkanProfileFeatures& f) { f.timeline_semaphore = false; }},
+    };
+    for (auto& c : cases) {
+        VulkanProfileFeatures f = full_features();
+        c.apply(f);
+        VulkanProfileReport r = evaluate_vulkan_bindless_profile(f);
+        CHECK(!r.supported, "missing requirement must reject the profile");
+        CHECK(report_has(r, c.req), "the exact missing requirement must be listed");
+        CHECK(r.missing_count == 1, "exactly one missing requirement for a single-feature absence");
+    }
+
+    // Capacity floors are mandatory; sub-floor limits reject with the
+    // capacity requirement listed and the raw (sub-floor) value reported.
+    {
+        VulkanProfileFeatures f = full_features();
+        f.max_sampled_descriptors = 64;
+        VulkanProfileReport r = evaluate_vulkan_bindless_profile(f);
+        CHECK(!r.supported, "sub-floor sampled capacity must reject");
+        CHECK(report_has(r, VulkanProfileRequirement::SampledImageCapacity), "capacity requirement listed");
+        CHECK(r.sampled_image_capacity == 64, "sub-floor capacity reported as-is");
+
+        f = full_features();
+        f.max_samplers = 0;
+        r = evaluate_vulkan_bindless_profile(f);
+        CHECK(!r.supported, "zero sampler capacity must reject");
+        CHECK(report_has(r, VulkanProfileRequirement::SamplerCapacity), "sampler capacity listed");
+    }
+
+    // Optional features: absence selects fallbacks, never rejection.
+    {
+        VulkanProfileFeatures f = full_features();
+        f.descriptor_binding_update_unused_while_pending = false;
+        VulkanProfileReport r = evaluate_vulkan_bindless_profile(f);
+        CHECK(r.supported, "missing update-unused-while-pending must not reject (snapshot path)");
+        CHECK(r.descriptor_snapshots == 2, "snapshot path selected (2 backing sets)");
+
+        f = full_features();
+        f.dynamic_rendering = false;
+        r = evaluate_vulkan_bindless_profile(f);
+        CHECK(r.supported, "missing dynamic rendering must not reject (private render pass)");
+        CHECK(!r.dynamic_rendering, "dynamic rendering absence recorded");
+
+        f = full_features();
+        f.synchronization2 = false;
+        r = evaluate_vulkan_bindless_profile(f);
+        CHECK(r.supported, "missing synchronization2 must not reject (legacy barriers)");
+        CHECK(!r.synchronization2, "synchronization2 absence recorded");
+    }
+
+    // Version is never the gate: all features on a 1.1-era report still pass;
+    // no features on a 1.4 report fail.
+    {
+        VulkanProfileFeatures f = full_features();
+        f.api_version = (1u << 22) | (1u << 12);
+        CHECK(evaluate_vulkan_bindless_profile(f).supported, "version must not gate support");
+
+        f = full_features();
+        f.api_version = (1u << 22) | (4u << 12);
+        f.buffer_device_address = false;
+        f.timeline_semaphore    = false;
+        f.sampled_image_nonuniform_indexing = false;
+        CHECK(!evaluate_vulkan_bindless_profile(f).supported, "high version cannot paper over missing features");
+    }
+
+    // All-false snapshot: every requirement listed, none omitted.
+    {
+        VulkanProfileReport r = evaluate_vulkan_bindless_profile({});
+        CHECK(!r.supported, "empty feature snapshot must reject");
+        CHECK(r.missing_count == 15, "all 15 requirements listed when nothing is supported");
+        CHECK(r.descriptor_snapshots == 2, "snapshot path recorded for empty snapshot");
+    }
+
+    // Name table sanity.
+    {
+        for (int i = 0; i < static_cast<int>(VulkanProfileRequirement::ValidCount); ++i) {
+            const char* n = vulkan_requirement_name(static_cast<VulkanProfileRequirement>(i));
+            CHECK(n != nullptr && n[0] != '\0', "requirement names must be non-empty");
+        }
+        CHECK(std::string(vulkan_requirement_name(VulkanProfileRequirement::ValidCount)) == "unknown",
+              "out-of-range requirement names report unknown");
+    }
+}
+
 int main() {
     printf("Izanagi Common Tests\n");
     printf("====================\n\n");
@@ -432,6 +584,7 @@ int main() {
     test_bitset();
     test_enum_ops();
     test_span();
+    test_profile_report();
 
     printf("\n=================\n");
     if (g_failures == 0) {

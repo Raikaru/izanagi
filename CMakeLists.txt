@@ -37,11 +37,25 @@ set(IZANAGI_SLANGC "" CACHE FILEPATH "Path to a host slangc executable (empty = 
 # Backend profile name advertised in the capability report.
 set(IZANAGI_PROFILE "IZANAGI_VK_NATIVE_1" CACHE STRING "Capability profile name")
 
+# Vulkan capability profile: which private mechanism implements the public
+# model. NATIVE = the modern descriptor-heap path (Vulkan 1.4 + descriptor
+# heap + untyped pointers). BINDLESS = the descriptor-indexing compatibility
+# path (declared; its backend lands in the compatibility phases).
+set(IZANAGI_VK_PROFILE "NATIVE" CACHE STRING "Vulkan capability profile: NATIVE | BINDLESS")
+set_property(CACHE IZANAGI_VK_PROFILE PROPERTY STRINGS NATIVE BINDLESS)
+
 if(NOT IZANAGI_BACKEND STREQUAL "VULKAN_NATIVE")
     message(FATAL_ERROR
         "IZANAGI_BACKEND=${IZANAGI_BACKEND} is not implemented yet. This phase "
         "ships the portable build boundary; VULKAN_COMPAT and METAL backends land "
         "in later phases. Supported now: VULKAN_NATIVE.")
+endif()
+if(NOT IZANAGI_VK_PROFILE STREQUAL "NATIVE")
+    message(FATAL_ERROR
+        "IZANAGI_VK_PROFILE=${IZANAGI_VK_PROFILE} is declared but its backend is "
+        "not implemented yet. The BINDLESS compatibility profile (descriptor "
+        "indexing arrays + typed physical pointers) lands in its own phases. "
+        "Supported now: NATIVE.")
 endif()
 
 # Resolve AUTO WSI per host.
@@ -93,10 +107,12 @@ add_library(izanagi STATIC
     src/common/containers.cpp
     src/common/format_info.cpp
     src/common/platform_utils.cpp
+    src/common/profile_report.cpp
     src/vk/volk_usage.cpp
     src/vk/vma_usage.cpp
     src/vk/gpu_to_vk.cpp
     src/vk/device.cpp
+    src/vk/profile.cpp
     src/vk/resources.cpp
     src/vk/pipeline.cpp
     src/vk/commands.cpp
@@ -129,6 +145,7 @@ target_compile_definitions(izanagi PRIVATE
     VK_NO_PROTOTYPES
     IZ_WSI_${IZANAGI_WSI}
     IZ_PROFILE="${IZANAGI_PROFILE}"
+    IZ_VK_PROFILE_${IZANAGI_VK_PROFILE}
 )
 if(IZANAGI_WSI STREQUAL "WIN32")
     target_compile_definitions(izanagi PRIVATE VK_USE_PLATFORM_WIN32_KHR)
@@ -203,14 +220,17 @@ if(IZANAGI_BUILD_TESTS)
 
     add_executable(izanagi_tests tests/api_tests.cpp)
     target_link_libraries(izanagi_tests PRIVATE izanagi)
+    target_include_directories(izanagi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(izanagi_tests PRIVATE IZ_VK_PROFILE_${IZANAGI_VK_PROFILE})
     add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3
                      izanagi_test_shaders4)
 
-    # GPU-independent container/arena tests (no Vulkan device required)
+    # GPU-independent container/arena/profile tests (no Vulkan device required)
     add_executable(izanagi_common_tests
         tests/common_tests.cpp
         src/common/containers.cpp
         src/common/platform_utils.cpp
+        src/common/profile_report.cpp
     )
     target_include_directories(izanagi_common_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -260,5 +280,6 @@ if(IZANAGI_BUILD_EXAMPLES AND IZANAGI_WSI STREQUAL "WIN32")
     )
     target_include_directories(izanagi_examples PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
     target_link_libraries(izanagi_examples PRIVATE izanagi)
+    target_compile_definitions(izanagi_examples PRIVATE IZ_VK_PROFILE_${IZANAGI_VK_PROFILE})
     add_dependencies(izanagi_examples izanagi_example_shaders izanagi_example_shaders2 izanagi_example_shaders3)
 endif()

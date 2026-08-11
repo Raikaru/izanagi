@@ -10,7 +10,8 @@
 #endif
 
 // --- Shader loading -----------------------------------------------------------
-// Resolves <exe_dir>/shaders/<name> so examples work regardless of CWD.
+// Resolves <exe_dir>/shaders/<profile>/<name> (falling back to the plain
+// shaders dir for older build trees) so examples work regardless of CWD.
 // The returned Span points at a static buffer valid until the next call;
 // pipeline creation copies the bytes synchronously, so this is safe.
 
@@ -27,10 +28,18 @@ gpu::Span<const uint8_t> example_load_shader(const char* name, uint32_t* out_siz
     if (!slash) { return {}; }
     *(slash + 1) = '\0';
 
-    char path[4096];
-    snprintf(path, sizeof(path), "%sshaders/%s", exe_path, name);
+    const char* profile_dir = "shaders/vk_native/";
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    profile_dir = "shaders/vk_bindless/";
+#endif
 
+    char path[4096];
+    snprintf(path, sizeof(path), "%s%s%s", exe_path, profile_dir, name);
     FILE* f = fopen(path, "rb");
+    if (!f) {
+        snprintf(path, sizeof(path), "%sshaders/%s", exe_path, name);
+        f = fopen(path, "rb");
+    }
     if (!f) {
         printf("Failed to open shader: %s\n", path);
         return {};

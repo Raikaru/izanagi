@@ -117,7 +117,9 @@ references at pool reset.
 - `CacheIdentity` carries both `cache_uuid` (the Vulkan `pipelineCacheUUID`,
   the primary compatibility key, read from the cache blob header) and
   `driver_uuid` (fallback when the driver exposes no header for an empty
-  cache).
+  cache), plus the backend **profile** that produced the blob — Native and
+  Bindless cache blobs are never interchangeable, even for the same driver and
+  GPU.
 - `flush_host_memory` / `invalidate_host_memory` synchronize non-coherent
   allocations (aligned to the non-coherent atom size, validated against the
   range). Coherent memory is a successful no-op. Call flush after writing an
@@ -158,6 +160,28 @@ and prewarming.
 One backend per compiled library: build configuration selects the backend
 (currently Vulkan 1.4 on Windows); `device_backend()` reports it. There is no
 runtime backend switching.
+
+## Backend profiles
+
+A backend may implement the public model through different private mechanisms.
+Each compiled profile is named and reported (`device_backend_profile()`);
+`IZANAGI_VK_PROFILE` selects the Vulkan profile at configure time:
+
+- **Native** (`BackendProfile::VulkanNative`) — the modern path: Vulkan 1.4,
+  `VK_EXT_descriptor_heap` global heap, untyped pointers, unified image
+  layouts, `vkCmdPushDataEXT` root args.
+- **Bindless** (`BackendProfile::VulkanBindless`) — the compatibility path:
+  descriptor-indexing arrays in a backend-private set, typed physical storage
+  buffer pointers, ordinary push constants, private image-layout handling.
+  Same public semantics: real GPU pointers + a persistent GPU-indexed
+  resource namespace. (Declared; its backend lands in the compatibility
+  phases. `IZANAGI_VK_PROFILE=BINDLESS` fails configure until then.)
+- **Metal** (`BackendProfile::Metal`) — future Apple backend.
+
+The profile never degrades semantics: a device that cannot preserve the
+pointer or global-resource model must be rejected with a complete capability
+report (see the profile evaluator, `src/common/profile_report.cpp` and
+`src/vk/profile.cpp`).
 
 ## Shutdown order
 

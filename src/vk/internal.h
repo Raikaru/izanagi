@@ -6,6 +6,7 @@
 
 #include "common/containers.h"
 #include "common/platform_utils.h"
+#include "common/profile_report.h"
 #include "gpu_to_vk.h"
 #include "vma_usage.h"
 #include "volk.h"
@@ -465,6 +466,11 @@ void       debug_set_compiler_paused(DeviceImpl* d, bool paused);
 void       debug_force_submit_failure(DeviceImpl* d, bool force);
 uint64_t   debug_queue_timeline(DeviceImpl* d);         // last successfully submitted value
 int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse resets
+
+// Profile capability snapshot (profile.cpp): fills a plain feature/limit
+// snapshot from the physical device so evaluate_vulkan_bindless_profile
+// (common/profile_report.cpp) can decide profile support.
+VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl* d);
 
 // pipeline.cpp internals used by commands.cpp / device.cpp
 void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec);

@@ -17,6 +17,7 @@
 #endif
 
 #include "izanagi/gpu.h"
+#include "common/profile_report.h"
 
 using namespace gpu;
 
@@ -31,6 +32,8 @@ void      debug_set_compiler_paused(DeviceImpl*, bool);
 void      debug_force_submit_failure(DeviceImpl*, bool);
 uint64_t  debug_queue_timeline(DeviceImpl*);         // last successfully submitted value
 int64_t   debug_pool_resets(DeviceImpl*);            // command-pool reuse resets
+// Fills a plain feature/limit snapshot from the physical device (profile.cpp).
+VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl*);
 uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
 }
 
@@ -80,6 +83,13 @@ static char g_arena_mem[4 * 1024 * 1024];
 
 // Find the shader directory relative to the executable
 static std::string find_shader_path(const char* name) {
+    // Shader artifacts live under a profile subdirectory (vk_native /
+    // vk_bindless) so Native and Bindless builds never collide; fall back to
+    // the plain directory for older build trees.
+    const char* profile_dir = "shaders/vk_native/";
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    profile_dir = "shaders/vk_bindless/";
+#endif
     // Resolve relative to the executable directory so tests run from any CWD.
 #ifdef _WIN32
     char exe_path[2048];
@@ -88,23 +98,29 @@ static std::string find_shader_path(const char* name) {
         char* slash = strrchr(exe_path, '\\');
         if (slash) {
             *(slash + 1) = '\0';
-            std::string path = std::string(exe_path) + "shaders/" + name;
+            std::string path = std::string(exe_path) + profile_dir + name;
+            if (std::filesystem::exists(path)) { return path; }
+            path = std::string(exe_path) + "shaders/" + name;
             if (std::filesystem::exists(path)) { return path; }
         }
     }
 #endif
     // Fallback: try relative candidates
     const char* candidates[] = {
+        "shaders/vk_native/",
         "shaders/",
+        "../shaders/vk_native/",
         "../shaders/",
+        "../../shaders/vk_native/",
         "../../shaders/",
+        "../../../shaders/vk_native/",
         "../../../shaders/",
     };
     for (auto* prefix : candidates) {
         std::string path = std::string(prefix) + name;
         if (std::filesystem::exists(path)) { return path; }
     }
-    return std::string("shaders/") + name;
+    return std::string(profile_dir) + name;
 }
 
 // --- Test 1: Device create/destroy ------------------------------------------------
@@ -2441,6 +2457,52 @@ static void test_concurrent_texture_submits() {
     printf("  PASS\n");
 }
 
+// --- Test 28: bindless profile report consistency -----------------------------------------
+// The capability evaluator runs against the physical device's REAL feature
+// bits. Invariant: the report never lists a requirement the device actually
+// supports (no hallucinated rejections), and native device creation implies
+// the bindless profile's real-pointer requirements.
+static void test_profile_report_consistency() {
+    printf("--- Test: bindless profile report consistency ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device dev = create_device(desc);
+    CHECK(dev != nullptr, "create_device returned null");
+
+    VulkanProfileFeatures f = query_vulkan_profile_features(dev);
+    VulkanProfileReport r   = evaluate_vulkan_bindless_profile(f);
+
+    CHECK(r.missing_count <= 16, "missing list fits its fixed buffer");
+    // Native profile creation requires bufferDeviceAddress (Vulkan 1.2
+    // feature enabled by create_logical_device), so the device has real
+    // shader-addressable pointers — the bindless report must agree.
+    CHECK(f.buffer_device_address, "native device creation implies bufferDeviceAddress");
+    CHECK(!r.missing_has(VulkanProfileRequirement::BufferDeviceAddress),
+          "real-pointer requirement satisfied on a working device");
+    // Determinism: re-evaluation is identical.
+    VulkanProfileReport r2 = evaluate_vulkan_bindless_profile(f);
+    CHECK(r.supported == r2.supported && r.missing_count == r2.missing_count,
+          "evaluation is deterministic");
+    for (uint32_t i = 0; i < r.missing_count; ++i) {
+        CHECK(r.missing[i] == r2.missing[i], "missing lists are deterministic");
+    }
+    // Capacity reporting: either the floor or the device's real limit when
+    // below the floor (and that below-floor case is listed as missing).
+    CHECK(r.sampled_image_capacity >= kMinBindlessSampledImages ||
+              r.missing_has(VulkanProfileRequirement::SampledImageCapacity),
+          "sampled capacity report is consistent with the missing list");
+    CHECK(r.storage_image_capacity >= kMinBindlessStorageImages ||
+              r.missing_has(VulkanProfileRequirement::StorageImageCapacity),
+          "storage capacity report is consistent with the missing list");
+    CHECK(r.sampler_capacity >= kMinBindlessSamplers ||
+              r.missing_has(VulkanProfileRequirement::SamplerCapacity),
+          "sampler capacity report is consistent with the missing list");
+
+    destroy_device(dev);
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2486,6 +2548,7 @@ int main() {
     test_descriptor_double_free();
     test_concurrent_texture_submits();
     test_dual_source_blend();
+    test_profile_report_consistency();
 
     printf("\n=================\n");
     if (g_failures == 0) {

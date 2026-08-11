@@ -142,6 +142,14 @@ enum class GpuPreference : uint8_t { Discrete = 0, Integrated };
 
 enum class Backend { Vulkan, Metal };
 
+// Selected capability profile of the compiled backend. Profiles preserve the
+// same public programming model (real GPU pointers + persistent GPU-indexed
+// resource namespace) using different private mechanisms; they never degrade
+// semantics. VulkanNative = the modern descriptor-heap path;
+// VulkanBindless = the descriptor-indexing compatibility path; Metal = the
+// future Apple backend.
+enum class BackendProfile : uint8_t { VulkanNative, VulkanBindless, Metal };
+
 enum class Memory : uint8_t {
     Default,   // CPU visible, optimized for CPU write -> GPU read
     Gpu,       // GPU-only
@@ -415,11 +423,15 @@ struct SamplerDesc {
 // per-driver identity (VkPhysicalDeviceIDProperties.driverUUID), used as a
 // fallback when the driver does not expose the cache UUID for an empty cache.
 struct CacheIdentity {
-    Backend  backend    = Backend::Vulkan;
-    uint32_t vendor_id  = 0;
-    uint32_t device_id  = 0;
-    uint8_t  driver_uuid[16] = {};
-    uint8_t  cache_uuid[16]  = {};
+    Backend        backend    = Backend::Vulkan;
+    // The backend profile that produced the cache blob. Native and Bindless
+    // blobs are never interchangeable, even for the same driver/GPU — the
+    // profile is part of the persistent-cache key.
+    BackendProfile profile    = BackendProfile::VulkanNative;
+    uint32_t       vendor_id  = 0;
+    uint32_t       device_id  = 0;
+    uint8_t        driver_uuid[16] = {};
+    uint8_t        cache_uuid[16]  = {};
 };
 // Optional persistent native pipeline cache (per device, whole-blob).
 // load is called once during create_device to seed the cache; return false
@@ -604,6 +616,9 @@ struct alignas(8) DrawIndexedIndirectGpuArgs {
 Device  create_device(const DeviceDesc&);
 void    destroy_device(Device);
 Backend device_backend();
+// Selected capability profile of the compiled backend (compile-time for the
+// current per-build profile selection).
+BackendProfile device_backend_profile();
 DeviceLimits device_limits(Device);
 void    device_wait_for_idle(Device);
 // True when dual-source blending (Factor::Src1*/OneMinusSrc1*) is supported

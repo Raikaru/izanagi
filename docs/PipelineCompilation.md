@@ -90,9 +90,11 @@ content bundle.
   `create_device` and persisted via `store` at `destroy_device` (and on
   explicit `flush_pipeline_cache`).
 - Cache data is optional: invalid or rejected blobs (driver/GPU mismatch) fall
-  back to an empty cache. `CacheIdentity` (backend, vendor/device IDs, driver
-  UUID) lets the application key storage; the blob itself is not transferable
-  across drivers or GPUs.
+  back to an empty cache. `CacheIdentity` (backend, **profile**, vendor/device
+  IDs, driver UUID) lets the application key storage; the blob itself is not
+  transferable across drivers, GPUs, or profiles — Native and Bindless blobs
+  are never treated as interchangeable, and the profile participates in the
+  persistent-cache key.
 - When the driver supports `pipelineCreationCacheControl`, the worker first
   probes with `VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT` and
   only runs a full compile when the driver reports compilation is required

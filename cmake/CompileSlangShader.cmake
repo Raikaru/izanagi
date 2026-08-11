@@ -16,6 +16,20 @@ function(add_slang_shader TARGET_NAME)
         message(FATAL_ERROR "add_slang_shader: OUTPUT is required")
     endif()
 
+    # Profile identity participates in artifact names: artifacts land in a
+    # <profile>/ subdirectory under the shaders dir, so Native and Bindless
+    # builds of the same source can never collide (and the runtime loader
+    # resolves the profile-specific path).
+    if(IZANAGI_VK_PROFILE STREQUAL "BINDLESS")
+        set(_profile_dir "vk_bindless")
+    else()
+        set(_profile_dir "vk_native")
+    endif()
+    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1${_profile_dir}/\\2" ARG_OUTPUT "${ARG_OUTPUT}")
+    if(NOT ARG_OUTPUT MATCHES "${_profile_dir}")
+        message(FATAL_ERROR "add_slang_shader: OUTPUT must be under a /shaders/ directory")
+    endif()
+
     # Debug/Release flag swap — use plain variables, not generator expressions
     # (VS generator doesn't evaluate $<CONFIG> inside add_custom_command reliably)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR "${CMAKE_CONFIGURATION_TYPES}" MATCHES "Debug")
