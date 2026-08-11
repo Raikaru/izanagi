@@ -176,18 +176,21 @@ struct DescriptorHeap {
 };
 
 // --- Command pool management --------------------------------------------------------
+// Pools are retired by queue timeline value, never by presentation frame
+// counters: a pool is reusable only when the queue's completed timeline is at
+// least its retire_value (the last submission that used a command buffer from
+// it). Headless workloads therefore work without presentation.
 struct CommandPool {
     VkCommandPool   command_pool = VK_NULL_HANDLE;
     SegmentArray<CommandBufferImpl> command_buffers;
     int64_t         buffer_free_idx = 0;
-    uint64_t        frame_idx       = 0;
+    uint64_t        retire_value = 0;   // reusable when completed >= this
+    uint32_t        outstanding = 0;    // recorded, not yet submitted
 };
 
 struct CommandSuperpool {
-    static constexpr uint32_t kPoolsPerGroup          = kMaxFramesInFlight;
     static constexpr uint32_t kMaxSimultaneousCommands = 64;
-    int64_t     available_pools = ~0ll;
-    CommandPool pools[kMaxSimultaneousCommands * kPoolsPerGroup] = {};
+    CommandPool pools[kMaxSimultaneousCommands] = {};
 };
 
 // --- Event (deferred completion callback) -------------------------------------------
@@ -284,6 +287,12 @@ struct DeviceImpl {
     int64_t stat_full_compiles   = 0;
     int64_t stat_failures        = 0;
     int64_t stat_max_queue_depth = 0;
+    // Queue/submission diagnostics
+    int64_t stat_submissions     = 0;
+    int64_t stat_failed_submits  = 0;
+    int64_t stat_pool_resets     = 0;
+    // Test hooks
+    int64_t force_submit_failure = 0;   // atomic: make queue_submit fail without submitting
 
     // Descriptor heap
     DescriptorHeap heap;
@@ -312,7 +321,9 @@ struct QueueImpl {
     CommandSuperpool command_superpool = {};
     Handle<Semaphore> timeline;
     uint32_t         queue_family  = 0;
-    uint64_t         timeline_value = 0;
+    uint64_t         timeline_value = 0;   // last successfully submitted value
+    // Serializes queue submission and presentation on this queue.
+    mutex            submit_lock   = IZ_MUTEX_INIT;
     Vector<CompletionEvent> pending_events;
     // Pipeline references retained for submitted-but-uncompleted work
     // (sorted by timeline_value; drained by queue_process_events).
@@ -357,8 +368,7 @@ void   log_vk_impl(DeviceImpl* d, VkResult res, Span<const char> msg, uint32_t l
 BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr);
 
 // Command pool management (commands.cpp)
-CommandPool*  get_command_pool(QueueImpl* queue, uint64_t frame_idx);
-void          release_command_pool(QueueImpl* q, CommandPool* pool);
+CommandPool*  get_command_pool(QueueImpl* queue);
 CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool);
 
 // Surface helpers (surface.cpp)
@@ -374,6 +384,9 @@ void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreat
 uint32_t   debug_live_pipelines(DeviceImpl* d);         // records in the dedup map
 uintptr_t  debug_last_compile_thread(DeviceImpl* d);    // thread id of the last native compile (0 = none)
 void       debug_set_compiler_paused(DeviceImpl* d, bool paused);
+void       debug_force_submit_failure(DeviceImpl* d, bool force);
+uint64_t   debug_queue_timeline(DeviceImpl* d);         // last successfully submitted value
+int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse resets
 
 // pipeline.cpp internals used by commands.cpp / device.cpp
 void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec);

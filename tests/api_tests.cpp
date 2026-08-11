@@ -28,6 +28,9 @@ struct DeviceImpl;
 uint32_t  debug_live_pipelines(DeviceImpl*);         // records in the dedup map
 uintptr_t debug_last_compile_thread(DeviceImpl*);    // thread that last compiled natively
 void      debug_set_compiler_paused(DeviceImpl*, bool);
+void      debug_force_submit_failure(DeviceImpl*, bool);
+uint64_t  debug_queue_timeline(DeviceImpl*);         // last successfully submitted value
+int64_t   debug_pool_resets(DeviceImpl*);            // command-pool reuse resets
 uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
 }
 
@@ -1965,6 +1968,92 @@ static void test_async_shutdown_with_pending() {
     printf("  PASS\n");
 }
 
+// --- Test 23: Submission tokens ---------------------------------------------------------------
+static void test_submission_tokens() {
+    printf("--- Test: submission tokens ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+
+    Queue q = get_queue(d);
+    CHECK(q != nullptr, "get_queue failed");
+
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "recording failed");
+    cmd_finalize(cmd);
+    Submission s1 = queue_submit(q, {&cmd, 1});
+    CHECK(s1.status == SubmitStatus::Success, "first submit must succeed");
+    CHECK(s1.value == 1, "first submission value is 1");
+    CHECK(s1.queue == q, "submission carries the queue");
+    CHECK(debug_queue_timeline(impl) == 1, "logical timeline published on success");
+    CHECK(wait_submission(s1), "wait_submission must complete");
+    CHECK(submission_complete(s1), "submission_complete true after completion");
+
+    // Injected failure: no native submit, no logical timeline advance.
+    gpu::debug_force_submit_failure(impl, true);
+    CommandBuffer cmd2 = queue_start_command_recording(q);
+    CHECK(cmd2 != nullptr, "recording failed");
+    cmd_finalize(cmd2);
+    Submission s2 = queue_submit(q, {&cmd2, 1});
+    CHECK(s2.status == SubmitStatus::Error, "forced failure reports Error");
+    CHECK(s2.value == 2, "failed submit carries the prospective value");
+    CHECK(debug_queue_timeline(impl) == 1, "logical timeline must not advance on failure");
+    CHECK(!submission_complete(s2) && !wait_submission(s2),
+          "failed submission never completes and never blocks");
+    gpu::debug_force_submit_failure(impl, false);
+
+    // The next successful submit continues from the published value.
+    CommandBuffer cmd3 = queue_start_command_recording(q);
+    CHECK(cmd3 != nullptr, "recording failed");
+    cmd_finalize(cmd3);
+    Submission s3 = queue_submit(q, {&cmd3, 1});
+    CHECK(s3.status == SubmitStatus::Success && s3.value == 2,
+          "timeline continues from the last published value");
+    CHECK(wait_submission(s3), "third submit must complete");
+    CHECK(debug_queue_timeline(impl) == 2, "timeline published for the third submit");
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 24: Headless command-pool retirement ------------------------------------------------
+static void test_headless_pool_retirement() {
+    printf("--- Test: headless pool retirement ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+
+    Queue q = get_queue(d);
+    const int64_t resets_before = gpu::debug_pool_resets(impl);
+    Submission last{};
+    for (int i = 0; i < 2000; ++i) {
+        CommandBuffer cmd = queue_start_command_recording(q);
+        if (cmd == nullptr) {
+            CHECK(false, "recording failed (pool starvation)");
+            break;
+        }
+        cmd_finalize(cmd);
+        last = queue_submit(q, {&cmd, 1});
+        CHECK(last.status == SubmitStatus::Success, "headless submit failed");
+        CHECK(last.value == static_cast<uint64_t>(i + 1), "submission values are sequential");
+    }
+    CHECK(wait_submission(last), "last headless submission must complete");
+    CHECK(gpu::debug_pool_resets(impl) > resets_before,
+          "pools must be reused (reset) headless, independent of presentation");
+    CHECK(submission_complete(last), "submission_complete true after wait");
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2001,6 +2090,8 @@ int main() {
     test_async_input_ownership();
     test_async_dedup_concurrent();
     test_async_shutdown_with_pending();
+    test_submission_tokens();
+    test_headless_pool_retirement();
     test_dual_source_blend();
 
     printf("\n=================\n");

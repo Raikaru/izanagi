@@ -343,6 +343,17 @@ enum class PresentMode : uint8_t { Immediate, Mailbox, Fifo, FifoRelaxed, ValidC
 
 enum class SurfaceStatus : uint8_t { Success, Suboptimal, OutOfDate, Error };
 
+// Result of queue_submit: identifies the submitted GPU work by its queue
+// timeline value. The logical timeline advances only on a successful submit.
+enum class SubmitStatus : uint8_t { Success, DeviceLost, OutOfMemory, Error };
+struct Submission {
+    Queue        queue  = nullptr;
+    uint64_t     value  = 0;
+    SubmitStatus status = SubmitStatus::Error;
+
+    explicit operator bool() const { return status == SubmitStatus::Success; }
+};
+
 enum class SamplerCoords : uint8_t { Normalized, Pixel };
 
 enum class SamplerFilter : uint8_t { Nearest, Linear };
@@ -658,10 +669,20 @@ void              wait_semaphore(Device, Handle<Semaphore>, uint64_t value);
 void              free(Device, Handle<Semaphore>);
 Queue             get_queue(Device, QueueType = QueueType::Default);
 CommandBuffer     queue_start_command_recording(Queue);
-void              queue_submit(Queue,
+// Submits command buffers, serialized per queue. Returns a Submission that
+// identifies the work; the queue's logical timeline advances only when the
+// native submit succeeds (a failed submit never publishes a value the GPU
+// will not signal). Non-blocking with respect to GPU completion.
+Submission        queue_submit(Queue,
                                Span<const CommandBuffer>,
                                Span<const SemaphoreInfo> wait   = {},
                                Span<const SemaphoreInfo> signal = {});
+// True once the submission's GPU work has completed. False for failed
+// submissions and for incomplete work.
+bool              submission_complete(Submission);
+// Blocks until the submission's GPU work completes; true only for successful
+// submissions that complete. Intended for loading phases, not frame recording.
+bool              wait_submission(Submission);
 void              queue_on_submitted_work_completed(Queue, void (*fn)(void*), void* userdata);
 void              queue_process_events(Queue);
 

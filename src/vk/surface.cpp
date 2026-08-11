@@ -307,6 +307,7 @@ SurfaceTextureInfo get_current_texture(Device dev) {
 SurfaceStatus present(Device dev, Queue q) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     auto& s = d->surface;
+    auto* queue_impl = reinterpret_cast<QueueImpl*>(q);
 
     const VkSemaphore present_sem =
         d->semaphore_pool[handle_cast<SemaphoreImpl>(s.present_semaphores[s.current_image_idx])].vk_semaphore;
@@ -322,7 +323,10 @@ SurfaceStatus present(Device dev, Queue q) {
         .pResults           = nullptr,
     };
 
+    // Presentation and submission are serialized per queue.
+    mutex_lock(&queue_impl->submit_lock);
     VkResult result = vkQueuePresentKHR(q->queue, &present_info);
+    mutex_unlock(&queue_impl->submit_lock);
     s.frame_idx++;
 
     switch (result) {

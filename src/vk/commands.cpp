@@ -30,10 +30,10 @@ void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
 
 // --- Command pool management -----------------------------------------------------------
 
-static void reset_command_pool(VkDevice device, CommandPool* pool) {
+static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
     // Release pipeline references retained by recorded-but-never-submitted
     // command buffers (their commands are discarded; the GPU never executed
-    // them, and the pool reuse is frame-paced past any prior completion).
+    // them, and pool reuse is gated on queue timeline completion).
     for (uint32_t i = 0; i < pool->command_buffers.size(); ++i) {
         auto& cb = pool->command_buffers[i];
         if (cb.device == nullptr) { continue; }
@@ -42,64 +42,49 @@ static void reset_command_pool(VkDevice device, CommandPool* pool) {
         }
         cb.retained_pipelines.clear();
     }
-    vkResetCommandPool(device, pool->command_pool, 0);
+    vkResetCommandPool(d->device, pool->command_pool, 0);
     pool->buffer_free_idx = 0;
+    atomic_fetch_add(&d->stat_pool_resets, 1);
 }
 
-CommandPool* get_command_pool(QueueImpl* queue, uint64_t frame_idx) {
-    CommandSuperpool& superpool       = queue->command_superpool;
-    CommandPool*      pool            = nullptr;
-    int64_t           available_pools = atomic_load(&superpool.available_pools);
-    bool              index_good      = false;
-    uint64_t          idx;
-    while (!index_good && available_pools != 0) {
-        idx                    = count_trailing_zeros(available_pools);
-        const int64_t  mask    = ~(1ll << idx);
-        const int64_t  desired = static_cast<int64_t>(available_pools & mask);
-        index_good = atomic_compare_exchange(&superpool.available_pools, &available_pools, desired);
-    };
+CommandPool* get_command_pool(QueueImpl* queue) {
+    auto* d = queue->device;
 
-    if (index_good) {
-        pool = &superpool.pools[CommandSuperpool::kPoolsPerGroup * idx +
-                                (frame_idx % CommandSuperpool::kPoolsPerGroup)];
+    // Completed timeline: a pool is reusable only once all submitted command
+    // buffers allocated from it have completed (retire_value <= completed).
+    uint64_t completed = 0;
+    VkSemaphore timeline_sem =
+        d->semaphore_pool[handle_cast<SemaphoreImpl>(queue->timeline)].vk_semaphore;
+    vkGetSemaphoreCounterValue(d->device, timeline_sem, &completed);
 
-        if (pool->command_pool == VK_NULL_HANDLE) {
-            VkCommandPoolCreateInfo pool_info{
+    for (auto& pool : queue->command_superpool.pools) {
+        if (pool.outstanding != 0) { continue; }
+        if (pool.command_pool == VK_NULL_HANDLE) {
+            const VkCommandPoolCreateInfo pool_info{
                 .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                 .pNext            = nullptr,
                 .flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
                 .queueFamilyIndex = queue->queue_family,
             };
             VkCommandPool command_pool = VK_NULL_HANDLE;
-            if (!IZ_CHK(queue->device,
-                        vkCreateCommandPool(queue->device->device, &pool_info, nullptr, &command_pool),
+            if (!IZ_CHK(d, vkCreateCommandPool(d->device, &pool_info, nullptr, &command_pool),
                         "get_command_pool failed")) {
                 return nullptr;
             }
-            *pool = CommandPool{
-                .command_pool    = command_pool,
-                .command_buffers = SegmentArray<CommandBufferImpl>(queue->device->allocator),
-                .buffer_free_idx = 0,
-                .frame_idx       = frame_idx,
-            };
-        } else if (pool->frame_idx != frame_idx) {
-            reset_command_pool(queue->device->device, pool);
-            pool->frame_idx = frame_idx;
+            pool.command_pool      = command_pool;
+            pool.command_buffers   = SegmentArray<CommandBufferImpl>(d->allocator);
+            pool.buffer_free_idx   = 0;
+            pool.retire_value      = 0;
+            pool.outstanding       = 0;
+            return &pool;
         }
-    } else {
-        IZ_LOG(queue->device, LogLevel::Error, "Too many command buffers in flight");
+        if (pool.retire_value <= completed) {
+            reset_command_pool(d, &pool);
+            return &pool;
+        }
     }
-    return pool;
-}
-
-void release_command_pool(QueueImpl* q, CommandPool* pool) {
-    auto&         superpool = q->command_superpool;
-    const int64_t idx       = (pool - superpool.pools) / CommandSuperpool::kPoolsPerGroup;
-    int64_t previous = atomic_load(&superpool.available_pools);
-    int64_t desired  = previous | (1ll << idx);
-    while (!atomic_compare_exchange(&superpool.available_pools, &previous, desired)) {
-        desired = previous | (1ll << idx);
-    }
+    IZ_LOG(d, LogLevel::Error, "Too many command buffers in flight");
+    return nullptr;
 }
 
 CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
@@ -131,12 +116,13 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
     result->wait_for_surface_texture = false;
     result->signal_surface_texture   = false;
     pool->buffer_free_idx++;
+    pool->outstanding++;   // the pool stays checked out until this cb is submitted
     return result;
 }
 
 CommandBuffer queue_start_command_recording(Queue q) {
     auto* d = q->device;
-    CommandPool* pool = get_command_pool(q, d->surface.frame_idx);
+    CommandPool* pool = get_command_pool(q);
     if (pool == nullptr) { return nullptr; }
 
     CommandBuffer buffer = get_command_buffer(q, pool);
@@ -160,19 +146,20 @@ CommandBuffer queue_start_command_recording(Queue q) {
 
 void cmd_finalize(CommandBuffer cmd) {
     auto* d = cmd->device;
-    auto* q = cmd->queue;
     IZ_CHK(d, vkEndCommandBuffer(cmd->buffer), "cmd_finalize failed");
-    release_command_pool(q, cmd->pool);
+    // The command pool stays checked out until this command buffer is
+    // submitted; finalizing does not make the pool GPU-safe for reuse.
 }
 
 // --- Queue submission -----------------------------------------------------------------
 
-void queue_submit(Queue                     q,
-                  Span<const CommandBuffer> command_buffers,
-                  Span<const SemaphoreInfo> wait_semaphores,
-                  Span<const SemaphoreInfo> signal_semaphores) {
+Submission queue_submit(Queue                     q,
+                        Span<const CommandBuffer> command_buffers,
+                        Span<const SemaphoreInfo> wait_semaphores,
+                        Span<const SemaphoreInfo> signal_semaphores) {
     auto* d = q->device;
     Arena*  arena = get_thread_local_arena(d);
+    if (arena == nullptr) { return {}; }
     ScratchScope scope(*arena);
 
     Span<VkSemaphoreSubmitInfo>     wait_info{};
@@ -312,35 +299,37 @@ void queue_submit(Queue                     q,
                              });
     }
 
-    // Advance queue timeline
+    // Serialize submission (and presentation) per queue.
+    mutex_lock(&q->submit_lock);
+    const uint64_t submit_value = q->timeline_value + 1;
+
+    // Test hook: injected failure — no native submit, no timeline advance.
+    if (atomic_load(&d->force_submit_failure)) {
+        atomic_fetch_add(&d->stat_failed_submits, 1);
+        mutex_unlock(&q->submit_lock);
+        return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
+    }
+
+    // Advance queue timeline with the prospective value; published only on
+    // a successful submit so the GPU never receives an unsignalable value.
     signal_info = concat(arena, signal_info,
                          VkSemaphoreSubmitInfo{
                              .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                              .pNext       = nullptr,
                              .semaphore   = d->semaphore_pool[handle_cast<SemaphoreImpl>(q->timeline)].vk_semaphore,
-                             .value       = ++(q->timeline_value),
+                             .value       = submit_value,
                              .stageMask   = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                              .deviceIndex = 0,
                          });
 
-    // Retain pipelines bound in these command buffers until this submit's
-    // timeline value completes (released by queue_process_events).
-    for (uint32_t i = 0; i < command_buffers.size(); ++i) {
-        auto& retained = command_buffers[i]->retained_pipelines;
-        if (retained.is_empty()) { continue; }
-        MemoryBlock blk = d->allocator.alloc(sizeof(PipelineRefBatch));
-        if (blk.ptr == nullptr) { continue; }   // refs stay in the cb; released at pool reset
-        auto* batch = ::new (blk.ptr) PipelineRefBatch{
-            .device         = d,
-            .timeline_value = q->timeline_value,
-            .records        = Vector<PipelineRecord*>(d->allocator),
-        };
-        for (PipelineRecord* rec : retained) { batch->records.push_back(rec); }
-        retained.clear();
-        q->in_flight_batches.push_back(batch);
+    if (arena->overflowed()) {
+        atomic_fetch_add(&d->stat_failed_submits, 1);
+        mutex_unlock(&q->submit_lock);
+        IZ_LOG(d, LogLevel::Error, "queue_submit: scratch arena overflow, submission aborted");
+        return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
     }
 
-    VkSubmitInfo2 submit_info{
+    const VkSubmitInfo2 submit_info{
         .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .pNext                    = nullptr,
         .flags                    = 0,
@@ -351,13 +340,84 @@ void queue_submit(Queue                     q,
         .signalSemaphoreInfoCount = static_cast<uint32_t>(signal_info.size()),
         .pSignalSemaphoreInfos    = signal_info.data(),
     };
-    // Scratch overflow aborts the operation: the submit structures may be
-    // truncated. Never submit a potentially-garbage batch.
-    if (arena->overflowed()) {
-        IZ_LOG(d, LogLevel::Error, "queue_submit: scratch arena overflow, submission aborted");
-        return;
+
+    const VkResult result = vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        atomic_fetch_add(&d->stat_failed_submits, 1);
+        log_vk_impl(d, result, "queue_submit: vkQueueSubmit2 failed", __LINE__, "commands.cpp"_sv);
+        mutex_unlock(&q->submit_lock);
+        Submission s{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
+        if (result == VK_ERROR_DEVICE_LOST) { s.status = SubmitStatus::DeviceLost; }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            s.status = SubmitStatus::OutOfMemory;
+        }
+        return s;
     }
-    vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
+
+    // Success: publish the logical timeline, retire command pools, and
+    // transfer pipeline references into an in-flight batch.
+    q->timeline_value = submit_value;
+    atomic_fetch_add(&d->stat_submissions, 1);
+    for (uint32_t i = 0; i < command_buffers.size(); ++i) {
+        CommandPool* pool = command_buffers[i]->pool;
+        if (pool != nullptr && pool->outstanding > 0) {
+            pool->outstanding--;
+            if (pool->retire_value < submit_value) { pool->retire_value = submit_value; }
+        }
+        auto& retained = command_buffers[i]->retained_pipelines;
+        if (retained.is_empty()) { continue; }
+        MemoryBlock blk = d->allocator.alloc(sizeof(PipelineRefBatch));
+        if (blk.ptr == nullptr) { continue; }   // refs stay in the cb; released at pool reset
+        auto* batch = ::new (blk.ptr) PipelineRefBatch{
+            .device         = d,
+            .timeline_value = submit_value,
+            .records        = Vector<PipelineRecord*>(d->allocator),
+        };
+        for (PipelineRecord* rec : retained) { batch->records.push_back(rec); }
+        retained.clear();
+        q->in_flight_batches.push_back(batch);
+    }
+    mutex_unlock(&q->submit_lock);
+    return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Success};
+}
+
+bool submission_complete(Submission s) {
+    if (s.status != SubmitStatus::Success || s.queue == nullptr) { return false; }
+    auto* q = reinterpret_cast<QueueImpl*>(s.queue);
+    auto* d = q->device;
+    uint64_t counter = 0;
+    VkSemaphore sem = d->semaphore_pool[handle_cast<SemaphoreImpl>(q->timeline)].vk_semaphore;
+    if (vkGetSemaphoreCounterValue(d->device, sem, &counter) != VK_SUCCESS) { return false; }
+    return counter >= s.value;
+}
+
+bool wait_submission(Submission s) {
+    if (s.status != SubmitStatus::Success || s.queue == nullptr) { return false; }
+    auto* q = reinterpret_cast<QueueImpl*>(s.queue);
+    auto* d = q->device;
+    VkSemaphore sem = d->semaphore_pool[handle_cast<SemaphoreImpl>(q->timeline)].vk_semaphore;
+    const VkSemaphoreWaitInfo wait_info{
+        .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .pNext          = nullptr,
+        .flags          = 0,
+        .semaphoreCount = 1,
+        .pSemaphores    = &sem,
+        .pValues        = &s.value,
+    };
+    return vkWaitSemaphores(d->device, &wait_info, UINT64_MAX) == VK_SUCCESS;
+}
+
+// White-box test hooks
+void debug_force_submit_failure(DeviceImpl* d, bool force) {
+    atomic_exchange(&d->force_submit_failure, force ? 1 : 0);
+}
+
+uint64_t debug_queue_timeline(DeviceImpl* d) {
+    return d->default_queue ? d->default_queue->timeline_value : 0;
+}
+
+int64_t debug_pool_resets(DeviceImpl* d) {
+    return atomic_load(&d->stat_pool_resets);
 }
 
 // Releases the pipeline references retained for a completed submission.
