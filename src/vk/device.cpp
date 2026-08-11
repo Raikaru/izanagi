@@ -44,7 +44,7 @@ static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_H
     // code runs on both.
 #if defined(IZ_VK_PROFILE_BINDLESS)
     VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
-    VK_KHR_SYNCHRONIZATION2_EXTENSION_NAME,
+    VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
 #endif
 };
 static constexpr size_t kRequiredDeviceExtensionsCount =
@@ -357,7 +357,13 @@ static VkResult create_logical_device(DeviceImpl* d) {
     // it first and enable only when supported (pipeline creation rejects
     // Src1* factors on devices without it).
     device_features.features.samplerAnisotropy = VK_TRUE;
-#if !defined(IZ_VK_PROFILE_BINDLESS)
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // OPTIONAL features are enabled only when the device supports them —
+    // forcing them would fail vkCreateDevice on otherwise-valid bindless
+    // devices (e.g. dzn lacks shaderInt8/storage8 access).
+    auto enable_if_supported = [](VkBool32 supported) { return supported == VK_TRUE ? VK_TRUE : VK_FALSE; };
+    device_features.features.shaderInt16      = enable_if_supported(device_features.features.shaderInt16);
+#else
     device_features.features.shaderInt16       = VK_TRUE;
 #endif
     device_features.features.multiDrawIndirect = VK_TRUE;
@@ -382,18 +388,10 @@ static VkResult create_logical_device(DeviceImpl* d) {
 #if defined(IZ_VK_PROFILE_BINDLESS)
     // Bindless: descriptor-indexing arrays ARE the global heap. Enable the
     // exact bits the global-set model needs; unsupported bits were already
-    // rejected by the bindless gate in create_device. OPTIONAL features
-    // (int8, float16, 8/16-bit storage access, push-constant storage) are
-    // enabled only when the device supports them — forcing them would make
-    // vkCreateDevice fail on otherwise-valid bindless devices.
-    auto enable_if_supported = [](VkBool32 supported) { return supported == VK_TRUE ? VK_TRUE : VK_FALSE; };
+    // rejected by the bindless gate in create_device.
     vulkan12_features.shaderInt8              = enable_if_supported(vulkan12_features.shaderInt8);
     vulkan12_features.shaderFloat16           = enable_if_supported(vulkan12_features.shaderFloat16);
     vulkan12_features.storagePushConstant8    = enable_if_supported(vulkan12_features.storagePushConstant8);
-    vulkan12_features.shaderInt8              = enable_if_supported(vulkan12_features.shaderInt8);
-    vulkan12_features.shaderFloat16           = enable_if_supported(vulkan12_features.shaderFloat16);
-    vulkan12_features.storagePushConstant8    = enable_if_supported(vulkan12_features.storagePushConstant8);
-    vulkan12_features.shaderInt16             = enable_if_supported(vulkan12_features.shaderInt16);
     vulkan12_features.storageBuffer8BitAccess = enable_if_supported(vulkan12_features.storageBuffer8BitAccess);
     vulkan11_features.storageBuffer16BitAccess = enable_if_supported(vulkan11_features.storageBuffer16BitAccess);
     vulkan12_features.descriptorIndexing = enable_if_supported(vulkan12_features.descriptorIndexing);
