@@ -19,13 +19,15 @@ namespace gpu {
 #endif
 #if defined(IZ_VK_PROFILE_BINDLESS)
 #    define IZ_REQUIRE_HEAP_TRIO 0
+#    define IZ_REQUIRE_KHR_RENDERING 2   // dynamic rendering + sync2 (KHR route on 1.2)
 #else
 #    define IZ_REQUIRE_HEAP_TRIO 1
+#    define IZ_REQUIRE_KHR_RENDERING 0
 #endif
 // Sized to the max possible count (+1 keeps the array well-formed even when a
 // configuration requires nothing, e.g. bindless + headless); the count is the
 // macro expression, so the extension loop only checks what is required.
-static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + 1] = {
+static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + IZ_REQUIRE_KHR_RENDERING + 1] = {
 #if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 #endif
@@ -36,9 +38,17 @@ static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_H
     VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
     VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
 #endif
+    // Bindless needs dynamic rendering + synchronization2: on 1.3+ devices
+    // these are cores (enabling the KHR names is a legal no-op); on 1.2
+    // devices the KHR extensions provide the same entry points, so the same
+    // code runs on both.
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+    VK_KHR_SYNCHRONIZATION2_EXTENSION_NAME,
+#endif
 };
 static constexpr size_t kRequiredDeviceExtensionsCount =
-    IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3;
+    IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + IZ_REQUIRE_KHR_RENDERING;
 
 // --- Logging -------------------------------------------------------------------------
 static void null_log_callback(LogLevel, Span<const char>, uint32_t, Span<const char>, void*) {}
@@ -137,10 +147,10 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
         .pEngineName        = "izanagi",
         .engineVersion      = 0,
 #if defined(IZ_VK_PROFILE_BINDLESS)
-        // Initial bindless slice targets Vulkan 1.3+ (dynamic rendering +
-        // synchronization2 are 1.3 cores; the legacy fallbacks that enable
-        // 1.2 devices land in a later phase).
-        .apiVersion         = VK_API_VERSION_1_3,
+        // Bindless: Vulkan 1.2 instance; dynamic rendering + synchronization2
+        // are enabled as KHR extensions on 1.2 devices (or left as 1.3 cores
+        // when available — the promoted entry points resolve identically).
+        .apiVersion         = VK_API_VERSION_1_2,
 #else
         .apiVersion         = VK_API_VERSION_1_4,
 #endif
@@ -222,9 +232,11 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         vkGetPhysicalDeviceProperties(devices[i], &props);
 
 #if defined(IZ_VK_PROFILE_BINDLESS)
-        // Bindless initial slice: Vulkan 1.3+ (exact feature gate in
-        // create_device, below).
-        if (props.apiVersion < VK_API_VERSION_1_3) { continue; }
+        // Bindless: Vulkan 1.2+ (dynamic rendering + synchronization2 are
+        // required and enabled either as 1.3 cores or via their KHR
+        // extensions on 1.2 devices — see kRequiredDeviceExtensions). The
+        // exact feature gate is in create_device, below.
+        if (props.apiVersion < VK_API_VERSION_1_2) { continue; }
 #else
         // Require Vulkan 1.4
         if (props.apiVersion < VK_API_VERSION_1_4) { continue; }
@@ -266,6 +278,9 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         }
         if (!all_supported) { continue; }
 
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        fprintf(stderr, "sel: dzn probe %u.%u.%u fam=%d exts=%d\n", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), graphics_family, (int)all_supported);
+#endif
         // Select based on preference
         if (best == VK_NULL_HANDLE) {
             best        = devices[i];
@@ -342,7 +357,9 @@ static VkResult create_logical_device(DeviceImpl* d) {
     // it first and enable only when supported (pipeline creation rejects
     // Src1* factors on devices without it).
     device_features.features.samplerAnisotropy = VK_TRUE;
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     device_features.features.shaderInt16       = VK_TRUE;
+#endif
     device_features.features.multiDrawIndirect = VK_TRUE;
     d->dual_src_blend = device_features.features.dualSrcBlend == VK_TRUE;
     if (d->dual_src_blend) {
@@ -350,24 +367,35 @@ static VkResult create_logical_device(DeviceImpl* d) {
     }
 
     vulkan11_features.shaderDrawParameters = VK_TRUE;
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     // 8/16-bit storage access through physical-storage-buffer pointers
     // (needed by the capability-gated ABI test; universal on 1.1+ drivers).
     vulkan11_features.storageBuffer16BitAccess = VK_TRUE;
 
     vulkan12_features.storageBuffer8BitAccess = VK_TRUE;
+#endif
 
     vulkan12_features.timelineSemaphore       = VK_TRUE;
     vulkan12_features.bufferDeviceAddress     = VK_TRUE;
-    vulkan12_features.shaderInt8              = VK_TRUE;
-    vulkan12_features.shaderFloat16           = VK_TRUE;
     vulkan12_features.scalarBlockLayout       = VK_TRUE;
     vulkan12_features.drawIndirectCount       = VK_TRUE;
-    vulkan12_features.storagePushConstant8    = VK_TRUE;
 #if defined(IZ_VK_PROFILE_BINDLESS)
     // Bindless: descriptor-indexing arrays ARE the global heap. Enable the
     // exact bits the global-set model needs; unsupported bits were already
-    // rejected by the bindless gate in create_device.
+    // rejected by the bindless gate in create_device. OPTIONAL features
+    // (int8, float16, 8/16-bit storage access, push-constant storage) are
+    // enabled only when the device supports them — forcing them would make
+    // vkCreateDevice fail on otherwise-valid bindless devices.
     auto enable_if_supported = [](VkBool32 supported) { return supported == VK_TRUE ? VK_TRUE : VK_FALSE; };
+    vulkan12_features.shaderInt8              = enable_if_supported(vulkan12_features.shaderInt8);
+    vulkan12_features.shaderFloat16           = enable_if_supported(vulkan12_features.shaderFloat16);
+    vulkan12_features.storagePushConstant8    = enable_if_supported(vulkan12_features.storagePushConstant8);
+    vulkan12_features.shaderInt8              = enable_if_supported(vulkan12_features.shaderInt8);
+    vulkan12_features.shaderFloat16           = enable_if_supported(vulkan12_features.shaderFloat16);
+    vulkan12_features.storagePushConstant8    = enable_if_supported(vulkan12_features.storagePushConstant8);
+    vulkan12_features.shaderInt16             = enable_if_supported(vulkan12_features.shaderInt16);
+    vulkan12_features.storageBuffer8BitAccess = enable_if_supported(vulkan12_features.storageBuffer8BitAccess);
+    vulkan11_features.storageBuffer16BitAccess = enable_if_supported(vulkan11_features.storageBuffer16BitAccess);
     vulkan12_features.descriptorIndexing = enable_if_supported(vulkan12_features.descriptorIndexing);
     vulkan12_features.shaderSampledImageArrayNonUniformIndexing =
         enable_if_supported(vulkan12_features.shaderSampledImageArrayNonUniformIndexing);
@@ -493,7 +521,7 @@ static VkResult create_vma_allocator(DeviceImpl* d) {
         .pVulkanFunctions            = &vulkan_functions,
         .instance                    = d->instance,
 #if defined(IZ_VK_PROFILE_BINDLESS)
-        .vulkanApiVersion            = VK_API_VERSION_1_3,
+        .vulkanApiVersion            = d->device_api_version,
 #else
         .vulkanApiVersion            = VK_API_VERSION_1_4,
 #endif
@@ -993,6 +1021,7 @@ Device create_device(const DeviceDesc& desc) {
         d->cache_identity.backend   = Backend::Vulkan;
         d->cache_identity.profile   = device_backend_profile();
         d->cache_identity.vendor_id = props2.properties.vendorID;
+        d->device_api_version       = props2.properties.apiVersion;
         d->cache_identity.device_id = props2.properties.deviceID;
         memcpy(d->cache_identity.driver_uuid, id_props.driverUUID,
                sizeof(d->cache_identity.driver_uuid));

@@ -287,6 +287,7 @@ struct DeviceImpl {
     // is a test hook to hardware-validate the legacy path on any device.
     bool                      use_synchronization2 = true;
     int64_t                   force_legacy_barriers = 0;
+    uint32_t                  device_api_version = VK_API_VERSION_1_4;
 
     // Debug
     bool                      has_debug_markers   = false;
