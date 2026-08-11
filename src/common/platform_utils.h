@@ -43,6 +43,17 @@ using rwlock = pthread_rwlock_t;
 #    define IZ_RWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
 #endif
 
+// Thread handles: an opaque identifier. Windows uses a HANDLE (pointer-sized);
+// POSIX uses pthread_t, which is an integer on Linux but a pointer on macOS —
+// so it can never be stored as a raw integer portably.
+#if _WIN32
+using thread_handle = uintptr_t;
+#elif __linux__ || __APPLE__
+using thread_handle = pthread_t;
+#else
+#    error "Unimplemented platform"
+#endif
+
 void mutex_lock(mutex* mtx);
 void mutex_unlock(mutex* mtx);
 bool mutex_try_lock(mutex* mtx);
@@ -67,7 +78,6 @@ void condvar_signal(condvar* cv);                    // wake one
 void condvar_broadcast(condvar* cv);                 // wake all
 
 // Threads
-using thread_handle = uintptr_t;
 bool        thread_create(thread_handle* out, void (*fn)(void*), void* arg);
 void        thread_join(thread_handle t);
 void        thread_set_low_priority(thread_handle t);

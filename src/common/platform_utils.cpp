@@ -282,12 +282,12 @@ bool thread_create(thread_handle* out, void (*fn)(void*), void* arg) {
         std::free(start);
         return false;
     }
-    *out = static_cast<thread_handle>(t);
+    *out = t;
     return true;
 }
 
 void thread_join(thread_handle t) {
-    if (t != 0) { pthread_join(static_cast<pthread_t>(t), nullptr); }
+    pthread_join(t, nullptr);
 }
 
 void thread_set_low_priority(thread_handle t) {
@@ -295,11 +295,11 @@ void thread_set_low_priority(thread_handle t) {
     // Best-effort: SCHED_OTHER priority tweak; may fail without privileges.
     sched_param param{};
     param.sched_priority = 0;
-    pthread_setschedparam(static_cast<pthread_t>(t), SCHED_OTHER, &param);
+    pthread_setschedparam(t, SCHED_OTHER, &param);
 }
 
 uintptr_t current_thread_id() {
-    return static_cast<uintptr_t>(pthread_self());
+    return reinterpret_cast<uintptr_t>(pthread_self());
 }
 
 double monotonic_seconds() {
