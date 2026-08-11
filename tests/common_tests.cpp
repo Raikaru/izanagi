@@ -819,14 +819,18 @@ uint32_t type_size(const Module& m, uint32_t id, uint32_t depth = 0) {
 
 // Finds a compiled shader artifact (exe-relative then cwd-relative candidates).
 static std::string find_shader_artifact(const char* name) {
+    // Multi-config (Debug/Release subdir) and single-config layouts.
     const std::string candidates[] = {
         "shaders/vk_native_spv16/",
         "bin/shaders/vk_native_spv16/",
         "../bin/shaders/vk_native_spv16/",
         "bin/Debug/shaders/vk_native_spv16/",
         "../bin/Debug/shaders/vk_native_spv16/",
+        "bin/Release/shaders/vk_native_spv16/",
+        "../bin/Release/shaders/vk_native_spv16/",
         "build/bin/shaders/vk_native_spv16/",
         "build/bin/Debug/shaders/vk_native_spv16/",
+        "build/bin/Release/shaders/vk_native_spv16/",
     };
     for (auto& c : candidates) {
         std::string p = c + name;
@@ -843,8 +847,11 @@ static std::string find_shader_artifact_bindless(const char* name) {
         "../bin/shaders/vk_bindless_spv15/",
         "bin/Debug/shaders/vk_bindless_spv15/",
         "../bin/Debug/shaders/vk_bindless_spv15/",
+        "bin/Release/shaders/vk_bindless_spv15/",
+        "../bin/Release/shaders/vk_bindless_spv15/",
         "build/bin/shaders/vk_bindless_spv15/",
         "build/bin/Debug/shaders/vk_bindless_spv15/",
+        "build/bin/Release/shaders/vk_bindless_spv15/",
     };
     for (auto& c : candidates) {
         std::string p = c + name;
