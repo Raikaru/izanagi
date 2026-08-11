@@ -37,7 +37,11 @@ struct FragmentData {
 };
 
 struct GraphicsArgs {
-    void* vert;
+    // Typed root pointer (never dereferenced by this shader). The untyped
+    // `void*` form was the only Native-only declaration in the corpus; typed
+    // physical pointers are ABI-identical (64-bit device address) and work on
+    // both profiles.
+    uint8_t* vert;
     FragmentData* frag;
 };
 

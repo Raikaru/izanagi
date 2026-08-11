@@ -2503,6 +2503,223 @@ static void test_profile_report_consistency() {
     destroy_device(dev);
 }
 
+// --- Test 30: typed physical-pointer battery --------------------------------------------
+// Runs ptr_types.slang on hardware: root pointer dereference, pointers to
+// scalars, second-level pointers stored in GPU memory, arrays behind
+// pointers, pointer arithmetic, pointer arrays, typed loads and stores.
+// Every operation is TYPED — the same corpus the Bindless profile must
+// support through typed physical storage buffer pointers.
+static void test_typed_pointers() {
+    printf("--- Test: typed pointer battery ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("ptr_types.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "failed to load ptr_types.spv");
+    if (spirv.size() == 0) { destroy_device(d); return; }
+
+    ShaderSource shader_src{.source = spirv, .entry_point = "main_cs"_sv};
+    Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+    CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+    if (pipeline.h == 0) { destroy_device(d); return; }
+
+    struct alignas(8) PtrNested {
+        uint32_t a;
+        uint64_t p;
+        uint32_t b;
+    };
+    struct alignas(8) PtrRoot {
+        uint64_t scalar_ptr;
+        uint64_t nested_ptr;
+        uint64_t array_ptr;
+        uint64_t arr_of_ptr[2];
+        uint32_t direct;
+        uint32_t sum;
+    };
+    static_assert(sizeof(PtrNested) == 24 && sizeof(PtrRoot) == 48,
+                  "pointer-test structs must match ptr_types.slang");
+
+    // Single buffer layout (offsets must match ptr_types.slang):
+    //   0:  scalar_vals[2]   16: PtrNested    40: nested_target
+    //  48:  vals[4]          64: ptr_targets[2]   80: PtrRoot (48 bytes)
+    // 128:  PtrArgs (16 bytes)
+    constexpr size_t kBufSize = 160;
+    GpuPtr buf  = malloc(d, kBufSize, Memory::Default);
+    GpuPtr out  = malloc(d, 4, Memory::Readback);
+    CHECK(buf != 0 && out != 0, "malloc failed");
+
+    uint32_t scalar_vals[2] = {11, 22};
+    std::memcpy(get_host_pointer(d, buf), scalar_vals, sizeof(scalar_vals));
+    auto* nested = reinterpret_cast<PtrNested*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 16);
+    nested->a = 33;
+    nested->p = buf + 40;
+    nested->b = 44;
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 40) = 55;
+    uint32_t vals[4] = {1, 2, 3, 4};
+    std::memcpy(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 48, vals, sizeof(vals));
+    uint32_t ptr_targets[2] = {66, 77};
+    std::memcpy(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 64, ptr_targets, sizeof(ptr_targets));
+    auto* root = reinterpret_cast<PtrRoot*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 80);
+    root->scalar_ptr  = buf + 0;
+    root->nested_ptr  = buf + 16;
+    root->array_ptr   = buf + 48;
+    root->arr_of_ptr[0] = buf + 64;
+    root->arr_of_ptr[1] = buf + 68;
+    root->direct      = 88;
+    root->sum         = 0;
+
+    constexpr uint32_t kExpected = 11 + 22 + 33 + 55 + 44 + 1 + 2 + 3 + 4 + 66 + 77 + 88;
+
+    // Compute root ABI: the push constant is ONE pointer to a GPU-resident
+    // argument struct (the same convention the examples use).
+    struct PtrArgData {
+        uint64_t root;
+        uint64_t out;
+    };
+    auto* arg_data = reinterpret_cast<PtrArgData*>(get_host_pointer(d, buf + 128));
+    arg_data->root = buf + 80;
+    arg_data->out  = out;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_dispatch(cmd, buf + 128, Dimension3D{1, 1, 1});
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "dispatch did not complete");
+
+    auto* out_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, out));
+    CHECK(out_host[0] == kExpected, "typed-pointer checksum mismatch (read via args.out)");
+    CHECK(root->sum == kExpected, "typed store through root pointer mismatch");
+
+    free(d, buf);
+    free(d, out);
+    destroy_device(d);
+}
+
+// --- Test 31: cross-profile GPU ABI test ------------------------------------------------
+// Runs abi_test.slang: an irregular nested C++/Slang structure with scalars
+// of different widths, padding-sensitive fields, arrays, nested structs, a
+// GpuPtr member (verified to be a REAL device address the shader dereferences
+// through a second-level pointer), and TextureView/SamplerId members. Every
+// value is compared against the CPU expectation — any layout divergence
+// between C++ and Slang fails.
+static void test_abi_gpu() {
+    printf("--- Test: GPU shader ABI ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("abi_test.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "failed to load abi_test.spv");
+    if (spirv.size() == 0) { destroy_device(d); return; }
+
+    ShaderSource shader_src{.source = spirv, .entry_point = "main_cs"_sv};
+    Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+    CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+    if (pipeline.h == 0) { destroy_device(d); return; }
+
+    // Natural alignment (4) — matching abi_test.slang (alignas(8) would pad
+    // the size from 12 to 16 and break the ABI contract).
+    struct AbiInner {
+        uint32_t a;
+        float    b;
+        uint32_t c;
+    };
+    struct alignas(8) AbiNested {
+        AbiInner inner;
+        uint64_t ptr;
+    };
+    struct alignas(8) AbiRoot {
+        uint32_t  u;
+        float     f;
+        uint64_t  gpu_ptr;
+        uint64_t  tex;
+        uint64_t  samp;
+        AbiNested nested;
+        float     arr[3];
+        uint16_t  s;
+        uint8_t   bytes[3];
+    };
+    static_assert(sizeof(AbiInner) == 12 && sizeof(AbiNested) == 24 && sizeof(AbiRoot) == 80,
+                  "ABI structs must match abi_test.slang");
+
+    GpuPtr buf = malloc(d, 128, Memory::Default);   // AbiRoot @0, scratch @96
+    GpuPtr out = malloc(d, 19 * sizeof(uint32_t), Memory::Readback);
+    CHECK(buf != 0 && out != 0, "malloc failed");
+
+    auto* root = reinterpret_cast<AbiRoot*>(get_host_pointer(d, buf));
+    root->u        = 0xDEADBEEFu;
+    root->f        = 1.5f;
+    root->gpu_ptr  = buf + 96;   // a REAL device address
+    root->tex      = 0x1122334455667788ull;
+    root->samp     = 0x8877665544332211ull;
+    root->nested.inner.a = 7;
+    root->nested.inner.b = 2.25f;
+    root->nested.inner.c = 9;
+    root->nested.ptr     = buf + 96;   // second-level pointer -> scratch
+    root->arr[0]  = 1.5f;
+    root->arr[1]  = 2.5f;
+    root->arr[2]  = 3.5f;
+    root->s       = 0xBEEFu;
+    root->bytes[0] = 0x11;
+    root->bytes[1] = 0x22;
+    root->bytes[2] = 0x33;
+    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 96) = 0xABCD1234u;
+
+    // Compute root ABI: the push constant is ONE pointer to a GPU-resident
+    // argument struct.
+    struct AbiArgData {
+        uint64_t root;
+        uint64_t out;
+    };
+    auto* arg_data = reinterpret_cast<AbiArgData*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 104);
+    arg_data->root = buf;
+    arg_data->out  = out;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_dispatch(cmd, buf + 104, Dimension3D{1, 1, 1});
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "dispatch did not complete");
+
+    auto* o = reinterpret_cast<uint32_t*>(get_host_pointer(d, out));
+    CHECK(o[0] == 0xDEADBEEFu, "u mismatch");
+    float fbits; std::memcpy(&fbits, &o[1], 4);
+    CHECK(fbits == 1.5f, "f mismatch");
+    uint64_t echoed_ptr = (uint64_t(o[3]) << 32) | o[2];
+    CHECK(echoed_ptr == buf + 96, "gpu_ptr member is not the real device address");
+    CHECK(o[4] == 0x55667788u && o[5] == 0x11223344u, "TextureView handle mismatch");
+    CHECK(o[6] == 0x44332211u && o[7] == 0x88776655u, "SamplerId handle mismatch");
+    CHECK(o[8] == 7 && o[10] == 9, "nested.inner a/c mismatch");
+    float nbf; std::memcpy(&nbf, &o[9], 4);
+    CHECK(nbf == 2.25f, "nested.inner.b mismatch");
+    CHECK(o[11] == 0xABCD1234u, "second-level pointer dereference mismatch");
+    float a0, a1, a2; std::memcpy(&a0, &o[12], 4); std::memcpy(&a1, &o[13], 4); std::memcpy(&a2, &o[14], 4);
+    CHECK(a0 == 1.5f && a1 == 2.5f && a2 == 3.5f, "arr mismatch");
+    CHECK(o[15] == 0xBEEFu, "uint16 field mismatch");
+    CHECK(o[16] == 0x11 && o[17] == 0x22 && o[18] == 0x33, "uint8 array mismatch");
+
+    free(d, buf);
+    free(d, out);
+    destroy_device(d);
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2549,6 +2766,8 @@ int main() {
     test_concurrent_texture_submits();
     test_dual_source_blend();
     test_profile_report_consistency();
+    test_typed_pointers();
+    test_abi_gpu();
 
     printf("\n=================\n");
     if (g_failures == 0) {

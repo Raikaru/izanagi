@@ -217,13 +217,33 @@ if(IZANAGI_BUILD_TESTS)
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/dual_src.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/dual_src.spv
     )
+    # Phase 2: typed-pointer battery + GPU ABI test compile under BOTH
+    # profiles; the native-only shader compiles natively and must FAIL under
+    # the bindless profile (asserted by the negative test below).
+    add_slang_shader(izanagi_test_shaders5
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/ptr_types.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/ptr_types.spv
+    )
+    add_slang_shader(izanagi_test_shaders6
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/abi_test.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/abi_test.spv
+    )
+    add_slang_shader(izanagi_test_shaders_untyped NATIVE_ONLY
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/untyped_negative.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/untyped_negative.spv
+    )
+    add_slang_negative_test(izanagi_test_shaders_untyped_neg
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/untyped_negative.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/untyped_negative.negstamp
+    )
 
     add_executable(izanagi_tests tests/api_tests.cpp)
     target_link_libraries(izanagi_tests PRIVATE izanagi)
     target_include_directories(izanagi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(izanagi_tests PRIVATE IZ_VK_PROFILE_${IZANAGI_VK_PROFILE})
     add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3
-                     izanagi_test_shaders4)
+                     izanagi_test_shaders4 izanagi_test_shaders5 izanagi_test_shaders6
+                     izanagi_test_shaders_untyped izanagi_test_shaders_untyped_neg)
 
     # GPU-independent container/arena/profile tests (no Vulkan device required)
     add_executable(izanagi_common_tests

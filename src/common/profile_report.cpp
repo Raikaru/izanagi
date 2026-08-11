@@ -35,6 +35,8 @@ const char* vulkan_requirement_name(VulkanProfileRequirement r) {
             return "storage_image_capacity";
         case VulkanProfileRequirement::SamplerCapacity:
             return "sampler_capacity";
+        case VulkanProfileRequirement::CombinedDescriptorBudget:
+            return "combined_descriptor_budget";
         default:
             return "unknown";
     }
@@ -46,17 +48,24 @@ VulkanProfileReport evaluate_vulkan_bindless_profile(const VulkanProfileFeatures
     r.dynamic_rendering    = f.dynamic_rendering;
     r.synchronization2     = f.synchronization2;
     r.descriptor_snapshots = f.descriptor_binding_update_unused_while_pending ? 1u : 2u;
+    r.combined_descriptor_budget = f.combined_descriptor_budget;
 
-    // Capacities: clamp to the profile floor; insufficient capacity is a
-    // rejection, but the (possibly larger) device limit is reported.
-    r.sampled_image_capacity = f.max_sampled_descriptors < kMinBindlessSampledImages
-                                   ? f.max_sampled_descriptors
-                                   : kMinBindlessSampledImages;
-    r.storage_image_capacity = f.max_storage_descriptors < kMinBindlessStorageImages
-                                   ? f.max_storage_descriptors
-                                   : kMinBindlessStorageImages;
-    r.sampler_capacity       = f.max_samplers < kMinBindlessSamplers ? f.max_samplers
-                                                                     : kMinBindlessSamplers;
+    // Per-type capacities: each array alone could be as large as
+    // min(per-type ceiling, combined budget); the report shows that number
+    // clamped down to the profile floor when it cannot even reach the floor.
+    auto per_type_capacity = [](uint32_t limit, uint32_t budget, uint32_t floor) {
+        uint32_t cap = limit < budget ? limit : budget;
+        return cap < floor ? cap : floor;
+    };
+    r.sampled_image_capacity = per_type_capacity(f.max_sampled_descriptors,
+                                                 f.combined_descriptor_budget,
+                                                 kMinBindlessSampledImages);
+    r.storage_image_capacity = per_type_capacity(f.max_storage_descriptors,
+                                                 f.combined_descriptor_budget,
+                                                 kMinBindlessStorageImages);
+    r.sampler_capacity       = per_type_capacity(f.max_samplers,
+                                                 f.combined_descriptor_budget,
+                                                 kMinBindlessSamplers);
 
     auto add_missing = [&r](bool ok, VulkanProfileRequirement req) {
         if (!ok && r.missing_count < 16) { r.missing[r.missing_count++] = req; }
@@ -91,6 +100,14 @@ VulkanProfileReport evaluate_vulkan_bindless_profile(const VulkanProfileFeatures
     add_missing(r.sampled_image_capacity >= kMinBindlessSampledImages, VulkanProfileRequirement::SampledImageCapacity);
     add_missing(r.storage_image_capacity >= kMinBindlessStorageImages, VulkanProfileRequirement::StorageImageCapacity);
     add_missing(r.sampler_capacity >= kMinBindlessSamplers, VulkanProfileRequirement::SamplerCapacity);
+
+    // The three arrays share one update-after-bind budget; independently
+    // sufficient per-type ceilings are not enough. The floors must fit the
+    // combined budget together (Phase 3 replaces this with the allocation
+    // policy that packs the actual capacities).
+    add_missing(kMinBindlessSampledImages + kMinBindlessStorageImages + kMinBindlessSamplers <=
+                    f.combined_descriptor_budget,
+                VulkanProfileRequirement::CombinedDescriptorBudget);
 
     r.supported = r.missing_count == 0;
     return r;

@@ -445,6 +445,7 @@ static VulkanProfileFeatures full_features() {
     f.max_sampled_descriptors = 1'000'000;
     f.max_storage_descriptors = 1'000'000;
     f.max_samplers            = 1'000'000;
+    f.combined_descriptor_budget = 1'000'000;
     return f;
 }
 
@@ -514,6 +515,28 @@ static void test_profile_report() {
         CHECK(report_has(r, VulkanProfileRequirement::SamplerCapacity), "sampler capacity listed");
     }
 
+    // The shared combined update-after-bind budget is mandatory: per-type
+    // ceilings that individually pass cannot fit the arrays together.
+    {
+        VulkanProfileFeatures f = full_features();
+        f.combined_descriptor_budget = 2000;   // < 1024 + 1024 + 256
+        VulkanProfileReport r = evaluate_vulkan_bindless_profile(f);
+        CHECK(!r.supported, "combined budget below the floors' sum must reject");
+        CHECK(report_has(r, VulkanProfileRequirement::CombinedDescriptorBudget),
+              "combined budget requirement listed");
+        CHECK(r.combined_descriptor_budget == 2000, "combined budget echoed");
+
+        f = full_features();
+        f.combined_descriptor_budget = 2304;   // exactly the floors' sum
+        CHECK(evaluate_vulkan_bindless_profile(f).supported,
+              "combined budget equal to the floors' sum passes");
+
+        f = full_features();
+        f.combined_descriptor_budget = 0;      // zero budget (no UAB pools)
+        CHECK(!evaluate_vulkan_bindless_profile(f).supported,
+              "zero combined budget must reject");
+    }
+
     // Optional features: absence selects fallbacks, never rejection.
     {
         VulkanProfileFeatures f = full_features();
@@ -554,7 +577,7 @@ static void test_profile_report() {
     {
         VulkanProfileReport r = evaluate_vulkan_bindless_profile({});
         CHECK(!r.supported, "empty feature snapshot must reject");
-        CHECK(r.missing_count == 15, "all 15 requirements listed when nothing is supported");
+        CHECK(r.missing_count == 16, "all 16 requirements listed when nothing is supported");
         CHECK(r.descriptor_snapshots == 2, "snapshot path recorded for empty snapshot");
     }
 
@@ -567,6 +590,72 @@ static void test_profile_report() {
         CHECK(std::string(vulkan_requirement_name(VulkanProfileRequirement::ValidCount)) == "unknown",
               "out-of-range requirement names report unknown");
     }
+}
+
+// --- Static shader ABI manifest ----------------------------------------------
+// Cross-profile ABI contract: public handle widths, push-constant root
+// shapes, and the shared irregular data structures (mirrored by
+// tests/shaders/abi_test.slang under scalar block layout + row-major). If
+// any C++ layout diverges from the shader's, the GPU ABI test (api tests)
+// lands a wrong value — these static checks pin the C++ side.
+
+// Natural alignment (4): the shader's AbiInner has no alignas; forcing
+// alignment 8 would pad the size from 12 to 16 and break the ABI contract.
+struct AbiInner {
+    uint32_t a;
+    float    b;
+    uint32_t c;
+};
+struct alignas(8) AbiNested {
+    AbiInner inner;
+    uint64_t ptr;
+};
+struct alignas(8) AbiRoot {
+    uint32_t  u;
+    float     f;
+    uint64_t  gpu_ptr;   // GpuPtr member
+    uint64_t  tex;       // TextureView handle
+    uint64_t  samp;      // SamplerId handle
+    AbiNested nested;
+    float     arr[3];
+    uint16_t  s;
+    uint8_t   bytes[3];
+};
+// Push-constant root shapes (1 or 2 pointers = 8/16 bytes).
+struct alignas(8) AbiRoot1 {
+    GpuPtr data;
+};
+struct alignas(8) AbiRoot2 {
+    GpuPtr vert;
+    GpuPtr frag;
+};
+
+static_assert(sizeof(GpuPtr) == 8, "GpuPtr must be a 64-bit device address");
+static_assert(sizeof(TextureView) == 8, "TextureView must be 64-bit");
+static_assert(sizeof(SamplerId) == 8, "SamplerId must be 64-bit");
+static_assert(sizeof(AbiInner) == 12, "AbiInner size (shader: uint32,float,uint32)");
+static_assert(sizeof(AbiNested) == 24, "AbiNested size (inner @0, ptr @16)");
+static_assert(sizeof(AbiRoot) == 80, "AbiRoot size (scalar layout, align 8)");
+static_assert(offsetof(AbiRoot, u) == 0, "AbiRoot.u @0");
+static_assert(offsetof(AbiRoot, f) == 4, "AbiRoot.f @4");
+static_assert(offsetof(AbiRoot, gpu_ptr) == 8, "AbiRoot.gpu_ptr @8");
+static_assert(offsetof(AbiRoot, tex) == 16, "AbiRoot.tex @16");
+static_assert(offsetof(AbiRoot, samp) == 24, "AbiRoot.samp @24");
+static_assert(offsetof(AbiRoot, nested) == 32, "AbiRoot.nested @32");
+static_assert(offsetof(AbiRoot, arr) == 56, "AbiRoot.arr @56");
+static_assert(offsetof(AbiRoot, s) == 68, "AbiRoot.s @68");
+static_assert(offsetof(AbiRoot, bytes) == 70, "AbiRoot.bytes @70");
+static_assert(sizeof(AbiRoot1) == 8, "compute root: one 64-bit pointer");
+static_assert(sizeof(AbiRoot2) == 16, "graphics root: two 64-bit pointers");
+
+static void test_abi_manifest() {
+    printf("--- Test: shader ABI manifest (static) ---\n");
+    // The static_asserts above pin the layout; runtime re-checks keep the
+    // manifest visible in the test output even where asserts are disabled.
+    CHECK(sizeof(AbiRoot) == 80 && offsetof(AbiRoot, nested) == 32,
+          "AbiRoot layout matches the shader contract");
+    CHECK(sizeof(AbiRoot1) == 8 && sizeof(AbiRoot2) == 16,
+          "push-constant root shapes are 8/16 bytes");
 }
 
 int main() {
@@ -585,6 +674,7 @@ int main() {
     test_enum_ops();
     test_span();
     test_profile_report();
+    test_abi_manifest();
 
     printf("\n=================\n");
     if (g_failures == 0) {

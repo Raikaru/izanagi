@@ -78,6 +78,7 @@ int main() {
     printf("    \"sampled_image_capacity\": %u,\n", bindless.sampled_image_capacity);
     printf("    \"storage_image_capacity\": %u,\n", bindless.storage_image_capacity);
     printf("    \"sampler_capacity\": %u,\n", bindless.sampler_capacity);
+    printf("    \"combined_descriptor_budget\": %u,\n", bindless.combined_descriptor_budget);
     printf("    \"missing_requirements\": [");
     for (uint32_t i = 0; i < bindless.missing_count; ++i) {
         if (i != 0) { printf(", "); }

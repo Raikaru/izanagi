@@ -49,6 +49,7 @@ enum class VulkanProfileRequirement : uint8_t {
     SampledImageCapacity,
     StorageImageCapacity,
     SamplerCapacity,
+    CombinedDescriptorBudget,
     ValidCount,
 };
 
@@ -98,10 +99,16 @@ struct VulkanProfileFeatures {
     bool dynamic_rendering = false;
     bool synchronization2  = false;
 
-    // Descriptor-array capacities (maxDescriptorSet* limits)
+    // Per-type descriptor-array ceilings: the update-after-bind variants —
+    // min(per-stage UAB, set UAB) for each type.
     uint32_t max_sampled_descriptors = 0;
     uint32_t max_storage_descriptors = 0;
     uint32_t max_samplers            = 0;
+    // Shared combined budget for the one global update-after-bind set/pool:
+    // min(maxPerStageUpdateAfterBindResources,
+    //     maxUpdateAfterBindDescriptorsInAllPools). The three arrays TOGETHER
+    // must fit it (the evaluator checks floors' sum against it).
+    uint32_t combined_descriptor_budget = 0;
 };
 
 struct VulkanProfileReport {
@@ -118,6 +125,7 @@ struct VulkanProfileReport {
     uint32_t sampled_image_capacity = 0;   // clamped to the profile floor
     uint32_t storage_image_capacity = 0;
     uint32_t sampler_capacity       = 0;
+    uint32_t combined_descriptor_budget = 0;   // echoed from the snapshot
 
     uint32_t missing_count = 0;
     VulkanProfileRequirement missing[16];
