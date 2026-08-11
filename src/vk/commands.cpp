@@ -693,6 +693,24 @@ bool debug_validation_active(DeviceImpl* d) {
     return d->enable_validation && d->debug_messenger != VK_NULL_HANDLE;
 }
 
+void debug_force_legacy_barriers(DeviceImpl* d, bool force) {
+    d->force_legacy_barriers = force ? 1 : 0;
+}
+
+uint32_t debug_legacy_stage_mask(StageFlags stage) {
+    return static_cast<uint32_t>(bridge_pipeline_stage_legacy(stage));
+}
+
+bool debug_bindless_null_slot_written(DeviceImpl* d) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    return d->bindless_sampled_views.size() > 0 && d->bindless_sampled_views[0] != VK_NULL_HANDLE &&
+           d->bindless_sampler_handles.size() > 0 && d->bindless_sampler_handles[0] != VK_NULL_HANDLE;
+#else
+    (void)d;
+    return false;
+#endif
+}
+
 int64_t debug_pool_resets(DeviceImpl* d) {
     return atomic_load(&d->stat_pool_resets);
 }
@@ -813,6 +831,22 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
 
 void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
     auto* d = cmd->device;
+    if (d->force_legacy_barriers != 0 || !d->use_synchronization2) {
+        // Legacy fallback (devices without synchronization2, or forced for
+        // testing): conservative memory-read/write access at the mapped
+        // 1.0-era stage bits. Preserves the public stage-only barrier model.
+        const VkPipelineStageFlags src_stage = bridge_pipeline_stage_legacy(before);
+        const VkPipelineStageFlags dst_stage = bridge_pipeline_stage_legacy(after);
+        constexpr VkAccessFlags access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        const VkMemoryBarrier barrier{
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext         = nullptr,
+            .srcAccessMask = access,
+            .dstAccessMask = access,
+        };
+        vkCmdPipelineBarrier(cmd->buffer, src_stage, dst_stage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        return;
+    }
     const auto src_stage = bridge_pipeline_stage(before);
     const auto dst_stage = bridge_pipeline_stage(after);
     constexpr auto access = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;

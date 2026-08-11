@@ -438,6 +438,7 @@ static VulkanProfileFeatures full_features() {
     f.storage_image_update_after_bind   = true;
     f.descriptor_binding_partially_bound              = true;
     f.runtime_descriptor_array                        = true;
+    f.descriptor_binding_variable_count               = true;
     f.descriptor_binding_update_unused_while_pending  = true;
     f.draw_indirect_count = true;
     f.timeline_semaphore  = true;
@@ -487,6 +488,7 @@ static void test_profile_report() {
         {VulkanProfileRequirement::StorageUpdateAfterBind, [](VulkanProfileFeatures& f) { f.storage_image_update_after_bind = false; }},
         {VulkanProfileRequirement::PartiallyBound, [](VulkanProfileFeatures& f) { f.descriptor_binding_partially_bound = false; }},
         {VulkanProfileRequirement::RuntimeDescriptorArray, [](VulkanProfileFeatures& f) { f.runtime_descriptor_array = false; }},
+        {VulkanProfileRequirement::DescriptorVariableCount, [](VulkanProfileFeatures& f) { f.descriptor_binding_variable_count = false; }},
         {VulkanProfileRequirement::DrawIndirectCount, [](VulkanProfileFeatures& f) { f.draw_indirect_count = false; }},
         {VulkanProfileRequirement::TimelineSemaphore, [](VulkanProfileFeatures& f) { f.timeline_semaphore = false; }},
     };
@@ -578,7 +580,7 @@ static void test_profile_report() {
     {
         VulkanProfileReport r = evaluate_vulkan_bindless_profile({});
         CHECK(!r.supported, "empty feature snapshot must reject");
-        CHECK(r.missing_count == 16, "all 16 requirements listed when nothing is supported");
+        CHECK(r.missing_count == 17, "all 17 requirements listed when nothing is supported");
         CHECK(r.descriptor_snapshots == 2, "snapshot path recorded for empty snapshot");
     }
 

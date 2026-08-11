@@ -44,6 +44,7 @@ enum class VulkanProfileRequirement : uint8_t {
     StorageUpdateAfterBind,
     PartiallyBound,
     RuntimeDescriptorArray,
+    DescriptorVariableCount,
     DrawIndirectCount,
     TimelineSemaphore,
     SampledImageCapacity,
@@ -87,6 +88,9 @@ struct VulkanProfileFeatures {
     bool storage_image_update_after_bind   = false;
     bool descriptor_binding_partially_bound                = false;
     bool runtime_descriptor_array                          = false;
+    // Variable descriptor count on the last binding (runtime arrays). The
+    // bindless layout requires it, so it is a mandatory capability.
+    bool descriptor_binding_variable_count                 = false;
     bool descriptor_binding_update_unused_while_pending    = false;
 
     // Mandatory public-command features
@@ -143,7 +147,7 @@ struct VulkanProfileReport {
     uint32_t combined_descriptor_budget = 0;   // echoed from the snapshot
 
     uint32_t missing_count = 0;
-    VulkanProfileRequirement missing[16];
+    VulkanProfileRequirement missing[20];
 
     // True when the given requirement is listed as missing.
     bool missing_has(VulkanProfileRequirement r) const {

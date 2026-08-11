@@ -401,6 +401,7 @@ static VkResult create_logical_device(DeviceImpl* d) {
     vulkan13_features.dynamicRendering = VK_TRUE;
     vulkan13_features.synchronization2 = VK_TRUE;
     vulkan13_features.maintenance4     = VK_TRUE;
+    d->use_synchronization2 = vulkan13_features.synchronization2 == VK_TRUE;
     // Optional: lets the compiler worker probe the cache with
     // FAIL_ON_PIPELINE_COMPILE_REQUIRED instead of compiling blind.
     d->pipeline_cache_control = vulkan13_features.pipelineCreationCacheControl == VK_TRUE;
@@ -672,6 +673,7 @@ static VkResult create_bindless_descriptor_sets(DeviceImpl* d) {
     d->bindless_sampled_views   = Vector<VkImageView>(d->allocator, VK_NULL_HANDLE, sampled);
     d->bindless_storage_views   = Vector<VkImageView>(d->allocator, VK_NULL_HANDLE, storage);
     d->bindless_sampler_handles = Vector<VkSampler>(d->allocator, VK_NULL_HANDLE, sampler);
+
     return VK_SUCCESS;
 }
 #else
@@ -1096,6 +1098,65 @@ Device create_device(const DeviceDesc& desc) {
     d->uninitialized_textures = Vector<TextureImpl*>(d->allocator);
     d->pipeline_records       = Vector<PipelineRecord*>(d->allocator);
     d->compiler_queue         = Vector<PipelineRecord*>(d->allocator);
+
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // Valid null-handle behavior: descriptor slot 0 is reserved as null. A
+    // real 1x1 dummy texture + views + sampler occupy that slot so a shader
+    // reading an uninitialized or zero handle gets a VALID, STABLE descriptor
+    // (never undefined descriptor data under partial binding). The dummy's
+    // texel content is driver-defined (it is never written) — the guarantee
+    // is descriptor validity, not sample data. Runs AFTER the pools are
+    // initialized (create_texture needs the texture pool).
+    {
+        const TextureDesc dummy_desc{
+            .type = TextureType::Tex2D,
+            .dimensions = {1, 1, 1},
+            .format = Format::RGBA8Unorm,
+            .usage  = UsageFlags::Sampled | UsageFlags::Storage,
+        };
+        d->bindless_dummy_texture = create_texture(reinterpret_cast<Device>(d), dummy_desc);
+        if (d->bindless_dummy_texture.h == 0) {
+            IZ_LOG(d, LogLevel::Error, "bindless: dummy null-texture creation failed");
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            goto fail;
+        }
+        TextureImpl& dummy = d->texture_pool[handle_cast<TextureImpl>(d->bindless_dummy_texture)];
+        const VkImageViewCreateInfo view_info{
+            .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext    = nullptr,
+            .flags    = 0,
+            .image    = dummy.vk_image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format   = VK_FORMAT_R8G8B8A8_UNORM,
+            .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .baseMipLevel = 0, .levelCount = 1,
+                                 .baseArrayLayer = 0, .layerCount = 1},
+        };
+        if (!write_sampled_descriptor(d, 0, view_info) || !write_storage_descriptor(d, 0, view_info)) {
+            IZ_LOG(d, LogLevel::Error, "bindless: dummy slot-0 descriptor write failed");
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            goto fail;
+        }
+        const VkSamplerCreateInfo sampler_info{
+            .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext        = nullptr,
+            .flags        = 0,
+            .magFilter    = VK_FILTER_NEAREST,
+            .minFilter    = VK_FILTER_NEAREST,
+            .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        };
+        if (!write_sampler_descriptor(d, 0, sampler_info)) {
+            IZ_LOG(d, LogLevel::Error, "bindless: dummy slot-0 sampler write failed");
+            result = VK_ERROR_INITIALIZATION_FAILED;
+            goto fail;
+        }
+    }
+#endif
 
     // Start the async compiler worker (single thread, FIFO, low priority).
     condvar_init(&d->compiler_cv);

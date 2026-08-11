@@ -467,4 +467,23 @@ Span<const char> string_from_result(VkResult result) {
     }
 }
 
+VkPipelineStageFlags bridge_pipeline_stage_legacy(StageFlags stage) {
+    // Conservative per-stage mapping to Vulkan 1.0 pipeline-stage bits for
+    // the non-synchronization2 barrier fallback. The public StageFlags are
+    // stage-granular; every bit has a 1.0 counterpart.
+    VkPipelineStageFlags out = 0;
+    if (any(stage & StageFlags::IndirectArguments)) { out |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT; }
+    if (any(stage & StageFlags::Transfer))          { out |= VK_PIPELINE_STAGE_TRANSFER_BIT; }
+    if (any(stage & StageFlags::Compute))           { out |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT; }
+    if (any(stage & StageFlags::RasterColorOut))    { out |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; }
+    if (any(stage & StageFlags::PixelShader))       { out |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; }
+    if (any(stage & StageFlags::FragmentTests))     {
+        out |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    }
+    if (any(stage & StageFlags::VertexShader))      { out |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT; }
+    if (any(stage & StageFlags::Host))              { out |= VK_PIPELINE_STAGE_HOST_BIT; }
+    if (out == 0) { out = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; }
+    return out;
+}
+
 }  // namespace gpu

@@ -8,6 +8,10 @@ namespace gpu {
 
 VkFormat                            bridge(Format format);
 VkImageAspectFlags                  aspects_for_format(Format format);
+// Legacy (Vulkan 1.0-era) pipeline-stage bits for the public StageFlags —
+// used by the non-synchronization2 barrier fallback. Conservative per-stage
+// mapping (see gpu_to_vk.cpp).
+VkPipelineStageFlags                bridge_pipeline_stage_legacy(StageFlags stage);
 Format                              bridge(VkFormat fmt);
 VkPrimitiveTopology                 bridge(Topology topo);
 PresentMode                         bridge(VkPresentModeKHR mode);

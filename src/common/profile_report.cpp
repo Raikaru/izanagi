@@ -25,6 +25,8 @@ const char* vulkan_requirement_name(VulkanProfileRequirement r) {
             return "descriptor_binding_partially_bound";
         case VulkanProfileRequirement::RuntimeDescriptorArray:
             return "runtime_descriptor_array";
+        case VulkanProfileRequirement::DescriptorVariableCount:
+            return "descriptor_binding_variable_descriptor_count";
         case VulkanProfileRequirement::DrawIndirectCount:
             return "draw_indirect_count";
         case VulkanProfileRequirement::TimelineSemaphore:
@@ -72,7 +74,7 @@ VulkanProfileReport evaluate_vulkan_bindless_profile(const VulkanProfileFeatures
                                                  kMinBindlessSamplers);
 
     auto add_missing = [&r](bool ok, VulkanProfileRequirement req) {
-        if (!ok && r.missing_count < 16) { r.missing[r.missing_count++] = req; }
+        if (!ok && r.missing_count < 20) { r.missing[r.missing_count++] = req; }
     };
 
     // Real pointers + shader ABI
@@ -93,6 +95,7 @@ VulkanProfileReport evaluate_vulkan_bindless_profile(const VulkanProfileFeatures
 
     add_missing(f.descriptor_binding_partially_bound, VulkanProfileRequirement::PartiallyBound);
     add_missing(f.runtime_descriptor_array, VulkanProfileRequirement::RuntimeDescriptorArray);
+    add_missing(f.descriptor_binding_variable_count, VulkanProfileRequirement::DescriptorVariableCount);
 
     // Mandatory public-command feature (multi-draw indirect count)
     add_missing(f.draw_indirect_count, VulkanProfileRequirement::DrawIndirectCount);

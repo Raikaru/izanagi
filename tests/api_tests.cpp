@@ -18,6 +18,9 @@
 
 #include "izanagi/gpu.h"
 #include "common/profile_report.h"
+// Named Vulkan constants for the legacy stage-mask checks (volk_headers
+// provides the include dir; the test links the library but not volk itself).
+#include <vulkan/vulkan.h>
 
 using namespace gpu;
 
@@ -37,6 +40,12 @@ VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl*);
 // True when the validation layer is actually attached (layer must be
 // installed; otherwise a validation test would be vacuous).
 bool debug_validation_active(DeviceImpl*);
+// Test hook: force the legacy (non-synchronization2) barrier path.
+void debug_force_legacy_barriers(DeviceImpl*, bool force);
+// True when the bindless reserved null slot (0) is backed by a dummy resource.
+bool debug_bindless_null_slot_written(DeviceImpl*);
+// Legacy barrier stage bits for the public StageFlags (test-only exposure).
+uint32_t debug_legacy_stage_mask(StageFlags stage);
 uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
 }
 
@@ -400,7 +409,10 @@ static void test_heap_slot_recycling() {
     Queue q = get_queue(d);
 
     constexpr int kIterations = 1000;
+    constexpr int kBatch = 32;   // bound in-flight command buffers well under the 64-pool cap
     uint32_t first_reuse = ~0u;
+    Submission pending[kBatch] = {};
+    int pending_count = 0;
     for (int i = 0; i < kIterations; ++i) {
         TextureViewDesc view_desc{
             .texture = tex,
@@ -412,16 +424,27 @@ static void test_heap_slot_recycling() {
 
         free_texture_view(d, view);
 
-        // Advance timeline to allow recycling
+        // Advance timeline to allow recycling. Wait in bounded batches so a
+        // slower GPU (or a loaded machine) can never exhaust the 64 command
+        // pools — the test stays timing-robust while still exercising
+        // recycling under in-flight pressure.
         CommandBuffer cmd = queue_start_command_recording(q);
+        CHECK(cmd != nullptr, "recording failed — command-pool exhaustion");
         cmd_finalize(cmd);
-        queue_submit(q, {&cmd, 1});
+        Submission s = queue_submit(q, {&cmd, 1});
+        CHECK(s.status == SubmitStatus::Success, "submit failed");
+        pending[pending_count++] = s;
+        if (pending_count == kBatch) {
+            for (int k = 0; k < kBatch; ++k) { CHECK(wait_submission(pending[k]), "batch submit complete"); }
+            pending_count = 0;
+        }
         queue_process_events(q);
 
         if (i > 0 && slot <= (uint32_t)i && first_reuse == ~0u) {
             first_reuse = slot;
         }
     }
+    for (int k = 0; k < pending_count; ++k) { CHECK(wait_submission(pending[k]), "final submit complete"); }
     CHECK(first_reuse != ~0u, "Heap slots should be recycled");
 
     free(d, tex);
@@ -2489,7 +2512,7 @@ static void test_profile_report_consistency() {
     VulkanProfileFeatures f = query_vulkan_profile_features(dev);
     VulkanProfileReport r   = evaluate_vulkan_bindless_profile(f);
 
-    CHECK(r.missing_count <= 16, "missing list fits its fixed buffer");
+    CHECK(r.missing_count <= 20, "missing list fits its fixed buffer");
     // Native profile creation requires bufferDeviceAddress (Vulkan 1.2
     // feature enabled by create_logical_device), so the device has real
     // shader-addressable pointers — the bindless report must agree.
@@ -2825,6 +2848,146 @@ static void test_validation_smoke() {
     CHECK(g_validation_errors == 0, "no validation errors during the smoke");
 }
 
+// --- Test 34: legacy barrier path (forced) ----------------------------------------
+// Forces the non-synchronization2 fallback on any device and runs an
+// upload -> barrier(Host->Compute) -> dispatch -> barrier(Compute->Host) ->
+// readback roundtrip, hardware-validating the legacy vkCmdPipelineBarrier
+// translation.
+static void test_legacy_barrier_forced() {
+    printf("--- Test: legacy barrier path (forced) ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    debug_force_legacy_barriers(d, true);
+
+    // Pure stage-mask mapping checks against the NAMED Vulkan constants:
+    // every public stage maps to a conservative 1.0-era bit (FragmentTests =
+    // early|late depth tests; None -> ALL_COMMANDS).
+    CHECK(debug_legacy_stage_mask(StageFlags::Transfer) == VK_PIPELINE_STAGE_TRANSFER_BIT,
+          "Transfer stage bit");
+    CHECK(debug_legacy_stage_mask(StageFlags::Compute) == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          "Compute stage bit");
+    CHECK(debug_legacy_stage_mask(StageFlags::FragmentTests) ==
+              (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT),
+          "FragmentTests maps to early|late depth tests");
+    CHECK(debug_legacy_stage_mask(StageFlags::Host) == VK_PIPELINE_STAGE_HOST_BIT, "Host stage bit");
+    CHECK(debug_legacy_stage_mask(StageFlags::None) == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+          "None maps to ALL_COMMANDS");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("memcpy_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "memcpy_kernel.spv load failed");
+    if (spirv.size() == 0) { debug_force_legacy_barriers(d, false); destroy_device(d); return; }
+
+    ShaderSource shader_src{.source = spirv, .entry_point = "compute_main"_sv};
+    Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+    CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+
+    constexpr uint32_t kCount = 256;
+    GpuPtr src_buf = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr dst_buf = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr args_buf = malloc(d, 32, Memory::Default);
+    auto* src = reinterpret_cast<uint32_t*>(get_host_pointer(d, src_buf));
+    for (uint32_t i = 0; i < kCount; ++i) { src[i] = i * 3 + 1; }
+    struct CopyData { uint64_t dst; uint64_t src; uint32_t count; uint32_t pad; };
+    auto* args = reinterpret_cast<CopyData*>(get_host_pointer(d, args_buf));
+    args->dst = dst_buf; args->src = src_buf; args->count = kCount; args->pad = 0;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_barrier(cmd, StageFlags::Host, StageFlags::Compute);   // legacy path
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_dispatch(cmd, args_buf, Dimension3D{(kCount + 63) / 64, 1, 1});
+    cmd_barrier(cmd, StageFlags::Compute, StageFlags::Host);   // legacy path
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "dispatch did not complete");
+
+    auto* dst = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst_buf));
+    bool match = true;
+    for (uint32_t i = 0; i < kCount && match; ++i) {
+        match = dst[i] == i * 6 + 3;
+    }
+    CHECK(match, "legacy-barrier compute roundtrip mismatch");
+
+    free(d, src_buf); free(d, dst_buf); free(d, args_buf);
+    free(d, pipeline);
+    debug_force_legacy_barriers(d, false);
+    destroy_device(d);
+}
+
+// --- Test 35: bindless null-handle validity --------------------------------------
+// The reserved null descriptor (handle 0) must be a VALID, STABLE descriptor
+// under the bindless profile (backed by the dummy slot-0 resource): sampling
+// it never faults and two dispatches with no intervening writes return
+// identical values. The guarantee is descriptor validity, not texel content
+// (the dummy is never written). The white-box hook confirms the dummy was
+// written. Native-profile only for the white-box part.
+static void test_bindless_null_handle() {
+    printf("--- Test: bindless null-handle determinism ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    CHECK(debug_bindless_null_slot_written(d), "dummy resource occupies the null slot");
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("null_sample.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "null_sample.spv load failed");
+    if (spirv.size() == 0) { destroy_device(d); return; }
+
+    ShaderSource shader_src{.source = spirv, .entry_point = "main_cs"_sv};
+    Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+    CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+    if (pipeline.h == 0) { destroy_device(d); return; }
+
+    GpuPtr args_buf = malloc(d, 16, Memory::Default);
+    GpuPtr out_a = malloc(d, 16, Memory::Readback);
+    GpuPtr out_b = malloc(d, 16, Memory::Readback);
+    struct NSData { uint64_t out; };
+    auto* args = reinterpret_cast<NSData*>(get_host_pointer(d, args_buf));
+
+    Queue q = get_queue(d);
+    args->out = out_a;
+    {
+        CommandBuffer cmd = queue_start_command_recording(q);
+        cmd_set_pipeline(cmd, pipeline);
+        cmd_dispatch(cmd, args_buf, Dimension3D{1, 1, 1});
+        cmd_finalize(cmd);
+        Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+        CHECK(wait_submission(s), "dispatch A did not complete");
+    }
+    args->out = out_b;
+    {
+        CommandBuffer cmd = queue_start_command_recording(q);
+        cmd_set_pipeline(cmd, pipeline);
+        cmd_dispatch(cmd, args_buf, Dimension3D{1, 1, 1});
+        cmd_finalize(cmd);
+        Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+        CHECK(wait_submission(s), "dispatch B did not complete");
+    }
+    auto* a = reinterpret_cast<uint32_t*>(get_host_pointer(d, out_a));
+    auto* b = reinterpret_cast<uint32_t*>(get_host_pointer(d, out_b));
+    CHECK(a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3],
+          "null-handle sampling is stable across dispatches");
+
+    free(d, args_buf); free(d, out_a); free(d, out_b);
+    free(d, pipeline);
+#else
+    printf("SKIPPED: null-handle determinism is bindless-profile only\n");
+#endif
+    destroy_device(d);
+}
+
 // --- Test 32: capability-gated 8/16-bit storage ABI -------------------------------
 // The mandatory ABI test avoids 8/16-bit storage (optional device
 // capabilities). Reading 8/16-bit members through a physical-storage-buffer
@@ -2905,6 +3068,7 @@ static void test_abi_int8_16() {
 }
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);   // crash/hang diagnostics: no buffering
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
 
@@ -2954,6 +3118,8 @@ int main() {
     test_abi_gpu();
     test_abi_int8_16();
     test_validation_smoke();
+    test_legacy_barrier_forced();
+    test_bindless_null_handle();
 
     printf("\n=================\n");
     if (g_failures == 0) {

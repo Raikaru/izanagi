@@ -245,6 +245,10 @@ if(IZANAGI_BUILD_TESTS)
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/abi_int8_16.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/abi_int8_16.spv
     )
+    add_slang_shader(izanagi_test_shaders8
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/null_sample.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/null_sample.spv
+    )
     add_slang_shader(izanagi_test_shaders_untyped NATIVE_ONLY
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/untyped_negative.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/untyped_negative.spv
@@ -255,7 +259,7 @@ if(IZANAGI_BUILD_TESTS)
     )
 
     add_executable(izanagi_tests tests/api_tests.cpp)
-    target_link_libraries(izanagi_tests PRIVATE izanagi)
+    target_link_libraries(izanagi_tests PRIVATE izanagi volk_headers)
     target_include_directories(izanagi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(izanagi_tests PRIVATE
         IZ_VK_PROFILE_${IZANAGI_VK_PROFILE}
@@ -265,7 +269,7 @@ if(IZANAGI_BUILD_TESTS)
         IZ_PROFILE_VERSION_BINDLESS="${IZANAGI_VK_PROFILE_VERSION_BINDLESS}")
     add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3
                      izanagi_test_shaders4 izanagi_test_shaders5 izanagi_test_shaders6
-                     izanagi_test_shaders7
+                     izanagi_test_shaders7 izanagi_test_shaders8
                      izanagi_test_shaders_untyped izanagi_test_shaders_untyped_neg)
 
     # GPU-independent container/arena/profile tests (no Vulkan device required)

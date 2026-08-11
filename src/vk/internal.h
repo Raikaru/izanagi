@@ -282,6 +282,12 @@ struct DeviceImpl {
     // Surface
     Surface surface;
 
+    // Barrier backend: synchronization2 when the device has it (always on
+    // native); legacy vkCmdPipelineBarrier otherwise. force_legacy_barriers
+    // is a test hook to hardware-validate the legacy path on any device.
+    bool                      use_synchronization2 = true;
+    int64_t                   force_legacy_barriers = 0;
+
     // Debug
     bool                      has_debug_markers   = false;
     bool                      enable_validation   = false;
@@ -360,6 +366,9 @@ struct DeviceImpl {
     Vector<VkImageView> bindless_sampled_views;
     Vector<VkImageView> bindless_storage_views;
     Vector<VkSampler>   bindless_sampler_handles;
+    // Dummy 1x1 texture backing descriptor slot 0 (the reserved null slot):
+    // sampling an uninitialized/zero handle reads a stable descriptor.
+    Handle<Texture>     bindless_dummy_texture;
 #endif
     // Descriptor allocator: per-region bitset + generation + state tables,
     // all guarded by desc_lock. Slot state machine: Free -> Allocated ->
@@ -487,6 +496,9 @@ void       debug_force_submit_failure(DeviceImpl* d, bool force);
 uint64_t   debug_queue_timeline(DeviceImpl* d);         // last successfully submitted value
 int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse resets
 bool       debug_validation_active(DeviceImpl* d);      // validation layer actually attached
+void       debug_force_legacy_barriers(DeviceImpl* d, bool force);  // test hook
+bool       debug_bindless_null_slot_written(DeviceImpl* d);   // slot-0 dummy present
+uint32_t   debug_legacy_stage_mask(StageFlags stage);        // legacy barrier stage bits
 
 // Profile capability snapshot (profile.cpp): fills a plain feature/limit
 // snapshot from the physical device so evaluate_vulkan_bindless_profile

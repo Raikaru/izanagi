@@ -63,6 +63,7 @@ VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl* d) {
     f.storage_image_update_after_bind = vulkan12.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE;
     f.descriptor_binding_partially_bound               = vulkan12.descriptorBindingPartiallyBound == VK_TRUE;
     f.runtime_descriptor_array                         = vulkan12.runtimeDescriptorArray == VK_TRUE;
+    f.descriptor_binding_variable_count                = vulkan12.descriptorBindingVariableDescriptorCount == VK_TRUE;
     f.descriptor_binding_update_unused_while_pending   = vulkan12.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
 
     f.draw_indirect_count = vulkan12.drawIndirectCount == VK_TRUE;

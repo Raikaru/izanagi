@@ -6,11 +6,22 @@ addresses, root arguments as raw pointers, a global indexable
 texture/sampler heap, stage-mask-only barriers, timeline-semaphore sync,
 minimal PSOs, and dynamic rendering.
 
-**v1 scope:** Vulkan 1.4 backend only (this is a Windows machine), a Slang
-shader toolchain compiled offline by `slangc`, three verified examples, a
-headless API test suite, and a [Metal 4 mapping document](docs/Metal4Mapping.md)
+**v1 scope:** Vulkan backends (this is a Windows machine), a Slang shader
+toolchain compiled offline by `slangc`, three verified examples, a headless
+API test suite, and a [Metal 4 mapping document](docs/Metal4Mapping.md)
 proving the API ports 1:1 to Apple's Metal 4 core API (the Metal backend
 itself is out of v1).
+
+**Requirements, principle first:** Izanagi requires real shader-addressable
+GPU pointers and a persistent GPU-indexed resource namespace. The modern
+Vulkan profile (`IZANAGI_VK_NATIVE_1`) uses native descriptor heaps and
+untyped pointers; the compatibility Vulkan profile (`IZANAGI_VK_BINDLESS_1`)
+uses backend-private descriptor-indexing arrays and typed physical pointers
+while preserving the same public programming model. See
+[docs/VulkanProfiles.md](docs/VulkanProfiles.md) and
+[docs/HardwareSupport.md](docs/HardwareSupport.md) — no GPU generation or
+Vulkan version is a support guarantee; only exact feature bits, limits, ABI,
+and conformance tests are.
 
 Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_gpu)
 (loon targets Vulkan 1.3 + descriptor-indexing sets; Izanagi targets Vulkan 1.4
@@ -61,7 +72,10 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
 
 ## Requirements
 
-- Windows 10/11 with a Vulkan 1.4-capable driver (NVIDIA/AMD/Intel)
+- Windows 10/11 with a Vulkan 1.3+ driver (NVIDIA/AMD/Intel; the Native
+  profile needs 1.4 + descriptor-heap support, the Bindless profile needs
+  1.3 + the descriptor-indexing feature set — `izanagi_capability_report`
+  reports exactly what a device provides)
 - CMake 3.30+ and a C++20 compiler (VS 2022 toolset tested)
 - No system Vulkan SDK required: Vulkan-Headers, volk, VMA are fetched
   automatically; `slangc` (2026.5.2) is downloaded at configure time.
