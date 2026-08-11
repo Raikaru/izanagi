@@ -293,9 +293,17 @@ VkBlendFactor bridge(Factor factor) {
         case Factor::Zero: return VK_BLEND_FACTOR_ZERO;
         case Factor::One: return VK_BLEND_FACTOR_ONE;
         case Factor::SrcColor: return VK_BLEND_FACTOR_SRC_COLOR;
+        case Factor::OneMinusSrcColor: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
         case Factor::DstColor: return VK_BLEND_FACTOR_DST_COLOR;
+        case Factor::OneMinusDstColor: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
         case Factor::SrcAlpha: return VK_BLEND_FACTOR_SRC_ALPHA;
         case Factor::OneMinusSrcAlpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        case Factor::DstAlpha: return VK_BLEND_FACTOR_DST_ALPHA;
+        case Factor::OneMinusDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+        case Factor::Src1Color: return VK_BLEND_FACTOR_SRC1_COLOR;
+        case Factor::OneMinusSrc1Color: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+        case Factor::Src1Alpha: return VK_BLEND_FACTOR_SRC1_ALPHA;
+        case Factor::OneMinusSrc1Alpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
     }
     return VK_BLEND_FACTOR_MAX_ENUM;
 }

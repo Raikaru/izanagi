@@ -1183,6 +1183,130 @@ static void test_generate_mipmaps() {
     printf("  PASS\n");
 }
 
+// --- Test 15: dual-source blending ----------------------------------------------
+// The shader emits source0 (rgb known, a = 0.5) and source1 (a = 1.0). With
+// RGB factors Src1Alpha/OneMinusSrc1Alpha and the alpha equation One/Zero:
+//   RGB   = src_rgb * 1.0 + dst * 0.0   -> reflects source1 alpha (1.0)
+//   alpha = 0.5                          -> reflects source0 alpha (stored)
+// A single-source implementation using SrcAlpha would blend RGB with 0.5 and
+// fail the RGB check, so this can only pass via dual-source blending.
+static void test_dual_source_blend() {
+    printf("--- Test: dual-source blending ---\n");
+    DeviceDesc desc{.log_callback = test_log_callback, .log_level = LogLevel::Warning};
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device failed");
+    if (!d) return;
+
+    constexpr uint32_t kSize = 64;
+    constexpr uint32_t kTexBytes = kSize * kSize * 4;
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> color_tex = create_texture(d, tex_desc);
+    CHECK(color_tex.h != 0, "create_texture failed");
+    if (color_tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("dual_src.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load dual_src.spv");
+    if (spirv.size() == 0) {
+        free(d, color_tex);
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vertex_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fragment_src{.source = spirv, .entry_point = "fragment_main"_sv};
+
+    const bool dual_supported = device_supports_dual_source_blend(d);
+
+    ColorTarget ct{
+        .format = Format::RGBA8Unorm,
+        .blendstate = BlendDesc{
+            .color_op          = Blend::Add,
+            .src_color_factor  = Factor::Src1Alpha,
+            .dst_color_factor  = Factor::OneMinusSrc1Alpha,
+            .alpha_op          = Blend::Add,
+            .src_alpha_factor  = Factor::One,
+            .dst_alpha_factor  = Factor::Zero,
+        },
+    };
+    RasterDesc raster_desc{
+        .color_targets = Span<const ColorTarget>(&ct, 1),
+    };
+    Handle<Pipeline> pipeline = create_graphics_pipeline(d, vertex_src, fragment_src, raster_desc);
+
+    if (!dual_supported) {
+        // Deterministic rejection is the contract on unsupported devices.
+        CHECK(pipeline.h == 0,
+              "dual-source pipeline must fail to create when dualSrcBlend is unsupported");
+        printf("  PASS (unsupported-device rejection)\n");
+        free(d, color_tex);
+        destroy_device(d);
+        return;
+    }
+    CHECK(pipeline.h != 0, "create_graphics_pipeline (dual-source) failed");
+    if (pipeline.h == 0) {
+        free(d, color_tex);
+        destroy_device(d);
+        return;
+    }
+
+    Queue q = get_queue(d);
+    GpuPtr readback = malloc(d, kTexBytes, Memory::Readback);
+    CHECK(readback != 0, "readback malloc failed");
+
+    RenderAttachment color_att{
+        .texture     = color_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{26, 51, 77, 204},   // dst rgb (0.1, 0.2, 0.3), a 0.8
+    };
+    RenderPassDesc pass_desc{
+        .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+        .render_area       = Rect2D{.width = kSize, .height = kSize},
+    };
+    BufferTextureCopyInfo copy_info{.image_extent = {kSize, kSize, 1}};
+
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw(cmd, 0, 0, 3, 1);
+    cmd_end_render_pass(cmd);
+    cmd_barrier(cmd, StageFlags::RasterColorOut, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, color_tex, readback, copy_info);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    // RGBA bytes. Expect: rgb = src (0.25, 0.5, 0.75) * 1.0 + dst * 0.0
+    // (factor = source1 alpha 1.0), alpha = source0 alpha 0.5.
+    const int er = int(0.25f * 255.0f), eg = int(0.5f * 255.0f), eb = int(0.75f * 255.0f);
+    const int ea = int(0.5f * 255.0f);
+    for (uint32_t i = 0; i < kSize * kSize; i++) {
+        const uint8_t* p = rb + i * 4;
+        int dr = int(p[0]) - er, dg = int(p[1]) - eg, db = int(p[2]) - eb, da = int(p[3]) - ea;
+        if (dr < -2 || dr > 2 || dg < -2 || dg > 2 || db < -2 || db > 2 || da < -2 || da > 2) {
+            CHECK(false, "dual-source blend result wrong (tolerance +-2)");
+            printf("  at %u: got (%u,%u,%u,%u) want (%d,%d,%d,%d)\n", i, p[0], p[1], p[2],
+                   p[3], er, eg, eb, ea);
+            break;
+        }
+    }
+
+    free(d, readback);
+    free(d, color_tex);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -1212,6 +1336,7 @@ int main() {
     test_bc1_roundtrip();
     test_msaa_resolve();
     test_generate_mipmaps();
+    test_dual_source_blend();
 
     printf("\n=================\n");
     if (g_failures == 0) {

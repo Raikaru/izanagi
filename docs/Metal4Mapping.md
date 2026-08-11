@@ -124,6 +124,26 @@ full enum including ETC2/ASTC, so the enum set ports 1:1.
 | `cmd_set_depth_stencil_state` | `vkCmdSetDepth*` / `vkCmdSetStencil*` dynamic state | `setDepthStencilState` |
 | `cmd_set_front_face` / `cmd_set_cull_mode` | `vkCmdSetFrontFace` / `vkCmdSetCullMode` | `setFrontFacingWinding` / `setCullMode` |
 
+### Blend factors (incl. dual-source)
+
+| Izanagi `Factor` | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+|---|---|---|
+| `Zero` / `One` | `VK_BLEND_FACTOR_ZERO` / `ONE` | `MTLBlendFactorZero` / `One` |
+| `SrcColor` / `OneMinusSrcColor` | `SRC_COLOR` / `ONE_MINUS_SRC_COLOR` | `SourceColor` / `OneMinusSourceColor` |
+| `DstColor` / `OneMinusDstColor` | `DST_COLOR` / `ONE_MINUS_DST_COLOR` | `DestinationColor` / `OneMinusDestinationColor` |
+| `SrcAlpha` / `OneMinusSrcAlpha` | `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA` | `SourceAlpha` / `OneMinusSourceAlpha` |
+| `DstAlpha` / `OneMinusDstAlpha` | `DST_ALPHA` / `ONE_MINUS_DST_ALPHA` | `DestinationAlpha` / `OneMinusDestinationAlpha` |
+| `Src1Color` / `OneMinusSrc1Color` | `SRC1_COLOR` / `ONE_MINUS_SRC1_COLOR` | `Source1Color` / `OneMinusSource1Color` |
+| `Src1Alpha` / `OneMinusSrc1Alpha` | `SRC1_ALPHA` / `ONE_MINUS_SRC1_ALPHA` | `Source1Alpha` / `OneMinusSource1Alpha` |
+
+Dual-source blending (`Src1*` factors) is an **optional device feature**:
+`device_supports_dual_source_blend()` reports it, and pipeline creation fails
+deterministically when `Src1*` factors are requested on a device without it
+(no silent fallback). Metal: dual-source blending is supported on Apple
+GPUs via `MTLBlendFactorSource1*`; the fragment shader's second color output
+(`[[color(0)]]` + `[[color(0), index(1)]]` in MSL) maps directly to the
+Vulkan `Location 0, Index 1` output used by the Vulkan backend.
+
 ## Surface / present
 
 | Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |

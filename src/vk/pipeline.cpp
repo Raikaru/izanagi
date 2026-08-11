@@ -199,6 +199,30 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
     // Color blend + attachment formats
     Span<VkPipelineColorBlendAttachmentState> color_blend_states{};
     Span<VkFormat>                            color_formats{};
+    // Dual-source factors are optional: reject deterministically when the
+    // device does not support dualSrcBlend (no silent fallback).
+    const bool needs_dual_src = [&]() {
+        for (auto& t : desc.color_targets) {
+            const auto& b = t.blendstate;
+            if (b.src_color_factor == Factor::Src1Color || b.src_color_factor == Factor::OneMinusSrc1Color ||
+                b.dst_color_factor == Factor::Src1Color || b.dst_color_factor == Factor::OneMinusSrc1Color ||
+                b.src_alpha_factor == Factor::Src1Color || b.src_alpha_factor == Factor::OneMinusSrc1Color ||
+                b.dst_alpha_factor == Factor::Src1Color || b.dst_alpha_factor == Factor::OneMinusSrc1Color ||
+                b.src_color_factor == Factor::Src1Alpha || b.src_color_factor == Factor::OneMinusSrc1Alpha ||
+                b.dst_color_factor == Factor::Src1Alpha || b.dst_color_factor == Factor::OneMinusSrc1Alpha ||
+                b.src_alpha_factor == Factor::Src1Alpha || b.src_alpha_factor == Factor::OneMinusSrc1Alpha ||
+                b.dst_alpha_factor == Factor::Src1Alpha || b.dst_alpha_factor == Factor::OneMinusSrc1Alpha) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if (needs_dual_src && !d->dual_src_blend) {
+        IZ_LOG(d, LogLevel::Error,
+               "create_graphics_pipeline: dual-source blend factors requested but the "
+               "device does not support dualSrcBlend");
+        return {};
+    }
     for (auto& t : desc.color_targets) {
         color_blend_states = concat(arena, color_blend_states, bridge(t.blendstate));
         color_formats      = concat(arena, color_formats, bridge(t.format));

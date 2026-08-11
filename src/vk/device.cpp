@@ -284,10 +284,16 @@ static VkResult create_logical_device(DeviceImpl* d) {
     // Query supported features
     vkGetPhysicalDeviceFeatures2(d->physical_device, &device_features);
 
-    // Enable only what we need
+    // Enable only what we need — dual-source blending is optional, so query
+    // it first and enable only when supported (pipeline creation rejects
+    // Src1* factors on devices without it).
     device_features.features.samplerAnisotropy = VK_TRUE;
     device_features.features.shaderInt16       = VK_TRUE;
     device_features.features.multiDrawIndirect = VK_TRUE;
+    d->dual_src_blend = device_features.features.dualSrcBlend == VK_TRUE;
+    if (d->dual_src_blend) {
+        device_features.features.dualSrcBlend = VK_TRUE;
+    }
 
     vulkan11_features.shaderDrawParameters = VK_TRUE;
 
@@ -714,6 +720,11 @@ void destroy_device(Device dev) {
 
 Backend device_backend() {
     return Backend::Vulkan;
+}
+
+bool device_supports_dual_source_blend(Device dev) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    return d != nullptr && d->dual_src_blend;
 }
 
 void device_wait_for_idle(Device dev) {

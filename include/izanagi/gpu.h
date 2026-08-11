@@ -182,7 +182,22 @@ enum class StencilOp : uint8_t {
 
 enum class Blend : uint8_t { Add, Subtract, RevSubtract, Min, Max };
 
-enum class Factor : uint8_t { Zero, One, SrcColor, DstColor, SrcAlpha, OneMinusSrcAlpha };
+enum class Factor : uint8_t {
+    Zero,
+    One,
+    SrcColor,
+    OneMinusSrcColor,
+    DstColor,
+    OneMinusDstColor,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+    DstAlpha,
+    OneMinusDstAlpha,
+    Src1Color,
+    OneMinusSrc1Color,
+    Src1Alpha,
+    OneMinusSrc1Alpha,
+};
 
 enum class Topology : uint8_t { TriangleList, TriangleStrip };
 
@@ -542,6 +557,10 @@ Device  create_device(const DeviceDesc&);
 void    destroy_device(Device);
 Backend device_backend();
 void    device_wait_for_idle(Device);
+// True when dual-source blending (Factor::Src1*/OneMinusSrc1*) is supported
+// on this device. Pipeline creation with Src1 factors fails (returns null)
+// when this is false.
+bool    device_supports_dual_source_blend(Device);
 
 // Surface
 SurfaceCapabilities get_surface_capabilities(Device);

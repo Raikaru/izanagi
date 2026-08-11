@@ -177,6 +177,7 @@ struct DeviceImpl {
     uint32_t           graphics_queue_family = 0;
     VkDevice           device          = VK_NULL_HANDLE;
     VmaAllocator       vma             = VK_NULL_HANDLE;
+    bool               dual_src_blend  = false;   // VkPhysicalDeviceFeatures.dualSrcBlend
 
     // Surface
     Surface surface;
