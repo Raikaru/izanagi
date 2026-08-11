@@ -13,10 +13,25 @@ only a *testing* label, used to organize which devices were actually run.
 
 **This is the only hardware tested so far.** No Maxwell, Polaris, Skylake,
 GCN, or Intel device has been qualified. The bindless profile's legacy
-fallbacks (snapshot descriptor sets, render-pass fallback) are gated behind
-explicit device-creation gates and are not runtime-exercised on this machine
-(its driver has all the modern features); the legacy barrier path is
-force-tested on this device.
+fallbacks (snapshot descriptor sets, render-pass fallback, legacy copy/blit,
+static dynamic state) are gated behind explicit device-creation gates and are
+not runtime-exercised on this machine (its driver has all the modern
+features); the legacy barrier path is force-tested on this device.
+
+### dzn (Vulkan-on-D3D12 in WSL) probing — 2026-08-11
+
+The bindless feature probe ran against mesa 26.2.0's dzn (RTX 4080 through
+D3D12, api 1.2.354): **every bindless-required capability is present**
+(BDA, int64, scalar block layout, non-uniform indexing, sampled/storage
+update-after-bind, partially-bound, runtime + variable-count arrays,
+update-unused-while-pending, timeline semaphores, draw-indirect-count; 1M
+descriptor capacities), plus dynamic rendering + synchronization2 (KHR
+forms). Missing: `VK_KHR_copy_commands2` and
+`VK_EXT_extended_dynamic_state` — so the 1.2 dispatch route (core-1.3
+commands aliased to KHR/EXT entry points, which dzn exports) gets dzn past
+device selection, but the full suite still requires the legacy-copy and
+static-dynamic-state fallbacks, which are the next phase. dzn is rejected
+today with the exact missing-extension list.
 
 ## Tiers
 

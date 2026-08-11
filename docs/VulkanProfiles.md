@@ -33,8 +33,12 @@ verification).
 
 The compatibility path. Same public model, different private mechanisms:
 
-- Vulkan 1.3 (initial slice; the legacy fallbacks that enable 1.2 devices are
-  gated behind explicit gates in `create_device`)
+- Vulkan 1.2+ via the KHR/EXT dispatch route (dynamic rendering, sync2,
+  copy-commands2, extended-dynamic-state are enabled as extensions on 1.2
+  devices and the core-1.3 command names are aliased to their KHR/EXT entry
+  points; on 1.3+ the extension entry points are the same code). Devices
+  lacking the copy/state extensions are rejected with the exact list until
+  the legacy-copy and static-dynamic-state fallbacks land
 - one long-lived update-after-bind descriptor set holding the global arrays
   (binding 0 = sampled images, 1 = storage images, 2 = samplers with variable
   descriptor count), sized from the update-after-bind ceilings and the shared
