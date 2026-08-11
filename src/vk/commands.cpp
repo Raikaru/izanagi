@@ -616,10 +616,12 @@ Submission queue_submit(Queue                     q,
             RetireItem{RetireKind::Texture, reinterpret_cast<uint64_t>(rec), 0});
     }
     auto commit_cb = [&](CommandBufferImpl* cb) {
-        if (cb->pool != nullptr && cb->pool->outstanding > 0) {
+        if (cb->pool != nullptr) {
             mutex_lock(&q->record_lock);   // pool accounting is record_lock-guarded
-            cb->pool->outstanding--;
-            if (cb->pool->retire_value < submit_value) { cb->pool->retire_value = submit_value; }
+            if (cb->pool->outstanding > 0) {
+                cb->pool->outstanding--;
+                if (cb->pool->retire_value < submit_value) { cb->pool->retire_value = submit_value; }
+            }
             mutex_unlock(&q->record_lock);
         }
         for (PipelineRecord* rec : cb->retained_pipelines) {
