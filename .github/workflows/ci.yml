@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  windows:
+  windows-debug:
     # windows-latest moved to VS 18 2026; the dev-windows-msvc preset
     # targets VS 17 2022, so pin the image that still ships it.
     runs-on: windows-2022
@@ -19,3 +19,16 @@ jobs:
         env:
           IZANAGI_TESTS_ALLOW_SKIP: 1
         run: ctest --test-dir build -C Debug --output-on-failure
+
+  windows-release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_CONFIGURATION_TYPES=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        env:
+          IZANAGI_TESTS_ALLOW_SKIP: 1
+        run: ctest --test-dir build -C Release --output-on-failure
