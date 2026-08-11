@@ -173,6 +173,7 @@ void queue_submit(Queue                     q,
                   Span<const SemaphoreInfo> signal_semaphores) {
     auto* d = q->device;
     Arena*  arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
 
     Span<VkSemaphoreSubmitInfo>     wait_info{};
     Span<VkCommandBufferSubmitInfo> command_info{};
@@ -350,6 +351,12 @@ void queue_submit(Queue                     q,
         .signalSemaphoreInfoCount = static_cast<uint32_t>(signal_info.size()),
         .pSignalSemaphoreInfos    = signal_info.data(),
     };
+    // Scratch overflow aborts the operation: the submit structures may be
+    // truncated. Never submit a potentially-garbage batch.
+    if (arena->overflowed()) {
+        IZ_LOG(d, LogLevel::Error, "queue_submit: scratch arena overflow, submission aborted");
+        return;
+    }
     vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
 }
 
@@ -668,6 +675,7 @@ void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensi
 void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     auto* d = cmd->device;
     Arena*  arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
     Span<VkRenderingAttachmentInfo> color_attachments{};
 
     for (const auto& attachment : desc.color_attachments) {
@@ -738,6 +746,10 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         .offset = {.x = (int32_t)desc.render_area.offset_x, .y = (int32_t)desc.render_area.offset_y},
         .extent = {.width = desc.render_area.width, .height = desc.render_area.height},
     };
+    if (arena->overflowed()) {
+        IZ_LOG(d, LogLevel::Error, "cmd_begin_render_pass: scratch arena overflow, pass skipped");
+        return;
+    }
     const VkRenderingInfo rendering_info{
         .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
         .pNext                = nullptr,

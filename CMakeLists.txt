@@ -132,8 +132,20 @@ if(IZANAGI_BUILD_TESTS)
     add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3
                      izanagi_test_shaders4)
 
+    # GPU-independent container/arena tests (no Vulkan device required)
+    add_executable(izanagi_common_tests
+        tests/common_tests.cpp
+        src/common/containers.cpp
+        src/common/platform_utils.cpp
+    )
+    target_include_directories(izanagi_common_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     enable_testing()
     add_test(NAME api_tests COMMAND izanagi_tests)
+    add_test(NAME common_tests COMMAND izanagi_common_tests)
 endif()
 
 # --- Examples ------------------------------------------------------------------

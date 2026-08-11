@@ -16,6 +16,7 @@ SurfaceCapabilities get_surface_capabilities(Device dev) {
     uint32_t format_count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(d->physical_device, s.surface, &format_count, nullptr);
     Arena* arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
     auto vk_formats = reinterpret_cast<VkSurfaceFormatKHR*>(
         arena->alloc(sizeof(VkSurfaceFormatKHR) * format_count));
     vkGetPhysicalDeviceSurfaceFormatsKHR(d->physical_device, s.surface, &format_count, vk_formats);

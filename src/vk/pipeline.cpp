@@ -308,6 +308,7 @@ static VkResult compile_compute(DeviceImpl* d, Arena* arena, PipelineRecord* rec
         .basePipelineHandle = VK_NULL_HANDLE,
         .basePipelineIndex  = 0,
     };
+    if (arena->overflowed()) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
     return vkCreateComputePipelines(d->device, d->vk_pipeline_cache, 1, &info, nullptr, out);
 }
 
@@ -513,6 +514,7 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .basePipelineHandle  = VK_NULL_HANDLE,
         .basePipelineIndex   = 0,
     };
+    if (arena->overflowed()) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
     return vkCreateGraphicsPipelines(d->device, d->vk_pipeline_cache, 1, &create_info, nullptr, out);
 }
 
@@ -526,6 +528,7 @@ static VkResult compile_record(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
 // Compiles one record on the worker and publishes Ready or Failed (monotonic).
 static void process_record(DeviceImpl* d, PipelineRecord* rec) {
     Arena*      arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
     const bool  probing = d->pipeline_cache_control;
     const double t0 = monotonic_seconds();
     VkPipeline  pipeline = VK_NULL_HANDLE;
@@ -534,7 +537,9 @@ static void process_record(DeviceImpl* d, PipelineRecord* rec) {
     rec->state.store(probing ? InternalPipelineState::ProbingCache
                              : InternalPipelineState::Compiling,
                      std::memory_order_relaxed);
-    if (probing) {
+    if (arena->overflowed()) {
+        result = VK_ERROR_OUT_OF_HOST_MEMORY;   // scratch exhausted before compile
+    } else if (probing) {
         // Cache-only probe. VK_PIPELINE_COMPILE_REQUIRED is expected control
         // flow, not an error: it means the driver would compile, so run the
         // real create (without the fail-on-compile bit).
@@ -663,7 +668,12 @@ Handle<Pipeline> request_compute_pipeline(Device                             dev
     if (atomic_load(&d->device_destroying)) { return {}; }
 
     Arena* arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
     const VkSpecializationInfo spec_info = construct_specialization_info(constants, arena);
+    if (arena->overflowed()) {
+        IZ_LOG(d, LogLevel::Error, "request_compute_pipeline: scratch arena overflow");
+        return {};
+    }
 
     mutex_lock(&d->pipeline_lock);
     if (PipelineRecord* hit = find_record_locked(d, source, {}, spec_info, nullptr)) {
@@ -711,7 +721,12 @@ Handle<Pipeline> request_graphics_pipeline(Device                             de
     if (atomic_load(&d->device_destroying)) { return {}; }
 
     Arena* arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
     const VkSpecializationInfo spec_info = construct_specialization_info(constants, arena);
+    if (arena->overflowed()) {
+        IZ_LOG(d, LogLevel::Error, "request_graphics_pipeline: scratch arena overflow");
+        return {};
+    }
 
     mutex_lock(&d->pipeline_lock);
     if (PipelineRecord* hit = find_record_locked(d, vertex, fragment, spec_info, &desc)) {

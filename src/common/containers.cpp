@@ -32,19 +32,45 @@ static constexpr uint32_t num_header_entries(uint32_t n) {
 }
 
 TwoLevelBitset::TwoLevelBitset(Allocator alloc, uint32_t size) :
-    m_data(alloc, 0ull, num_entries(size)), m_size{size} {}
+    m_data(alloc, 0ull, num_entries(size)), m_size{size} {
+    // Reserve out-of-range entries so allocation never returns a slot >= size.
+    const uint32_t header_size  = num_header_entries(m_size);
+    const uint32_t leaf_entries = div_round_up(m_size, 64);
+    if (leaf_entries == 0) { return; }
+
+    // Leaf bits at/above size in the last leaf word.
+    const uint32_t tail = m_size & 63;
+    if (tail != 0) {
+        m_data[header_size + leaf_entries - 1] |= ~((1ull << tail) - 1);
+    }
+    // Chunk entries at/above the chunk count in the last header word.
+    const uint32_t tail_chunks = leaf_entries & 63;
+    if (tail_chunks != 0) {
+        const uint32_t last_header = (leaf_entries - 1) / 64;
+        m_data[last_header] |= ~((1ull << tail_chunks) - 1);
+    }
+}
 
 uint32_t TwoLevelBitset::set_leading_zero() {
-    uint32_t       header_idx  = 0;
     const uint32_t header_size = num_header_entries(m_size);
-    while (header_idx < header_size && m_data[header_idx] == UINT64_MAX) { header_idx++; }
-    if (header_idx == header_size) { return ~0; }
-
-    const uint32_t chunk_idx = count_trailing_zeros(~m_data[header_idx]);
-    const uint32_t chunk_pos = count_trailing_zeros(~m_data[header_size + chunk_idx]);
-    m_data[header_size + chunk_idx] |= 1ull << chunk_pos;
-    if (m_data[header_size + chunk_idx] == UINT64_MAX) { m_data[header_idx] |= 1ull << chunk_idx; }
-    return 64 * chunk_idx + chunk_pos;
+    uint32_t       header_idx  = 0;
+    while (header_idx < header_size) {
+        const uint64_t header = m_data[header_idx];
+        if (header == UINT64_MAX) { header_idx++; continue; }
+        const uint32_t chunk_pos_in_word = count_trailing_zeros(~header);
+        const uint32_t leaf_idx          = header_size + header_idx * 64 + chunk_pos_in_word;
+        uint64_t       leaf              = m_data[leaf_idx];
+        if (leaf == UINT64_MAX) {
+            // This chunk is full: mark it in the header and re-scan.
+            m_data[header_idx] |= 1ull << chunk_pos_in_word;
+            continue;
+        }
+        const uint32_t bit = count_trailing_zeros(~leaf);
+        m_data[leaf_idx] |= 1ull << bit;
+        if (m_data[leaf_idx] == UINT64_MAX) { m_data[header_idx] |= 1ull << chunk_pos_in_word; }
+        return 64 * (header_idx * 64 + chunk_pos_in_word) + bit;
+    }
+    return ~0u;
 }
 
 void TwoLevelBitset::clear_bit(uint32_t idx) {

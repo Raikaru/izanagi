@@ -36,8 +36,14 @@ class Allocator {
 };
 
 // --- Arena --------------------------------------------------------------------
+// Bump allocator with alignment, deterministic rewind, and overflow detection.
+// Not thread-safe: one arena per thread (see ScratchScope usage in backend ops).
 class Arena {
    public:
+    struct Marker {
+        uintptr_t offset;
+    };
+
     Arena() = default;
     Arena(void* ptr, size_t size, ProcLogCallback cb, void* userdata) noexcept :
         m_ptr(reinterpret_cast<uintptr_t>(ptr)),
@@ -49,11 +55,24 @@ class Arena {
     Arena(const Arena&)            = default;
     Arena& operator=(const Arena&) = default;
 
-    [[nodiscard]] void* alloc(size_t size) {
-        const uintptr_t ptr    = m_ptr;
+    // Returns the current position (for deterministic rewind).
+    [[nodiscard]] Marker mark() const {
+        return Marker{static_cast<uintptr_t>(m_ptr - m_begin)};
+    }
+    // Rewinds to a previously taken marker (LIFO discipline).
+    void rewind(Marker m) { m_ptr = m_begin + m.offset; }
+    // True once any allocation has failed (until clear_overflow).
+    [[nodiscard]] bool overflowed() const { return m_overflowed; }
+    void               clear_overflow() { m_overflowed = false; }
+
+    [[nodiscard]] void* alloc(size_t size, size_t alignment = 16) {
+        // alignment must be a power of two; clamp invalid values to 16.
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) { alignment = 16; }
+        const uintptr_t ptr    = (m_ptr + (alignment - 1)) & ~(static_cast<uintptr_t>(alignment) - 1);
         const uintptr_t newptr = ptr + size;
         const uintptr_t end    = m_begin + m_size;
         if (newptr > end) {
+            m_overflowed = true;
             if (m_log_callback) {
                 m_log_callback(LogLevel::Error, "Arena out of memory"_sv, __LINE__, "containers.h"_sv, m_log_userdata);
             }
@@ -82,9 +101,26 @@ class Arena {
     uintptr_t m_ptr{0};
     uintptr_t m_begin{0};
     size_t    m_size{0};
+    bool      m_overflowed = false;
 
     ProcLogCallback m_log_callback;
     void*           m_log_userdata;
+};
+
+// RAII scope: rewinds the arena to its entry marker on destruction. Top-level
+// backend operations must create one so repeated operations never exhaust the
+// thread-local arena. LIFO only.
+class ScratchScope {
+   public:
+    explicit ScratchScope(Arena& arena) : m_arena(arena), m_marker(arena.mark()) {}
+    ~ScratchScope() { m_arena.rewind(m_marker); }
+
+    ScratchScope(const ScratchScope&)            = delete;
+    ScratchScope& operator=(const ScratchScope&) = delete;
+
+   private:
+    Arena&        m_arena;
+    Arena::Marker m_marker;
 };
 
 template <class T>
@@ -154,10 +190,13 @@ class Vector {
     }
 
     void clear();
-    void reserve(uint32_t capacity);
+    bool reserve(uint32_t capacity);
 
     T& push_back(const T& v) {
-        if (m_count == m_capacity) { reserve(grow_capacity(m_count + 1)); }
+        if (m_count == m_capacity && !reserve(grow_capacity(m_count + 1))) {
+            m_alloc_failed = true;
+            return dummy();
+        }
         T* result = ::new (m_data + m_count) T(v);
         m_count++;
         return *result;
@@ -165,7 +204,10 @@ class Vector {
 
     template <class... Args>
     T& emplace_back(Args&&... args) {
-        if (m_count == m_capacity) { reserve(grow_capacity(m_count + 1)); }
+        if (m_count == m_capacity && !reserve(grow_capacity(m_count + 1))) {
+            m_alloc_failed = true;
+            return dummy();
+        }
         T* result = ::new (m_data + m_count) T(std::forward<Args>(args)...);
         m_count++;
         return *result;
@@ -185,16 +227,25 @@ class Vector {
 
     T* insert(T* pos, const T& value) {
         if (m_count == m_capacity) {
-            const auto idx = pos - m_data;
-            reserve(grow_capacity(m_count + 1));
+            const auto idx = m_data ? static_cast<uint32_t>(pos - m_data) : 0u;
+            if (!reserve(grow_capacity(m_count + 1))) {
+                m_alloc_failed = true;
+                return pos;   // no write; failure is observable via alloc_failed()
+            }
             pos = m_data + idx;
         }
-        ::new (end()) T(std::move(*(end() - 1)));
-        for (auto it = end() - 1; it > pos; --it) { *it = std::move(*(it - 1)); }
+        if (m_count > 0) {
+            ::new (end()) T(std::move(*(end() - 1)));
+            for (auto it = end() - 1; it > pos; --it) { *it = std::move(*(it - 1)); }
+        }
         ::new (pos) T(value);
         m_count++;
         return pos;
     }
+
+    // True after an allocation failure (the vector stays consistent; no
+    // out-of-bounds writes occur).
+    [[nodiscard]] bool alloc_failed() const { return m_alloc_failed; }
 
     const T&           operator[](uint32_t idx) const { return m_data[idx]; }
     T&                 operator[](uint32_t idx) { return m_data[idx]; }
@@ -208,7 +259,11 @@ class Vector {
     constexpr bool     is_empty() const { return m_count == 0; }
 
    private:
-    void             grow(size_t new_capacity);
+    static T& dummy() {
+        static thread_local T instance{};
+        return instance;
+    }
+    bool             grow(size_t new_capacity);
     constexpr size_t grow_capacity(size_t sz) const {
         const size_t new_capacity = m_capacity ? (m_capacity + m_capacity / 2) : 8;
         return new_capacity > sz ? new_capacity : sz;
@@ -217,6 +272,7 @@ class Vector {
     uint32_t  m_count    = 0;
     uint32_t  m_capacity = 0;
     T*        m_data     = nullptr;
+    bool      m_alloc_failed = false;
 };
 
 // --- SegmentArray ---------------------------------------------------------------
@@ -397,6 +453,10 @@ Vector<T>::Vector(Allocator allocator, uint32_t initial_capacity) : m_allocator(
 
 template <class T>
 Vector<T>::Vector(Allocator allocator, const T& value, uint32_t count) : Vector(allocator, count) {
+    if (m_data == nullptr && count > 0) {
+        m_alloc_failed = true;
+        return;
+    }
     m_count = count;
     for (uint32_t i = 0; i < count; ++i) { ::new (m_data + i) T(value); }
 }
@@ -414,12 +474,13 @@ void Vector<T>::clear() {
 }
 
 template <class T>
-void Vector<T>::reserve(uint32_t capacity) {
-    if (capacity > m_capacity) { grow(capacity); }
+bool Vector<T>::reserve(uint32_t capacity) {
+    if (capacity > m_capacity) { return grow(capacity); }
+    return true;
 }
 
 template <class T>
-void Vector<T>::grow(size_t new_capacity) {
+bool Vector<T>::grow(size_t new_capacity) {
     new_capacity                  = new_capacity > 4 ? new_capacity : 4;
     const MemoryBlock current_blk = {
         .ptr = static_cast<void*>(m_data),
@@ -427,21 +488,23 @@ void Vector<T>::grow(size_t new_capacity) {
     };
     if constexpr (std::is_trivially_copyable_v<T>) {
         MemoryBlock blk = m_allocator.realloc(current_blk, new_capacity * sizeof(T));
-        if (blk.ptr == nullptr) { return; }
+        if (blk.ptr == nullptr) { return false; }
         new_capacity = blk.len / sizeof(T);
-        m_capacity   = new_capacity;
+        m_capacity   = static_cast<uint32_t>(new_capacity);
         m_data       = reinterpret_cast<T*>(blk.ptr);
+        return true;
     } else {
         MemoryBlock blk = m_allocator.alloc(new_capacity * sizeof(T));
-        if (blk.ptr == nullptr) { return; }
+        if (blk.ptr == nullptr) { return false; }
         for (uint32_t i = 0; i < m_count; ++i) {
             ::new (reinterpret_cast<T*>(blk.ptr) + i) T(std::move(m_data[i]));
             m_data[i].~T();
         }
         new_capacity = blk.len / sizeof(T);
         m_allocator.free(current_blk);
-        m_capacity = new_capacity;
+        m_capacity = static_cast<uint32_t>(new_capacity);
         m_data     = reinterpret_cast<T*>(blk.ptr);
+        return true;
     }
 }
 

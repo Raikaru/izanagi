@@ -21,7 +21,7 @@
         return name(static_cast<U>(lhs) op static_cast<U>(rhs));                                   \
     }
 #define IZ_BITWISE_ASSIGNMENT_OP(name, op)                                                         \
-    inline constexpr name operator op## = (name lhs, name rhs) {                                   \
+    inline constexpr name& operator op##= (name& lhs, name rhs) {                                 \
         lhs = lhs op rhs;                                                                          \
         return lhs;                                                                                \
     }
