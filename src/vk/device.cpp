@@ -5,21 +5,15 @@
 #include <cstdio>
 #include <cstring>
 
-// Template instantiations for the public header's extern declarations
 namespace gpu {
-template class Span<const char>;
-template class Span<uint8_t>;
-template class Span<const ColorTarget>;
-template class Span<const RenderAttachment>;
-template class Span<const Format>;
-template class Span<const PresentMode>;
-template class Span<const CommandBuffer>;
-template class Span<const SemaphoreInfo>;
-template class Span<const SpecializationConstant>;
 
 // --- Required device extensions ---------------------------------------------------
+// VK_KHR_SWAPCHAIN is required only when a surface-capable WSI is selected;
+// headless builds never request it.
 static const char* kRequiredDeviceExtensions[] = {
+#if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+#endif
     VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
     VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
     VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
@@ -126,19 +120,25 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
         .apiVersion         = VK_API_VERSION_1_4,
     };
 
-    const char* instance_extensions[] = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
-    };
-    constexpr uint32_t num_instance_extensions =
-        sizeof(instance_extensions) / sizeof(instance_extensions[0]);
+    // WSI extensions are enabled only when a surface-capable WSI is selected;
+    // a HEADLESS build never requests surface/swapchain extensions.
+    const char* wsi_extensions[2] = {};
+    uint32_t    num_wsi_extensions = 0;
+#if defined(IZ_WSI_WIN32)
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_SURFACE_EXTENSION_NAME;
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#endif
+#if defined(IZ_WSI_ANDROID)
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_SURFACE_EXTENSION_NAME;
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
+#endif
 
     // Optional validation layer
     const char* layers[1]     = {"VK_LAYER_KHRONOS_validation"};
     uint32_t    layer_count   = 0;
     const char* ext_ptrs[8];
     uint32_t    ext_count     = 0;
-    for (uint32_t i = 0; i < num_instance_extensions; ++i) { ext_ptrs[ext_count++] = instance_extensions[i]; }
+    for (uint32_t i = 0; i < num_wsi_extensions; ++i) { ext_ptrs[ext_count++] = wsi_extensions[i]; }
 
     if (desc.enable_validation) {
         uint32_t avail_layer_count = 0;
@@ -605,7 +605,8 @@ Device create_device(const DeviceDesc& desc) {
         goto fail;
     }
 
-    // Create surface if window handle provided
+    // Create surface if a window handle is provided and the WSI is surface-capable.
+#if defined(IZ_WSI_WIN32)
     if (desc.native_window_handle != 0) {
         VkWin32SurfaceCreateInfoKHR surface_info{
             .sType     = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
@@ -620,6 +621,11 @@ Device create_device(const DeviceDesc& desc) {
             goto fail;
         }
     }
+#else
+    // No surface-capable WSI in this build; surface APIs report clean errors.
+    (void)desc.native_window_handle;
+    (void)desc.native_instance_handle;
+#endif
 
     result = select_physical_device(d, desc.gpu_preference);
     if (result != VK_SUCCESS) {

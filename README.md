@@ -136,8 +136,15 @@ target_link_libraries(your_app PRIVATE Izanagi::izanagi)
 ```
 
 The public header `izanagi/gpu.h` is Vulkan-free (no Vk* types, no volk
-include); consumers only need the include dir + the compiled lib. The API is
-Windows-only in v1 (Vulkan 1.4 backend).
+include); consumers only need the include dir + the compiled lib.
+
+## Platform status
+
+Windows (Vulkan Native, WIN32 WSI) is the certified baseline. Linux headless
+builds and the macOS build boundary are in place; Metal, Android, and iOS are
+in incremental phases. See [docs/PlatformSupport.md](docs/PlatformSupport.md)
+and [docs/Build.md](docs/Build.md) — a platform is never listed as supported
+merely because it compiles.
 
 ## Examples
 

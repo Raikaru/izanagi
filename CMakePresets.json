@@ -11,6 +11,57 @@
       "cacheVariables": {
         "CMAKE_CXX_STANDARD": "20"
       }
+    },
+    {
+      "name": "windows-headless",
+      "displayName": "Windows headless Vulkan (no WSI)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build-headless",
+      "cacheVariables": {
+        "IZANAGI_WSI": "HEADLESS",
+        "IZANAGI_BUILD_EXAMPLES": "OFF"
+      }
+    },
+    {
+      "name": "linux-clang-debug",
+      "displayName": "Linux Clang Debug (headless)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/linux-clang-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "IZANAGI_WSI": "HEADLESS",
+        "IZANAGI_BUILD_EXAMPLES": "OFF"
+      }
+    },
+    {
+      "name": "linux-gcc-release",
+      "displayName": "Linux GCC Release (headless)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/linux-gcc-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "IZANAGI_WSI": "HEADLESS",
+        "IZANAGI_BUILD_EXAMPLES": "OFF"
+      }
+    },
+    {
+      "name": "linux-clang-asan",
+      "displayName": "Linux Clang ASan/UBSan (common tests)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/linux-clang-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "IZANAGI_WSI": "HEADLESS",
+        "IZANAGI_BUILD_EXAMPLES": "OFF",
+        "IZANAGI_BUILD_TESTS": "ON",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
     }
   ],
   "buildPresets": [

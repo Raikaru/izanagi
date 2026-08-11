@@ -5,6 +5,18 @@
 
 namespace gpu {
 
+// Template instantiations for the public header's extern declarations
+// (common code, so every consumer — including GPU-independent tests — links).
+template class Span<const char>;
+template class Span<uint8_t>;
+template class Span<const ColorTarget>;
+template class Span<const RenderAttachment>;
+template class Span<const Format>;
+template class Span<const PresentMode>;
+template class Span<const CommandBuffer>;
+template class Span<const SemaphoreInfo>;
+template class Span<const SpecializationConstant>;
+
 Allocator::Allocator() {
     m_alloc = [](void*, void* ptr, uint32_t, uint32_t new_size) -> MemoryBlock {
         if (new_size == 0) {

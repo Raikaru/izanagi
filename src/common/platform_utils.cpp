@@ -20,7 +20,10 @@ __declspec(dllimport) void __stdcall          InitializeConditionVariable(void* 
 __declspec(dllimport) int __stdcall           SleepConditionVariableSRW(void* ConditionVariable, void* SRWLock, unsigned long dwMilliseconds, unsigned long dwFlags);
 __declspec(dllimport) void __stdcall          WakeAllConditionVariable(void* ConditionVariable);
 __declspec(dllimport) void __stdcall          WakeConditionVariable(void* ConditionVariable);
-__declspec(dllimport) void* __stdcall         CreateThread(void* lpThreadAttributes, unsigned long dwStackSize, void* lpStartAddress, void* lpParameter, unsigned long dwCreationFlags, unsigned long* lpThreadId);
+typedef unsigned long(__stdcall* IZ_THREAD_START_ROUTINE)(void*);
+__declspec(dllimport) void* __stdcall CreateThread(void* lpThreadAttributes, unsigned long dwStackSize,
+                                                   IZ_THREAD_START_ROUTINE lpStartAddress, void* lpParameter,
+                                                   unsigned long dwCreationFlags, unsigned long* lpThreadId);
 __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void* hHandle, unsigned long dwMilliseconds);
 __declspec(dllimport) int __stdcall           CloseHandle(void* hObject);
 __declspec(dllimport) int __stdcall           SetThreadPriority(void* hThread, int nPriority);

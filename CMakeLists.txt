@@ -15,7 +15,69 @@ endif()
 # consumed via add_subdirectory/FetchContent.
 option(IZANAGI_BUILD_TESTS    "Build the API test suite"    ${PROJECT_IS_TOP_LEVEL})
 option(IZANAGI_BUILD_EXAMPLES "Build the example programs"  ${PROJECT_IS_TOP_LEVEL})
-mark_as_advanced(IZANAGI_BUILD_TESTS IZANAGI_BUILD_EXAMPLES)
+option(IZANAGI_BUILD_CAPABILITY_REPORT "Build the capability-report tool" ${PROJECT_IS_TOP_LEVEL})
+mark_as_advanced(IZANAGI_BUILD_TESTS IZANAGI_BUILD_EXAMPLES IZANAGI_BUILD_CAPABILITY_REPORT)
+
+# --- Backend and WSI selection -------------------------------------------------
+# One backend per compiled library. IZANAGI_BACKEND selects the private
+# implementation; IZANAGI_WSI selects the window-system integration (HEADLESS
+# requires no desktop window system). Unsupported combinations fail configure
+# with a clear message — never silently pick a different backend/WSI.
+set(IZANAGI_BACKEND "VULKAN_NATIVE" CACHE STRING
+    "Private backend: VULKAN_NATIVE | VULKAN_COMPAT | METAL")
+set(IZANAGI_WSI "AUTO" CACHE STRING
+    "Window-system integration: AUTO | HEADLESS | WIN32 | XCB | WAYLAND | ANDROID | METAL")
+set_property(CACHE IZANAGI_BACKEND PROPERTY STRINGS VULKAN_NATIVE VULKAN_COMPAT METAL)
+set_property(CACHE IZANAGI_WSI PROPERTY STRINGS AUTO HEADLESS WIN32 XCB WAYLAND ANDROID METAL)
+
+# Host shader tool: explicit path wins, then PATH, then a repository-managed
+# host package (see third_party/CMakeLists.txt).
+set(IZANAGI_SLANGC "" CACHE FILEPATH "Path to a host slangc executable (empty = auto-discover)")
+
+# Backend profile name advertised in the capability report.
+set(IZANAGI_PROFILE "IZANAGI_VK_NATIVE_1" CACHE STRING "Capability profile name")
+
+if(NOT IZANAGI_BACKEND STREQUAL "VULKAN_NATIVE")
+    message(FATAL_ERROR
+        "IZANAGI_BACKEND=${IZANAGI_BACKEND} is not implemented yet. This phase "
+        "ships the portable build boundary; VULKAN_COMPAT and METAL backends land "
+        "in later phases. Supported now: VULKAN_NATIVE.")
+endif()
+
+# Resolve AUTO WSI per host.
+if(IZANAGI_WSI STREQUAL "AUTO")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        set(IZANAGI_WSI "WIN32")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+        set(IZANAGI_WSI "ANDROID")
+    elseif(APPLE)
+        set(IZANAGI_WSI "HEADLESS")   # METAL WSI lands with the Metal backend
+    else()
+        set(IZANAGI_WSI "HEADLESS")   # XCB/WAYLAND hosts land in a later phase
+    endif()
+endif()
+
+# Validate backend/WSI/host combinations.
+if(IZANAGI_WSI STREQUAL "WIN32" AND NOT WIN32)
+    message(FATAL_ERROR "IZANAGI_WSI=WIN32 requires a Windows host")
+endif()
+if(IZANAGI_WSI STREQUAL "XCB" OR IZANAGI_WSI STREQUAL "WAYLAND")
+    message(FATAL_ERROR
+        "IZANAGI_WSI=${IZANAGI_WSI} is declared but its host is not implemented "
+        "yet (planned for the Linux presentation phase). Use HEADLESS.")
+endif()
+if(IZANAGI_WSI STREQUAL "ANDROID" AND NOT ANDROID)
+    message(FATAL_ERROR "IZANAGI_WSI=ANDROID requires an Android target")
+endif()
+if(IZANAGI_WSI STREQUAL "METAL" AND NOT APPLE)
+    message(FATAL_ERROR "IZANAGI_WSI=METAL requires an Apple target")
+endif()
+if(IZANAGI_BACKEND STREQUAL "METAL" AND NOT APPLE)
+    message(FATAL_ERROR "IZANAGI_BACKEND=METAL requires an Apple host")
+endif()
+
+message(STATUS "Izanagi backend: ${IZANAGI_BACKEND} (profile ${IZANAGI_PROFILE})")
+message(STATUS "Izanagi WSI:     ${IZANAGI_WSI}")
 
 # Place all binaries in predictable locations
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -58,16 +120,28 @@ target_link_libraries(izanagi
     PRIVATE $<BUILD_INTERFACE:GPUOpen::VulkanMemoryAllocator>
 )
 
+# WSI-conditional platform definitions: VK_USE_PLATFORM_* applies only to the
+# selected WSI's source set. Windows.h hygiene macros stay Windows-wide.
+if(WIN32)
+    target_compile_definitions(izanagi PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
 target_compile_definitions(izanagi PRIVATE
-    VK_USE_PLATFORM_WIN32_KHR
     VK_NO_PROTOTYPES
-    WIN32_LEAN_AND_MEAN
-    NOMINMAX
+    IZ_WSI_${IZANAGI_WSI}
+    IZ_PROFILE="${IZANAGI_PROFILE}"
 )
-
+if(IZANAGI_WSI STREQUAL "WIN32")
+    target_compile_definitions(izanagi PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
+if(IZANAGI_WSI STREQUAL "ANDROID")
+    target_compile_definitions(izanagi PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+endif()
 if(MSVC)
     target_compile_options(izanagi PRIVATE /W4 /permissive- /Zc:preprocessor /wd4201 /wd4324)
 endif()
+
+# One stable consumer target for the selected implementation.
+add_library(Izanagi::Izanagi ALIAS izanagi)
 
 # --- Install / export ----------------------------------------------------------
 include(CMakePackageConfigHelpers)
@@ -148,8 +222,21 @@ if(IZANAGI_BUILD_TESTS)
     add_test(NAME common_tests COMMAND izanagi_common_tests)
 endif()
 
+# --- Capability report tool ----------------------------------------------------
+if(IZANAGI_BUILD_CAPABILITY_REPORT)
+    add_executable(izanagi_capability_report tools/capability_report.cpp)
+    target_link_libraries(izanagi_capability_report PRIVATE izanagi volk_headers GPUOpen::VulkanMemoryAllocator)
+    target_include_directories(izanagi_capability_report PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(izanagi_capability_report PRIVATE IZ_PROFILE="${IZANAGI_PROFILE}")
+endif()
+
 # --- Examples ------------------------------------------------------------------
-if(IZANAGI_BUILD_EXAMPLES)
+# The example host currently exists for the WIN32 WSI only; other WSI hosts
+# land with their platform phases.
+if(IZANAGI_BUILD_EXAMPLES AND NOT IZANAGI_WSI STREQUAL "WIN32")
+    message(STATUS "Examples: skipped (no ${IZANAGI_WSI} example host yet)")
+endif()
+if(IZANAGI_BUILD_EXAMPLES AND IZANAGI_WSI STREQUAL "WIN32")
     add_slang_shader(izanagi_example_shaders
         SOURCE ${CMAKE_SOURCE_DIR}/examples/shaders/hello_triangle.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/hello_triangle.spv

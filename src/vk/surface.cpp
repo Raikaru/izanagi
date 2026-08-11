@@ -344,6 +344,9 @@ SurfaceTextureInfo get_current_texture(Device dev) {
 SurfaceStatus present(Device dev, Queue q) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     auto& s = d->surface;
+    if (s.swapchain == VK_NULL_HANDLE) {
+        return SurfaceStatus::Error;   // no surface in this build/configuration
+    }
     auto* queue_impl = reinterpret_cast<QueueImpl*>(q);
 
     const VkSemaphore present_sem =
