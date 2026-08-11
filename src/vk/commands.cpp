@@ -7,6 +7,29 @@
 
 namespace gpu {
 
+// Vulkan 1.3 commands are available on 1.2 devices only through their KHR/EXT
+// extensions. Under the bindless profile the core-1.3 names are aliased to
+// the extension entry points (enabled extensions guarantee the functions
+// resolve; on 1.3+ devices the extension entry points are the same code).
+#if defined(IZ_VK_PROFILE_BINDLESS)
+#    define vkQueueSubmit2             vkQueueSubmit2KHR
+#    define vkCmdPipelineBarrier2      vkCmdPipelineBarrier2KHR
+#    define vkCmdBeginRendering        vkCmdBeginRenderingKHR
+#    define vkCmdEndRendering          vkCmdEndRenderingKHR
+#    define vkCmdCopyBuffer2           vkCmdCopyBuffer2KHR
+#    define vkCmdCopyBufferToImage2    vkCmdCopyBufferToImage2KHR
+#    define vkCmdCopyImageToBuffer2    vkCmdCopyImageToBuffer2KHR
+#    define vkCmdBlitImage2            vkCmdBlitImage2KHR
+#    define vkCmdSetDepthWriteEnable       vkCmdSetDepthWriteEnableEXT
+#    define vkCmdSetDepthTestEnable        vkCmdSetDepthTestEnableEXT
+#    define vkCmdSetDepthCompareOp         vkCmdSetDepthCompareOpEXT
+#    define vkCmdSetDepthBoundsTestEnable  vkCmdSetDepthBoundsTestEnableEXT
+#    define vkCmdSetStencilTestEnable      vkCmdSetStencilTestEnableEXT
+#    define vkCmdSetStencilOp              vkCmdSetStencilOpEXT
+#    define vkCmdSetViewportWithCount      vkCmdSetViewportWithCountEXT
+#    define vkCmdSetScissorWithCount       vkCmdSetScissorWithCountEXT
+#endif
+
 // --- Descriptor heap binding ---------------------------------------------------------
 
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
@@ -413,7 +436,7 @@ Submission queue_submit(Queue                     q,
             .imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size()),
             .pImageMemoryBarriers     = image_barriers.data(),
         };
-        vkCmdPipelineBarrier2(internal_cmd->buffer, &dependency_info);
+                vkCmdPipelineBarrier2(internal_cmd->buffer, &dependency_info);
         cmd_finalize(internal_cmd);
         command_info = concat(arena, command_info,
                               VkCommandBufferSubmitInfo{
@@ -593,7 +616,7 @@ Submission queue_submit(Queue                     q,
         .pSignalSemaphoreInfos    = signal_info.data(),
     };
 
-    const VkResult result = vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
+    const VkResult result =         vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) {
         atomic_fetch_add(&d->stat_failed_submits, 1);
         log_vk_impl(d, result, "queue_submit: vkQueueSubmit2 failed", __LINE__, "commands.cpp"_sv);
@@ -870,7 +893,7 @@ void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
         .imageMemoryBarrierCount  = 0,
         .pImageMemoryBarriers     = nullptr,
     };
-    vkCmdPipelineBarrier2(cmd->buffer, &info);
+            vkCmdPipelineBarrier2(cmd->buffer, &info);
 }
 
 void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
@@ -1202,7 +1225,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     };
 
     auto buf = cmd->buffer;
-    vkCmdBeginRendering(buf, &rendering_info);
+            vkCmdBeginRendering(buf, &rendering_info);
 
     // Default dynamic state
     vkCmdSetDepthWriteEnable(buf, false);
@@ -1229,7 +1252,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
 }
 
 void cmd_end_render_pass(CommandBuffer cmd) {
-    vkCmdEndRendering(cmd->buffer);
+            vkCmdEndRendering(cmd->buffer);
 }
 
 void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
@@ -1345,7 +1368,7 @@ void cmd_wait_for_surface_texture(CommandBuffer cmd) {
         .imageMemoryBarrierCount  = 1,
         .pImageMemoryBarriers     = &image_barrier,
     };
-    vkCmdPipelineBarrier2(cmd->buffer, &info);
+            vkCmdPipelineBarrier2(cmd->buffer, &info);
 }
 
 void cmd_signal_surface_texture(CommandBuffer cmd) {
@@ -1384,7 +1407,7 @@ void cmd_signal_surface_texture(CommandBuffer cmd) {
         .imageMemoryBarrierCount  = 1,
         .pImageMemoryBarriers     = &image_barrier,
     };
-    vkCmdPipelineBarrier2(cmd->buffer, &info);
+            vkCmdPipelineBarrier2(cmd->buffer, &info);
 }
 
 // --- Debug groups ----------------------------------------------------------------------

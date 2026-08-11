@@ -19,7 +19,7 @@ namespace gpu {
 #endif
 #if defined(IZ_VK_PROFILE_BINDLESS)
 #    define IZ_REQUIRE_HEAP_TRIO 0
-#    define IZ_REQUIRE_KHR_RENDERING 2   // dynamic rendering + sync2 (KHR route on 1.2)
+#    define IZ_REQUIRE_KHR_RENDERING 4   // dyn. rendering + sync2 + copy-commands2 (KHR) + ext. dyn. state (EXT) on 1.2
 #else
 #    define IZ_REQUIRE_HEAP_TRIO 1
 #    define IZ_REQUIRE_KHR_RENDERING 0
@@ -45,6 +45,8 @@ static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_H
 #if defined(IZ_VK_PROFILE_BINDLESS)
     VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
     VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+    VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME,
+    VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
 #endif
 };
 static constexpr size_t kRequiredDeviceExtensionsCount =
@@ -331,9 +333,17 @@ static VkResult create_logical_device(DeviceImpl* d) {
         .pNext = &unified_layouts_features,
     };
 #endif
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+        .pNext = nullptr,
+    };
+#endif
     VkPhysicalDeviceVulkan13Features vulkan13_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-#if !defined(IZ_VK_PROFILE_BINDLESS)
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .pNext = &extended_dynamic_state_features,
+#else
         .pNext = &vulkan14_features,
 #endif
     };
@@ -426,8 +436,13 @@ static VkResult create_logical_device(DeviceImpl* d) {
 
     vulkan13_features.dynamicRendering = VK_TRUE;
     vulkan13_features.synchronization2 = VK_TRUE;
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     vulkan13_features.maintenance4     = VK_TRUE;
+#endif
     d->use_synchronization2 = vulkan13_features.synchronization2 == VK_TRUE;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    extended_dynamic_state_features.extendedDynamicState = VK_TRUE;
+#endif
     // Optional: lets the compiler worker probe the cache with
     // FAIL_ON_PIPELINE_COMPILE_REQUIRED instead of compiling blind.
     d->pipeline_cache_control = vulkan13_features.pipelineCreationCacheControl == VK_TRUE;
