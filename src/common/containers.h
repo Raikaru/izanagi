@@ -226,6 +226,8 @@ class Vector {
     }
 
     T* insert(T* pos, const T& value) {
+        // Copy first: handles self-insertion and reserve-invalidated references.
+        T temp(value);
         if (m_count == m_capacity) {
             const auto idx = m_data ? static_cast<uint32_t>(pos - m_data) : 0u;
             if (!reserve(grow_capacity(m_count + 1))) {
@@ -234,11 +236,17 @@ class Vector {
             }
             pos = m_data + idx;
         }
-        if (m_count > 0) {
+        if (pos == end()) {
+            // Append: construct directly into the uninitialized tail.
+            ::new (pos) T(std::move(temp));
+        } else {
+            // Move the last element into the uninitialized tail, shift the
+            // interior down with move-assignment into live slots, then
+            // move-assign the inserted value into the (live) slot at pos.
             ::new (end()) T(std::move(*(end() - 1)));
             for (auto it = end() - 1; it > pos; --it) { *it = std::move(*(it - 1)); }
+            *pos = std::move(temp);
         }
-        ::new (pos) T(value);
         m_count++;
         return pos;
     }
@@ -375,6 +383,14 @@ class SlotMap {
 
     Handle<T> emplace(T&& val);
     void      erase(Handle<T> h);
+    // Invalidates every handle to this slot WITHOUT destroying the stored
+    // record or freeing the slot (used when a refcounted record must survive
+    // retirement but its public handle must become stale immediately).
+    void invalidate(Handle<T> h);
+    // Returns the handle with the CURRENT generation for a stored record
+    // (used to release refcounted records whose public handle was already
+    // invalidated). Returns {} when the record is not in the map.
+    Handle<T> find_handle(const T* ptr);
 
     T&       operator[](Handle<T> h);
     const T& operator[](Handle<T> h) const;
@@ -399,7 +415,7 @@ class SlotMap {
     static constexpr uint32_t capacity_for_segment_count(uint32_t segment_count) {
         return ((1 << kSmallSegmentsToSkip) << segment_count) - (1 << kSmallSegmentsToSkip);
     }
-    void                    add_segment();
+    bool                    add_segment();
     Entry*                  get(uint32_t idx);
     static Handle<T>        create_handle(uint32_t idx, uint32_t gen);
     static DecomposedHandle decompose_handle(Handle<T> h);
@@ -533,13 +549,17 @@ void SlotMap<T>::clear() {
         m_segments[segment_idx] = nullptr;
     }
     m_used_segments = 0;
+    m_head          = kEndOfList;   // free-list head must not dangle into freed segments
     mutex_unlock(&m_mutex);
 }
 
 template <class T>
 Handle<T> SlotMap<T>::emplace(T&& val) {
     mutex_lock(&m_mutex);
-    if (m_head == kEndOfList) { add_segment(); }
+    if (m_head == kEndOfList && !add_segment()) {
+        mutex_unlock(&m_mutex);
+        return {};   // allocation failure: invalid handle, map unchanged
+    }
 
     const uint32_t idx = m_head;
     assert(idx != kNotInFreelist && idx != kEndOfList);
@@ -549,9 +569,12 @@ Handle<T> SlotMap<T>::emplace(T&& val) {
     m_head      = entry->next;
     entry->next = kNotInFreelist;
     ::new (&entry->data) T(std::forward<T&&>(val));
+    // Bump the generation while locked: a stale handle (from a prior erase or
+    // emplace) must never resolve to this slot.
+    const Handle<T> handle = create_handle(idx, ++entry->gen);
     mutex_unlock(&m_mutex);
 
-    return create_handle(idx, ++entry->gen);
+    return handle;
 }
 
 template <class T>
@@ -561,6 +584,7 @@ void SlotMap<T>::erase(Handle<T> h) {
     Entry* entry          = get(idx);
     assert(entry->gen == gen);
     if (m_destructor_fn) { m_destructor_fn(&entry->data, m_destructor_userdata); }
+    entry->gen  = entry->gen + 1;   // invalidate every handle to this slot
     entry->next = m_head;
     m_head      = idx;
     mutex_unlock(&m_mutex);
@@ -583,17 +607,53 @@ const T& SlotMap<T>::operator[](Handle<T> h) const {
 }
 
 template <class T>
-void SlotMap<T>::add_segment() {
-    const size_t segment_size     = slots_in_segment(m_used_segments);
-    const auto   blk              = m_allocator.alloc(sizeof(Entry) * segment_size);
-    auto         segment          = reinterpret_cast<Entry*>(blk.ptr);
+// Appends a new segment and links every slot exactly once into the free
+// list. Returns false when the segment cannot be allocated (the map is left
+// unchanged and usable).
+bool SlotMap<T>::add_segment() {
+    const size_t segment_size = slots_in_segment(m_used_segments);
+    const auto   blk          = m_allocator.alloc(sizeof(Entry) * segment_size);
+    if (blk.ptr == nullptr) { return false; }
+    auto segment = reinterpret_cast<Entry*>(blk.ptr);
     m_segments[m_used_segments++] = segment;
     const uint32_t segment_offset = capacity_for_segment_count(m_used_segments - 1);
     for (size_t i = segment_size; i > 0; --i) {
+        const uint32_t idx = static_cast<uint32_t>(i - 1) + segment_offset;
         segment[i - 1].gen  = 0;
         segment[i - 1].next = m_head;
-        m_head              = i + segment_offset;
+        m_head              = idx;
     }
+    return true;
+}
+
+template <class T>
+Handle<T> SlotMap<T>::find_handle(const T* ptr) {
+    mutex_lock(&m_mutex);
+    Handle<T> result{};
+    for (uint32_t segment_idx = 0; segment_idx < m_used_segments; ++segment_idx) {
+        const uint32_t segment_size   = slots_in_segment(segment_idx);
+        Entry*         segment        = m_segments[segment_idx];
+        const uint32_t segment_offset = capacity_for_segment_count(segment_idx);
+        for (uint32_t slot = 0; slot < segment_size; ++slot) {
+            if (segment[slot].next == kNotInFreelist && &segment[slot].data == ptr) {
+                result = create_handle(segment_offset + slot, segment[slot].gen);
+                break;
+            }
+        }
+        if (result.h != 0) { break; }
+    }
+    mutex_unlock(&m_mutex);
+    return result;
+}
+
+template <class T>
+void SlotMap<T>::invalidate(Handle<T> h) {
+    mutex_lock(&m_mutex);
+    const auto [idx, gen] = decompose_handle(h);
+    Entry* entry          = get(idx);
+    assert(entry->gen == gen);
+    entry->gen = entry->gen + 1;   // every old handle to this slot is now stale
+    mutex_unlock(&m_mutex);
 }
 
 template <class T>

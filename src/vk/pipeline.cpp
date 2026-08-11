@@ -164,7 +164,21 @@ static bool compute_key_equal(const PipelineRecord& rec, ShaderSource source,
     return spec_equal(rec, spec);
 }
 
-// Copies every create input into one owned block inside `rec`. Returns false on
+// Frees every allocation owned by a record's canonical key.
+void free_key(DeviceImpl* d, PipelineRecord* rec) {
+    if (rec->key_block.ptr != nullptr) { d->allocator.free(rec->key_block); }
+    if (rec->spec_ids_block.ptr != nullptr) { d->allocator.free(rec->spec_ids_block); }
+    if (rec->spec_sizes_block.ptr != nullptr) { d->allocator.free(rec->spec_sizes_block); }
+    if (rec->color_targets_block.ptr != nullptr) { d->allocator.free(rec->color_targets_block); }
+    rec->key_block = {};
+    rec->spec_ids_block = {};
+    rec->spec_sizes_block = {};
+    rec->color_targets_block = {};
+}
+
+// Copies every create input into owned storage inside `rec`. Byte/string data
+// lives in one blob; typed arrays (spec ids/sizes, color targets) are
+// allocated separately so they are always naturally aligned. Returns false on
 // allocation failure (caller must destroy the record and bail).
 static bool build_key(DeviceImpl* d, PipelineRecord* rec, ShaderSource vertex, ShaderSource fragment,
                       const VkSpecializationInfo& spec, const RasterDesc* desc) {
@@ -172,30 +186,39 @@ static bool build_key(DeviceImpl* d, PipelineRecord* rec, ShaderSource vertex, S
     size_t total = 0;
     total += vertex.source.size() + vertex.entry_point.size() + 1;
     total += fragment.source.size() + fragment.entry_point.size() + 1;
-    total += spec.dataSize + spec.mapEntryCount * 2 * sizeof(uint32_t);
-    total += ct_count * sizeof(ColorTarget);
+    total += spec.dataSize;
     if (total == 0) { total = 1; }
 
     MemoryBlock blk = d->allocator.alloc(total);
     if (blk.ptr == nullptr) { return false; }
+    MemoryBlock ids_blk = d->allocator.alloc(spec.mapEntryCount * sizeof(uint32_t));
+    MemoryBlock sizes_blk = d->allocator.alloc(spec.mapEntryCount * sizeof(uint32_t));
+    MemoryBlock targets_blk = d->allocator.alloc(ct_count * sizeof(ColorTarget));
+    if ((spec.mapEntryCount > 0 && ids_blk.ptr == nullptr) ||
+        (spec.mapEntryCount > 0 && sizes_blk.ptr == nullptr) ||
+        (ct_count > 0 && targets_blk.ptr == nullptr)) {
+        d->allocator.free(blk);
+        if (ids_blk.ptr != nullptr) { d->allocator.free(ids_blk); }
+        if (sizes_blk.ptr != nullptr) { d->allocator.free(sizes_blk); }
+        if (targets_blk.ptr != nullptr) { d->allocator.free(targets_blk); }
+        return false;
+    }
     rec->key_block = blk;
+    rec->spec_ids_block = ids_blk;
+    rec->spec_sizes_block = sizes_blk;
+    rec->color_targets_block = targets_blk;
 
     uint8_t* p = static_cast<uint8_t*>(blk.ptr);
-    auto take_space = [&p](size_t n) -> void* {
-        void* out = p;
-        p += n;
-        return out;
-    };
     auto take_bytes = [&p](const void* src, size_t n) -> uint8_t* {
         uint8_t* out = p;
         if (n) { memcpy(p, src, n); }
         p += n;
         return out;
     };
-    auto take_str = [&p](Span<const char> s) -> char* {
+    auto take_str = [&p](Span<const char> str) -> char* {
         char* out = reinterpret_cast<char*>(p);
-        if (s.size()) { memcpy(p, s.data(), s.size()); }
-        p += s.size();
+        if (str.size()) { memcpy(p, str.data(), str.size()); }
+        p += str.size();
         *p = '\0';
         p += 1;
         return out;
@@ -211,8 +234,8 @@ static bool build_key(DeviceImpl* d, PipelineRecord* rec, ShaderSource vertex, S
     rec->spec_size = static_cast<uint32_t>(spec.dataSize);
     rec->spec_data = take_bytes(spec.pData, spec.dataSize);
     rec->spec_count = spec.mapEntryCount;
-    uint32_t* ids = static_cast<uint32_t*>(take_space(spec.mapEntryCount * sizeof(uint32_t)));
-    uint32_t* sizes = static_cast<uint32_t*>(take_space(spec.mapEntryCount * sizeof(uint32_t)));
+    uint32_t* ids = static_cast<uint32_t*>(ids_blk.ptr);
+    uint32_t* sizes = static_cast<uint32_t*>(sizes_blk.ptr);
     for (uint32_t i = 0; i < spec.mapEntryCount; ++i) {
         ids[i]   = spec.pMapEntries[i].constantID;
         sizes[i] = spec.pMapEntries[i].size;
@@ -227,7 +250,7 @@ static bool build_key(DeviceImpl* d, PipelineRecord* rec, ShaderSource vertex, S
         rec->depth_format      = desc->depth_format;
         rec->stencil_format    = desc->stencil_format;
         rec->color_target_count = ct_count;
-        ColorTarget* cts = static_cast<ColorTarget*>(take_space(ct_count * sizeof(ColorTarget)));
+        ColorTarget* cts = static_cast<ColorTarget*>(targets_blk.ptr);
         for (uint32_t i = 0; i < ct_count; ++i) { cts[i] = desc->color_targets[i]; }
         rec->color_targets = cts;
     }
@@ -628,7 +651,7 @@ void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec) {
     if (rec->vk_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(d->device, rec->vk_pipeline, nullptr);
     }
-    if (rec->key_block.ptr != nullptr) { d->allocator.free(rec->key_block); }
+    free_key(d, rec);
     free_record(d, rec);
 }
 
@@ -868,8 +891,11 @@ void free_after(Device dev, Handle<Pipeline> pipeline, Submission s) {
     const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
     PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
     // The user reference (and the native pipeline with it) is released when
-    // the target submission completes.
+    // the target submission completes. The public handle is invalidated
+    // immediately by erasing its slot (the record survives via the deferred
+    // reference).
     enqueue_retire(q, value, RetireItem{RetireKind::PipelineRef, reinterpret_cast<uint64_t>(rec), 0});
+    d->pipeline_pool.erase(handle_cast<PipelineImpl>(pipeline));
 }
 
 // --- White-box test hooks -------------------------------------------------------------------

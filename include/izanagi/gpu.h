@@ -413,13 +413,16 @@ struct SamplerDesc {
 // persistent storage per backend/driver/GPU. The cache blob is NOT
 // transferable across drivers or GPUs; the driver rejects incompatible
 // blobs at load time (treat rejection as "no cache").
-// driver_uuid is the backend's stable per-driver identity (Vulkan:
-// VkPhysicalDeviceIDProperties.driverUUID).
+// cache_uuid is the backend's pipeline-cache compatibility identity (Vulkan:
+// pipelineCacheUUID from the cache blob header); driver_uuid is the stable
+// per-driver identity (VkPhysicalDeviceIDProperties.driverUUID), used as a
+// fallback when the driver does not expose the cache UUID for an empty cache.
 struct CacheIdentity {
     Backend  backend    = Backend::Vulkan;
     uint32_t vendor_id  = 0;
     uint32_t device_id  = 0;
     uint8_t  driver_uuid[16] = {};
+    uint8_t  cache_uuid[16]  = {};
 };
 // Optional persistent native pipeline cache (per device, whole-blob).
 // load is called once during create_device to seed the cache; return false

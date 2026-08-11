@@ -69,7 +69,7 @@ Arena* get_thread_local_arena(DeviceImpl* d) {
 // base <= ptr, then bounds check against the user size). Rejects pointers in
 // gaps between allocations and past the end. Returns the buffer record and the
 // VkBuffer-relative offset (64-bit, includes the interior alignment).
-static Buffer* find_buffer_for_ptr(DeviceImpl* d, GpuPtr ptr, VkDeviceSize* out_offset) {
+Buffer* find_buffer_for_ptr(DeviceImpl* d, GpuPtr ptr, VkDeviceSize* out_offset) {
     rwlock_lock_read(&d->ptr_map_lock);
     uint32_t lo = 0, hi = d->ptr_map.size();
     uint32_t best = ~0u;
@@ -552,10 +552,15 @@ static VkResult create_descriptor_heap(DeviceImpl* d) {
     d->sampled_bitset.set_leading_zero();
     d->storage_bitset.set_leading_zero();
     d->sampler_bitset.set_leading_zero();
-    // Per-slot CPU generations for stale-handle detection
+    // Per-slot CPU generations + Free/Allocated/Retiring state tables
     d->sampled_gen = Vector<uint16_t>(d->allocator, 0, d->heap.sampled_capacity);
     d->storage_gen = Vector<uint16_t>(d->allocator, 0, d->heap.storage_capacity);
     d->sampler_gen = Vector<uint16_t>(d->allocator, 0, d->heap.sampler_capacity);
+    d->sampled_state = Vector<uint8_t>(d->allocator, 0, d->heap.sampled_capacity);
+    d->storage_state = Vector<uint8_t>(d->allocator, 0, d->heap.storage_capacity);
+    d->sampler_state = Vector<uint8_t>(d->allocator, 0, d->heap.sampler_capacity);
+    d->sampled_owner = Vector<TextureImpl*>(d->allocator, nullptr, d->heap.sampled_capacity);
+    d->storage_owner = Vector<TextureImpl*>(d->allocator, nullptr, d->heap.storage_capacity);
 
     return VK_SUCCESS;
 }
@@ -704,6 +709,39 @@ Device create_device(const DeviceDesc& desc) {
                        "create_device: vkCreatePipelineCache (empty) failed");
             }
         }
+
+        // pipelineCacheUUID is the primary compatibility identity: read it
+        // from the cache blob header (VkPipelineCacheHeaderVersionOne layout:
+        // headerSize, headerVersion, vendorID, deviceID, pipelineCacheUUID).
+        // Fall back to driverUUID when the driver exposes no header yet.
+        if (d->vk_pipeline_cache != VK_NULL_HANDLE) {
+            size_t size = 0;
+            vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, nullptr);
+            if (size >= 32) {
+                MemoryBlock tmp = d->allocator.alloc(size);
+                if (tmp.ptr != nullptr) {
+                    VkResult r = vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, tmp.ptr);
+                    if (r == VK_SUCCESS && size >= 32) {
+                        const uint8_t* data = static_cast<const uint8_t*>(tmp.ptr);
+                        uint32_t header_size = 0;
+                        uint32_t version     = 0;
+                        memcpy(&header_size, data, 4);
+                        memcpy(&version, data + 4, 4);
+                        if (version == 1 && header_size >= 32) {
+                            memcpy(d->cache_identity.cache_uuid, data + 16, 16);
+                        }
+                    }
+                    d->allocator.free(tmp);
+                }
+            }
+            bool any_uuid = false;
+            for (int i = 0; i < 16; ++i) {
+                if (d->cache_identity.cache_uuid[i] != 0) { any_uuid = true; break; }
+            }
+            if (!any_uuid) {
+                memcpy(d->cache_identity.cache_uuid, d->cache_identity.driver_uuid, 16);
+            }
+        }
     }
 
     // Initialize pools
@@ -740,7 +778,7 @@ Device create_device(const DeviceDesc& desc) {
 
     // Initialize ptr_map and other vectors
     d->ptr_map                = Vector<GpuPtrMap>(d->allocator);
-    d->uninitialized_textures = Vector<Handle<Texture>>(d->allocator);
+    d->uninitialized_textures = Vector<TextureImpl*>(d->allocator);
     d->pipeline_records       = Vector<PipelineRecord*>(d->allocator);
     d->compiler_queue         = Vector<PipelineRecord*>(d->allocator);
 
@@ -803,7 +841,7 @@ void destroy_device(Device dev) {
         if (rec->vk_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(d->device, rec->vk_pipeline, nullptr);
         }
-        if (rec->key_block.ptr != nullptr) { d->allocator.free(rec->key_block); }
+        free_key(d, rec);
         free_record(d, rec);
     }
     d->pipeline_records.clear();
@@ -1009,6 +1047,15 @@ GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
     return user_address;
 }
 
+// Releases one buffer reference; the pool slot (and native buffer) is
+// destroyed with the last (1 per live allocation + command-buffer retentions).
+void release_buffer_ref(DeviceImpl* d, Handle<Buffer> buf) {
+    auto& b = d->buffer_pool[handle_cast<Buffer>(buf)];
+    if (atomic_fetch_add(&b.refs, -1) == 1) {
+        d->buffer_pool.erase(buf);
+    }
+}
+
 void free(Device dev, GpuPtr ptr) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     rwlock_lock_write(&d->ptr_map_lock);
@@ -1017,9 +1064,10 @@ void free(Device dev, GpuPtr ptr) {
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;
         if (d->ptr_map[mid].ptr == ptr) {
-            d->buffer_pool.erase(d->ptr_map[mid].buffer);
+            const Handle<Buffer> h = d->ptr_map[mid].buffer;
             d->ptr_map.erase(d->ptr_map.begin() + mid, d->ptr_map.begin() + mid + 1);
             rwlock_unlock_write(&d->ptr_map_lock);
+            release_buffer_ref(d, h);
             return;
         }
         if (d->ptr_map[mid].ptr < ptr) { lo = mid + 1; } else { hi = mid; }
@@ -1209,29 +1257,29 @@ void queue_process_events(Queue q) {
     IZ_CHK(d, vkGetSemaphoreCounterValue(d->device, timeline_sem, &current_time),
            "queue_process_events failed");
 
+    // Collect due completion events and retirement batches under the submit
+    // lock (queue_process_events is thread-safe); fire callbacks and process
+    // batches outside it so no application callback or native destruction runs
+    // while holding queue locks.
+    Vector<CompletionEvent> due_events(d->allocator);
+    Vector<RetireBatch*>    due_batches(d->allocator);
+    mutex_lock(&q->submit_lock);
     uint32_t i = 0;
-    while (i < q->pending_events.size() && q->pending_events[i].completed_time <= current_time) {
-        q->pending_events[i].callback(q->pending_events[i].userdata);
-        i++;
-    }
+    while (i < q->pending_events.size() && q->pending_events[i].completed_time <= current_time) { i++; }
+    for (uint32_t k = 0; k < i; ++k) { due_events.push_back(q->pending_events[k]); }
     if (i != 0) {
         q->pending_events.erase(q->pending_events.begin(), q->pending_events.begin() + i);
     }
-
-    // Drain the retirement queue (batches sorted by value, ascending).
-    mutex_lock(&q->submit_lock);
     uint32_t j = 0;
     while (j < q->retire_queue.size() && q->retire_queue[j]->value <= current_time) { j++; }
-    Vector<RetireBatch*> ready(d->allocator);
-    for (uint32_t k = 0; k < j; ++k) { ready.push_back(q->retire_queue[k]); }
+    for (uint32_t k = 0; k < j; ++k) { due_batches.push_back(q->retire_queue[k]); }
     if (j != 0) {
         q->retire_queue.erase(q->retire_queue.begin(), q->retire_queue.begin() + j);
     }
     mutex_unlock(&q->submit_lock);
 
-    // Process outside queue locks (may take the pipeline/map locks and
-    // destroy native objects).
-    for (RetireBatch* batch : ready) { process_retire_batch(d, batch); }
+    for (const CompletionEvent& e : due_events) { e.callback(e.userdata); }
+    for (RetireBatch* batch : due_batches) { process_retire_batch(d, batch); }
 }
 
 

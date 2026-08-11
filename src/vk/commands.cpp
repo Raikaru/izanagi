@@ -41,10 +41,15 @@ static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
             release_pipeline_ref(cb.device, rec);
         }
         cb.retained_pipelines.clear();
-        for (Handle<Texture> tex : cb.retained_textures) {
-            release_texture_ref(cb.device, tex);
+        for (TextureImpl* rec : cb.retained_textures) {
+            Handle<Texture> h = handle_cast<Texture>(cb.device->texture_pool.find_handle(rec));
+            if (h.h != 0) { release_texture_ref(cb.device, h); }
         }
         cb.retained_textures.clear();
+        for (Handle<Buffer> b : cb.retained_buffers) {
+            release_buffer_ref(cb.device, b);
+        }
+        cb.retained_buffers.clear();
     }
     vkResetCommandPool(d->device, pool->command_pool, 0);
     pool->buffer_free_idx = 0;
@@ -53,17 +58,37 @@ static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
 
 // Retains a texture explicitly named by a command until the command buffer is
 // submitted (or abandoned), so freeing the user handle cannot destroy a native
-// image the recorded commands still reference.
+// image the recorded commands still reference. Retains the stable record, not
+// the public handle.
 static void retain_texture(CommandBufferImpl* cmd, Handle<Texture> tex) {
-    for (Handle<Texture> t : cmd->retained_textures) {
-        if (t.h == tex.h) { return; }   // already retained
+    TextureImpl* rec = &cmd->device->texture_pool[handle_cast<TextureImpl>(tex)];
+    for (TextureImpl* r : cmd->retained_textures) {
+        if (r == rec) { return; }   // already retained
     }
-    auto& t = cmd->device->texture_pool[handle_cast<TextureImpl>(tex)];
-    atomic_fetch_add(&t.refs, 1);
-    cmd->retained_textures.push_back(tex);
+    atomic_fetch_add(&rec->refs, 1);
+    cmd->retained_textures.push_back(rec);
+}
+
+// Retains a buffer explicitly named by a command (memory copies, index and
+// indirect operands). Resolves the allocation; invalid pointers are not
+// retained (the command will fail at submit).
+static void retain_buffer(CommandBufferImpl* cmd, GpuPtr ptr) {
+    if (ptr == 0) { return; }
+    VkDeviceSize offset = 0;
+    Buffer* buf = find_buffer_for_ptr(cmd->device, ptr, &offset);
+    if (buf == nullptr) { return; }
+    Handle<Buffer> h = cmd->device->buffer_pool.find_handle(buf);
+    if (h.h == 0) { return; }
+    for (Handle<Buffer> b : cmd->retained_buffers) {
+        if (b.h == h.h) { return; }   // already retained
+    }
+    atomic_fetch_add(&buf->refs, 1);
+    cmd->retained_buffers.push_back(h);
 }
 
 CommandPool* get_command_pool(QueueImpl* queue) {
+    // record_lock is held by the caller (queue_start_command_recording) across
+    // pool selection AND command-buffer checkout.
     auto* d = queue->device;
 
     // Completed timeline: a pool is reusable only once all submitted command
@@ -105,6 +130,7 @@ CommandPool* get_command_pool(QueueImpl* queue) {
 
 CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
     auto* d = q->device;
+    // record_lock is held by the caller (queue_start_command_recording).
     if (pool->command_buffers.size() <= pool->buffer_free_idx) {
         const VkCommandBufferAllocateInfo info{
             .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -128,7 +154,9 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
         pool->command_buffers[pool->command_buffers.size() - 1].retained_pipelines =
             Vector<PipelineRecord*>(d->allocator);
         pool->command_buffers[pool->command_buffers.size() - 1].retained_textures =
-            Vector<Handle<Texture>>(d->allocator);
+            Vector<TextureImpl*>(d->allocator);
+        pool->command_buffers[pool->command_buffers.size() - 1].retained_buffers =
+            Vector<Handle<Buffer>>(d->allocator);
     }
     CommandBufferImpl* result        = &pool->command_buffers[pool->buffer_free_idx];
     result->wait_for_surface_texture = false;
@@ -140,10 +168,12 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
 
 CommandBuffer queue_start_command_recording(Queue q) {
     auto* d = q->device;
+    mutex_lock(&q->record_lock);
     CommandPool* pool = get_command_pool(q);
+    CommandBuffer buffer = (pool != nullptr) ? get_command_buffer(q, pool) : nullptr;
+    mutex_unlock(&q->record_lock);
     if (pool == nullptr) { return nullptr; }
 
-    CommandBuffer buffer = get_command_buffer(q, pool);
     if (buffer) {
         buffer->current_idx_buffer = 0;
         const VkCommandBufferBeginInfo begin_info{
@@ -171,40 +201,65 @@ void cmd_finalize(CommandBuffer cmd) {
 
 // --- Unified retirement queue --------------------------------------------------------------
 // Caller holds q->submit_lock.
-static void enqueue_retire_locked(DeviceImpl* d, QueueImpl* q, uint64_t value, const RetireItem& item) {
+// Finds or creates the retire batch for `value` and reserves item capacity.
+// Returns nullptr on allocation failure (the caller must abort the
+// submission before GPU work is enqueued). Caller holds q->submit_lock.
+static RetireBatch* prepare_retire_batch(DeviceImpl* d, QueueImpl* q, uint64_t value, uint32_t item_capacity) {
     for (uint32_t i = 0; i < q->retire_queue.size(); ++i) {
         RetireBatch* b = q->retire_queue[i];
         if (b->value == value) {
-            b->items.push_back(item);
-            return;
+            if (!b->items.reserve(b->items.size() + item_capacity)) { return nullptr; }
+            return b;
         }
         if (b->value > value) {
+            // Reserve the queue slot BEFORE allocating the batch so the
+            // insertion below cannot fail and orphan the batch.
+            if (!q->retire_queue.reserve(q->retire_queue.size() + 1)) { return nullptr; }
             MemoryBlock blk = d->allocator.alloc(sizeof(RetireBatch));
-            if (blk.ptr == nullptr) { return; }
+            if (blk.ptr == nullptr) { return nullptr; }
             auto* nb = ::new (blk.ptr) RetireBatch{
                 .value = value,
                 .items = Vector<RetireItem>(d->allocator),
             };
-            nb->items.push_back(item);
+            if (!nb->items.reserve(item_capacity)) {
+                nb->~RetireBatch();
+                d->allocator.free({.ptr = nb, .len = sizeof(RetireBatch)});
+                return nullptr;
+            }
             q->retire_queue.insert(q->retire_queue.begin() + i, nb);
-            return;
+            return nb;
         }
     }
+    if (!q->retire_queue.reserve(q->retire_queue.size() + 1)) { return nullptr; }
     MemoryBlock blk = d->allocator.alloc(sizeof(RetireBatch));
-    if (blk.ptr == nullptr) { return; }
+    if (blk.ptr == nullptr) { return nullptr; }
     auto* nb = ::new (blk.ptr) RetireBatch{
         .value = value,
         .items = Vector<RetireItem>(d->allocator),
     };
-    nb->items.push_back(item);
+    if (!nb->items.reserve(item_capacity)) {
+        nb->~RetireBatch();
+        d->allocator.free({.ptr = nb, .len = sizeof(RetireBatch)});
+        return nullptr;
+    }
     q->retire_queue.push_back(nb);
+    return nb;
 }
 
-void enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item) {
+// Fallible retirement insertion. Returns false on allocation failure: the
+// caller must keep ownership (conservative retention until device shutdown)
+// rather than silently dropping the reference.
+bool enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item) {
     auto* d = q->device;
     mutex_lock(&q->submit_lock);
-    enqueue_retire_locked(d, q, value, item);
+    RetireBatch* batch = prepare_retire_batch(d, q, value, 1);
+    bool ok = batch != nullptr;
+    if (ok) { batch->items.push_back(item); }
     mutex_unlock(&q->submit_lock);
+    if (!ok) {
+        IZ_LOG(d, LogLevel::Error, "enqueue_retire: allocation failure — resource retained until shutdown");
+    }
+    return ok;
 }
 
 // Destroys/retires the batch's resources. Called without queue locks held.
@@ -212,23 +267,31 @@ void process_retire_batch(DeviceImpl* d, RetireBatch* batch) {
     for (const RetireItem& item : batch->items) {
         switch (item.kind) {
             case RetireKind::Buffer:
-                d->buffer_pool.erase(Handle<Buffer>{.h = item.a});
+                release_buffer_ref(d, Handle<Buffer>{.h = item.a});
                 break;
-            case RetireKind::Texture:
-                remove_uninitialized_texture(d, Handle<Texture>{.h = item.a});
-                release_texture_ref(d, Handle<Texture>{.h = item.a});
+            case RetireKind::Texture: {
+                auto* rec = reinterpret_cast<TextureImpl*>(item.a);
+                Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
+                if (h.h != 0) {
+                    remove_uninitialized_texture(d, rec);
+                    release_texture_ref(d, h);
+                }
                 break;
+            }
             case RetireKind::PipelineRef:
                 release_pipeline_ref(d, reinterpret_cast<PipelineRecord*>(item.a));
                 break;
             case RetireKind::SampledSlot:
-                d->sampled_bitset.clear_bit(static_cast<uint32_t>(item.a));
+                desc_retire_slot(d, RetireKind::SampledSlot, static_cast<uint32_t>(item.a),
+                                 static_cast<uint16_t>(item.b));
                 break;
             case RetireKind::StorageSlot:
-                d->storage_bitset.clear_bit(static_cast<uint32_t>(item.a));
+                desc_retire_slot(d, RetireKind::StorageSlot, static_cast<uint32_t>(item.a),
+                                 static_cast<uint16_t>(item.b));
                 break;
             case RetireKind::SamplerSlot:
-                d->sampler_bitset.clear_bit(static_cast<uint32_t>(item.a));
+                desc_retire_slot(d, RetireKind::SamplerSlot, static_cast<uint32_t>(item.a),
+                                 static_cast<uint16_t>(item.b));
                 break;
         }
     }
@@ -252,18 +315,62 @@ Submission queue_submit(Queue                     q,
     Span<VkCommandBufferSubmitInfo> command_info{};
     Span<VkSemaphoreSubmitInfo>     signal_info{};
 
-    // Drain uninitialized textures — one-time UNDEFINED->GENERAL transition
+    // Serialize submission (and presentation) per queue. The serialized region
+    // covers the entire stateful sequence: claim texture initialization
+    // records, record the optional internal transition command buffer, reserve
+    // retirement storage, submit, and commit/roll back every participant.
+    mutex_lock(&q->submit_lock);
+    const uint64_t submit_value = q->timeline_value + 1;
+
+    // Test hook: injected failure — nothing is claimed, no timeline advance.
+    if (atomic_load(&d->force_submit_failure)) {
+        atomic_fetch_add(&d->stat_failed_submits, 1);
+        mutex_unlock(&q->submit_lock);
+        return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
+    }
+
+    // Claim uninitialized textures — one-time UNDEFINED->GENERAL transition.
+    // The list holds stable records, and each is temporarily referenced so a
+    // concurrent free/free_after cannot destroy the record mid-preparation.
     mutex_lock(&d->texture_init_lock);
-    Vector<Handle<Texture>> texture_list(d->allocator);
+    Vector<TextureImpl*> texture_list(d->allocator);
     swap(d->uninitialized_textures, texture_list);
+    for (TextureImpl* rec : texture_list) { atomic_fetch_add(&rec->refs, 1); }
     mutex_unlock(&d->texture_init_lock);
 
+    CommandBufferImpl* internal_cmd = nullptr;
     if (texture_list.size() > 0) {
-        CommandBuffer               cmd = queue_start_command_recording(q);
+        internal_cmd = queue_start_command_recording(q);
+        if (internal_cmd == nullptr) {
+            mutex_lock(&d->texture_init_lock);
+            for (TextureImpl* rec : texture_list) {
+                if (rec->init_state == TextureInitState::NeedsTransition) {
+                    d->uninitialized_textures.push_back(rec);
+                }
+            }
+            mutex_unlock(&d->texture_init_lock);
+            for (TextureImpl* rec : texture_list) {
+                Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
+                if (h.h != 0) { release_texture_ref(d, h); }
+            }
+            mutex_unlock(&q->submit_lock);
+            return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
+        }
         Span<VkImageMemoryBarrier2> image_barriers{};
-        for (auto tex : texture_list) {
-            auto& image    = d->texture_pool[handle_cast<TextureImpl>(tex)];
-            image.init_state = TextureInitState::TransitionQueued;
+        for (TextureImpl* rec : texture_list) {
+            // Claim under the lock: NeedsTransition -> TransitionQueued only;
+            // never clobber a concurrent Released (a public free racing the
+            // drain). Records not claimed get no barrier.
+            mutex_lock(&d->texture_init_lock);
+            // Never clobber a concurrent Released: only NeedsTransition
+            // advances to TransitionQueued. The barrier is still emitted for
+            // every drained record (a Released record may be retained by
+            // application command buffers in this very submit and its GPU use
+            // still needs the UNDEFINED->GENERAL transition).
+            if (rec->init_state == TextureInitState::NeedsTransition) {
+                rec->init_state = TextureInitState::TransitionQueued;
+            }
+            mutex_unlock(&d->texture_init_lock);
             image_barriers = concat(
                 arena, image_barriers,
                 VkImageMemoryBarrier2{
@@ -275,10 +382,10 @@ Submission queue_submit(Queue                     q,
                     .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                     .oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED,
                     .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
-                    .image         = image.vk_image,
+                    .image         = rec->vk_image,
                     .subresourceRange =
                         VkImageSubresourceRange{
-                            .aspectMask     = aspects_for_format(image.format),
+                            .aspectMask     = aspects_for_format(rec->format),
                             .baseMipLevel   = 0,
                             .levelCount     = VK_REMAINING_MIP_LEVELS,
                             .baseArrayLayer = 0,
@@ -297,13 +404,13 @@ Submission queue_submit(Queue                     q,
             .imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size()),
             .pImageMemoryBarriers     = image_barriers.data(),
         };
-        vkCmdPipelineBarrier2(cmd->buffer, &dependency_info);
-        cmd_finalize(cmd);
+        vkCmdPipelineBarrier2(internal_cmd->buffer, &dependency_info);
+        cmd_finalize(internal_cmd);
         command_info = concat(arena, command_info,
                               VkCommandBufferSubmitInfo{
                                   .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
                                   .pNext         = nullptr,
-                                  .commandBuffer = cmd->buffer,
+                                  .commandBuffer = internal_cmd->buffer,
                                   .deviceMask    = 1,
                               });
     }
@@ -386,26 +493,8 @@ Submission queue_submit(Queue                     q,
                              });
     }
 
-    // Serialize submission (and presentation) per queue.
-    mutex_lock(&q->submit_lock);
-    const uint64_t submit_value = q->timeline_value + 1;
-
-    // Test hook: injected failure — no native submit, no timeline advance.
-    if (atomic_load(&d->force_submit_failure)) {
-        atomic_fetch_add(&d->stat_failed_submits, 1);
-        mutex_unlock(&q->submit_lock);
-        // A failed submit never performed the transitions: restore them.
-        mutex_lock(&d->texture_init_lock);
-        for (Handle<Texture> tex : texture_list) {
-            d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::NeedsTransition;
-            d->uninitialized_textures.push_back(tex);
-        }
-        mutex_unlock(&d->texture_init_lock);
-        return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
-    }
-
-    // Advance queue timeline with the prospective value; published only on
-    // a successful submit so the GPU never receives an unsignalable value.
+    // Advance queue timeline with the prospective value; published only on a
+    // successful submit so the GPU never receives an unsignalable value.
     signal_info = concat(arena, signal_info,
                          VkSemaphoreSubmitInfo{
                              .sType       = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -416,16 +505,65 @@ Submission queue_submit(Queue                     q,
                              .deviceIndex = 0,
                          });
 
-    if (arena->overflowed()) {
-        atomic_fetch_add(&d->stat_failed_submits, 1);
-        mutex_unlock(&q->submit_lock);
+    // Rollback: restore texture transitions for a later retry, return every
+    // participating command buffer (internal + application) to a reusable or
+    // abandoned state, and release never-submitted retained references.
+    auto rollback = [&]() {
         mutex_lock(&d->texture_init_lock);
-        for (Handle<Texture> tex : texture_list) {
-            d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::NeedsTransition;
-            d->uninitialized_textures.push_back(tex);
+        for (TextureImpl* rec : texture_list) {
+            // Requeue only records still awaiting their transition; records a
+            // concurrent free/free_after released must not be resurrected.
+            if (rec->init_state == TextureInitState::TransitionQueued) {
+                rec->init_state = TextureInitState::NeedsTransition;
+                d->uninitialized_textures.push_back(rec);
+            }
         }
         mutex_unlock(&d->texture_init_lock);
+        for (TextureImpl* rec : texture_list) {
+            Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
+            if (h.h != 0) { release_texture_ref(d, h); }   // the preparation ref
+        }
+        if (internal_cmd != nullptr && internal_cmd->pool != nullptr &&
+            internal_cmd->pool->outstanding > 0) {
+            internal_cmd->pool->outstanding--;   // never submitted: release the checkout
+        }
+        for (uint32_t i = 0; i < command_buffers.size(); ++i) {
+            auto* cb = command_buffers[i];
+            if (cb->pool != nullptr && cb->pool->outstanding > 0) { cb->pool->outstanding--; }
+            for (PipelineRecord* rec : cb->retained_pipelines) { release_pipeline_ref(d, rec); }
+            cb->retained_pipelines.clear();
+            for (TextureImpl* rec : cb->retained_textures) {
+                Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
+                if (h.h != 0) { release_texture_ref(d, h); }
+            }
+            cb->retained_textures.clear();
+            for (Handle<Buffer> b : cb->retained_buffers) { release_buffer_ref(d, b); }
+            cb->retained_buffers.clear();
+        }
+    };
+
+    if (arena->overflowed()) {
+        atomic_fetch_add(&d->stat_failed_submits, 1);
+        rollback();
+        mutex_unlock(&q->submit_lock);
         IZ_LOG(d, LogLevel::Error, "queue_submit: scratch arena overflow, submission aborted");
+        return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
+    }
+
+    // Reserve retirement storage BEFORE the native submit so the post-submit
+    // reference transfer cannot fail (ownership must never be dropped).
+    uint32_t retain_count = static_cast<uint32_t>(texture_list.size());   // prep refs
+    for (uint32_t i = 0; i < command_buffers.size(); ++i) {
+        retain_count += static_cast<uint32_t>(command_buffers[i]->retained_pipelines.size());
+        retain_count += static_cast<uint32_t>(command_buffers[i]->retained_textures.size());
+        retain_count += static_cast<uint32_t>(command_buffers[i]->retained_buffers.size());
+    }
+    RetireBatch* retire_batch = prepare_retire_batch(d, q, submit_value, retain_count);
+    if (retire_batch == nullptr) {
+        atomic_fetch_add(&d->stat_failed_submits, 1);
+        rollback();
+        mutex_unlock(&q->submit_lock);
+        IZ_LOG(d, LogLevel::Error, "queue_submit: failed to reserve retirement storage");
         return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
     }
 
@@ -445,13 +583,8 @@ Submission queue_submit(Queue                     q,
     if (result != VK_SUCCESS) {
         atomic_fetch_add(&d->stat_failed_submits, 1);
         log_vk_impl(d, result, "queue_submit: vkQueueSubmit2 failed", __LINE__, "commands.cpp"_sv);
+        rollback();
         mutex_unlock(&q->submit_lock);
-        mutex_lock(&d->texture_init_lock);
-        for (Handle<Texture> tex : texture_list) {
-            d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::NeedsTransition;
-            d->uninitialized_textures.push_back(tex);
-        }
-        mutex_unlock(&d->texture_init_lock);
         Submission s{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
         if (result == VK_ERROR_DEVICE_LOST) { s.status = SubmitStatus::DeviceLost; }
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
@@ -460,31 +593,45 @@ Submission queue_submit(Queue                     q,
         return s;
     }
 
-    // Success: the transitions were recorded and submitted.
-    for (Handle<Texture> tex : texture_list) {
-        d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::Initialized;
-    }
-
-    // Success: publish the logical timeline, retire command pools, and
-    // transfer retained references into a value-keyed retire batch.
+    // Commit: publish the logical timeline, mark transitions initialized, and
+    // account every participating command buffer (internal + application) with
+    // one path — pool outstanding/retire value and retained-reference transfer.
     q->timeline_value = submit_value;
     atomic_fetch_add(&d->stat_submissions, 1);
-    for (uint32_t i = 0; i < command_buffers.size(); ++i) {
-        CommandPool* pool = command_buffers[i]->pool;
-        if (pool != nullptr && pool->outstanding > 0) {
-            pool->outstanding--;
-            if (pool->retire_value < submit_value) { pool->retire_value = submit_value; }
+    for (TextureImpl* rec : texture_list) {
+        mutex_lock(&d->texture_init_lock);
+        if (rec->init_state == TextureInitState::TransitionQueued) {
+            rec->init_state = TextureInitState::Initialized;   // never clobber Released
         }
-        for (PipelineRecord* rec : command_buffers[i]->retained_pipelines) {
-            enqueue_retire_locked(d, q, submit_value,
-                                  RetireItem{RetireKind::PipelineRef, reinterpret_cast<uint64_t>(rec), 0});
-        }
-        command_buffers[i]->retained_pipelines.clear();
-        for (Handle<Texture> tex : command_buffers[i]->retained_textures) {
-            enqueue_retire_locked(d, q, submit_value, RetireItem{RetireKind::Texture, tex.h, 0});
-        }
-        command_buffers[i]->retained_textures.clear();
+        mutex_unlock(&d->texture_init_lock);
+        // Release the preparation reference when THIS submission completes
+        // (the transition barrier runs in it; the record must survive until
+        // then even if a concurrent free dropped the user reference).
+        retire_batch->items.push_back(
+            RetireItem{RetireKind::Texture, reinterpret_cast<uint64_t>(rec), 0});
     }
+    auto commit_cb = [&](CommandBufferImpl* cb) {
+        if (cb->pool != nullptr && cb->pool->outstanding > 0) {
+            cb->pool->outstanding--;
+            if (cb->pool->retire_value < submit_value) { cb->pool->retire_value = submit_value; }
+        }
+        for (PipelineRecord* rec : cb->retained_pipelines) {
+            retire_batch->items.push_back(
+                RetireItem{RetireKind::PipelineRef, reinterpret_cast<uint64_t>(rec), 0});
+        }
+        cb->retained_pipelines.clear();
+        for (TextureImpl* rec : cb->retained_textures) {
+            retire_batch->items.push_back(
+                RetireItem{RetireKind::Texture, reinterpret_cast<uint64_t>(rec), 0});
+        }
+        cb->retained_textures.clear();
+        for (Handle<Buffer> b : cb->retained_buffers) {
+            retire_batch->items.push_back(RetireItem{RetireKind::Buffer, b.h, 0});
+        }
+        cb->retained_buffers.clear();
+    };
+    if (internal_cmd != nullptr) { commit_cb(internal_cmd); }
+    for (uint32_t i = 0; i < command_buffers.size(); ++i) { commit_cb(command_buffers[i]); }
     mutex_unlock(&q->submit_lock);
     return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Success};
 }
@@ -532,6 +679,8 @@ int64_t debug_pool_resets(DeviceImpl* d) {
 
 void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
     auto* d = cmd->device;
+    retain_buffer(cmd, destGpu);
+    retain_buffer(cmd, srcGpu);
     auto src = buffer_and_offset_from_ptr(d, srcGpu);
     auto dst = buffer_and_offset_from_ptr(d, destGpu);
     VkBufferCopy2 region{
@@ -555,9 +704,10 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
                          Handle<Texture>              texture,
                          const BufferTextureCopyInfo& info) {
     auto* d = cmd->device;
+    retain_buffer(cmd, srcPtr);
+    retain_texture(cmd, texture);
     auto src = buffer_and_offset_from_ptr(d, srcPtr);
     auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
-    retain_texture(cmd, texture);
 
     VkBufferImageCopy2 region{
         .sType             = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -599,9 +749,10 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
                            GpuPtr                       destGpu,
                            const BufferTextureCopyInfo& info) {
     auto* d = cmd->device;
+    retain_buffer(cmd, destGpu);
+    retain_texture(cmd, texture);
     auto dst = buffer_and_offset_from_ptr(d, destGpu);
     auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
-    retain_texture(cmd, texture);
 
     VkBufferImageCopy2 region{
         .sType             = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -668,6 +819,7 @@ void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
 
 void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
     auto* d   = cmd->device;
+    retain_texture(cmd, texture);
     auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
 
     const uint32_t aspect = aspects_for_format(tex.format);
@@ -822,12 +974,15 @@ static void push_graphics_ptrs(VkCommandBuffer buf, GpuPtr vertexDataGpu, GpuPtr
 }
 
 void cmd_dispatch(CommandBuffer cmd, GpuPtr dataGpu, const Dimension3D& gridDimensions) {
+    retain_buffer(cmd, dataGpu);
     push_compute_ptr(cmd->buffer, dataGpu);
     vkCmdDispatch(cmd->buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
 void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensionsGpu) {
     auto* d = cmd->device;
+    retain_buffer(cmd, dataGpu);
+    retain_buffer(cmd, gridDimensionsGpu);
     auto dim = buffer_and_offset_from_ptr(d, gridDimensionsGpu);
     push_compute_ptr(cmd->buffer, dataGpu);
     vkCmdDispatchIndirect(cmd->buffer, dim.buffer, dim.offset);
@@ -1010,12 +1165,17 @@ void cmd_end_render_pass(CommandBuffer cmd) {
 
 void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
               uint32_t vertexCount, uint32_t instanceCount) {
+    retain_buffer(cmd, vertexDataGpu);
+    retain_buffer(cmd, fragmentDataGpu);
     push_graphics_ptrs(cmd->buffer, vertexDataGpu, fragmentDataGpu);
     vkCmdDraw(cmd->buffer, vertexCount, instanceCount, 0, 0);
 }
 
 void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInfo& args) {
     auto* d = cmd->device;
+    retain_buffer(cmd, args.vertexDataGpu);
+    retain_buffer(cmd, args.fragmentDataGpu);
+    retain_buffer(cmd, args.indicesGpu);
     push_graphics_ptrs(cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
         const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
@@ -1028,6 +1188,10 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
 
 void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedIndirectInfo& args) {
     auto* d = cmd->device;
+    retain_buffer(cmd, args.vertexDataGpu);
+    retain_buffer(cmd, args.fragmentDataGpu);
+    retain_buffer(cmd, args.indicesGpu);
+    retain_buffer(cmd, args.argsGpu);
     push_graphics_ptrs(cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
         const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
@@ -1042,6 +1206,11 @@ void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedInd
 
 void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer cmd, const MultiDrawIndirectInfo& args) {
     auto* d = cmd->device;
+    retain_buffer(cmd, args.vertexDataGpu);
+    retain_buffer(cmd, args.pixelDataGpu);
+    retain_buffer(cmd, args.indicesGpu);
+    retain_buffer(cmd, args.argsGpu);
+    retain_buffer(cmd, args.drawCountGpu);
     push_graphics_ptrs(cmd->buffer, args.vertexDataGpu, args.pixelDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
         const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);

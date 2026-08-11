@@ -2287,6 +2287,160 @@ static void test_descriptor_handles_and_limits() {
     printf("  PASS\n");
 }
 
+// --- Test 28: Texture-init submission pool stress --------------------------------------------
+static void test_texture_init_pool_stress() {
+    printf("--- Test: texture init pool stress ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    Queue q = get_queue(d);
+
+    // More texture-initializing submissions than the command-pool cap (64):
+    // the internal transition command buffer must participate in pool
+    // retirement (regression: its checkout leaked and exhausted the pools).
+    for (int i = 0; i < 200; ++i) {
+        TextureDesc td{
+            .type       = TextureType::Tex2D,
+            .dimensions = {4, 4, 1},
+            .format     = Format::RGBA8Unorm,
+            .usage      = UsageFlags::Sampled | UsageFlags::TransferDst | UsageFlags::TransferSrc,
+        };
+        Handle<Texture> tex = create_texture(d, td);
+        CHECK(tex.h != 0, "create_texture failed");
+        GpuPtr staging = malloc(d, 4 * 4 * 4, Memory::Default);
+        CommandBuffer cmd = queue_start_command_recording(q);
+        CHECK(cmd != nullptr, "recording failed — command-pool exhaustion");
+        if (cmd == nullptr) { destroy_device(d); return; }
+        cmd_copy_to_texture(cmd, staging, tex, BufferTextureCopyInfo{.image_extent = {4, 4, 1}});
+        cmd_finalize(cmd);
+        Submission s = queue_submit(q, {&cmd, 1});
+        CHECK(s.status == SubmitStatus::Success, "submit failed");
+        CHECK(wait_submission(s), "submission must complete");
+        for (int k = 0; k < 100; ++k) { queue_process_events(q); sleep_ms(1); }
+        free(d, staging);
+        free(d, tex);
+        for (int k = 0; k < 100; ++k) { queue_process_events(q); sleep_ms(1); }
+    }
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 29: Descriptor double-free / reuse safety -------------------------------------------
+static void test_descriptor_double_free() {
+    printf("--- Test: descriptor double free ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    Queue q = get_queue(d);
+
+    TextureDesc td{
+        .type       = TextureType::Tex2D,
+        .dimensions = {8, 8, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled,
+    };
+    Handle<Texture> tex = create_texture(d, td);
+    CHECK(tex.h != 0, "create_texture failed");
+    if (tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    TextureView v1 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    CHECK(v1 != 0, "view creation");
+    const uint32_t slot1 = static_cast<uint32_t>(v1 & 0xFFFFFFFFull);
+
+    // Accepted free marks the slot Retiring; a second free is rejected.
+    free_texture_view(d, v1);
+    free_texture_view(d, v1);   // double free while Retiring -> rejected (logged)
+
+    // The Retiring slot must not be reusable before its retirement completes.
+    TextureView v2 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    CHECK(v2 != 0, "second view");
+    CHECK(static_cast<uint32_t>(v2 & 0xFFFFFFFFull) != slot1,
+          "Retiring slot is not reusable before retirement");
+
+    // Retire v1's slot; reuse it; a stale free must not corrupt the new owner.
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "wait failed");
+    for (int k = 0; k < 100; ++k) { queue_process_events(q); sleep_ms(1); }
+
+    TextureView v3 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    CHECK(static_cast<uint32_t>(v3 & 0xFFFFFFFFull) == slot1, "slot reused after retirement");
+    CHECK(((v3 >> 32) & 0xFFFF) != ((v1 >> 32) & 0xFFFF), "generation bumped on reuse");
+    free_texture_view(d, v1);   // stale generation -> rejected; must not enqueue anything
+    free_texture_view(d, v2);
+    free_texture_view(d, v3);
+
+    // Owner retention: the texture survives its public free while a view holds it.
+    TextureView v4 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    free(d, tex);   // user ref released; the view's owner reference keeps the record alive
+    cmd = queue_start_command_recording(q);
+    cmd_finalize(cmd);
+    s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "submit after texture free");
+    CHECK(wait_submission(s), "wait failed");
+    free_texture_view(d, v4);   // retirement releases the owner reference
+    for (int k = 0; k < 100; ++k) { queue_process_events(q); sleep_ms(1); }
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 30: Concurrent texture-initializing submissions --------------------------------------
+static void test_concurrent_texture_submits() {
+    printf("--- Test: concurrent texture submits ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    Queue q = get_queue(d);
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 2; ++t) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < 50; ++i) {
+                TextureDesc td{
+                    .type       = TextureType::Tex2D,
+                    .dimensions = {4, 4, 1},
+                    .format     = Format::RGBA8Unorm,
+                    .usage      = UsageFlags::Sampled | UsageFlags::TransferDst | UsageFlags::TransferSrc,
+                };
+                Handle<Texture> tex = create_texture(d, td);
+                GpuPtr staging = malloc(d, 64, Memory::Default);
+                if (tex.h == 0 || staging == 0) { failures++; continue; }
+                CommandBuffer cmd = queue_start_command_recording(q);
+                if (cmd == nullptr) { failures++; continue; }
+                cmd_copy_to_texture(cmd, staging, tex, BufferTextureCopyInfo{.image_extent = {4, 4, 1}});
+                cmd_finalize(cmd);
+                Submission s = queue_submit(q, {&cmd, 1});
+                if (s.status != SubmitStatus::Success) { failures++; }
+                wait_submission(s);
+                for (int k = 0; k < 100; ++k) { queue_process_events(q); sleep_ms(1); }
+                free(d, staging);
+                free(d, tex);
+                for (int k = 0; k < 100; ++k) { queue_process_events(q); sleep_ms(1); }
+            }
+        });
+    }
+    for (auto& th : threads) { th.join(); }
+    CHECK(failures == 0, "concurrent texture-initializing submits must all succeed");
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2328,6 +2482,9 @@ int main() {
     test_texture_cb_retention();
     test_memory_alignment_and_bounds();
     test_descriptor_handles_and_limits();
+    test_texture_init_pool_stress();
+    test_descriptor_double_free();
+    test_concurrent_texture_submits();
     test_dual_source_blend();
 
     printf("\n=================\n");

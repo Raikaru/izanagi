@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -322,6 +323,100 @@ static void test_span() {
     printf("  PASS\n");
 }
 
+// --- SlotMap stress: segments, clear/reuse, invalidate, failure -------------------------------
+static void test_slotmap_stress() {
+    printf("--- Test: slot map stress ---\n");
+    Allocator alloc(test_allocator, nullptr);
+    g_alloc_budget = 10000000;
+
+    SlotMap<Payload> map(alloc, [](Payload*, void*) {});
+
+    // Thousands of entries force multiple segment expansions; every slot
+    // must be reachable exactly once from the free list.
+    std::vector<Handle<Payload>> handles;
+    handles.reserve(10000);
+    for (uint32_t i = 0; i < 10000; ++i) {
+        Handle<Payload> h = map.emplace(Payload{i});
+        CHECK(h.h != 0, "emplace failed during segment expansion");
+        handles.push_back(h);
+    }
+    bool ok = true;
+    for (uint32_t i = 0; i < 10000; ++i) {
+        if (map[handles[i]].value != i) { ok = false; }
+    }
+    CHECK(ok, "all segment entries hold their payload");
+
+    // Erase + reuse: generations advance and old handles are stale.
+    Handle<Payload> first = handles[0];
+    map.erase(first);
+    Handle<Payload> reused = map.emplace(Payload{9999});
+    CHECK(reused.h != first.h, "reuse bumps generation");
+    CHECK(map[reused].value == 9999, "reused slot payload");
+    map.erase(reused);
+
+    // invalidate: the record stays, the handle becomes stale.
+    Handle<Payload> keep = map.emplace(Payload{7});
+    Payload* kept_record = &map[keep];
+    Handle<Payload> stale = keep;
+    map.invalidate(keep);
+    Handle<Payload> found = map.find_handle(kept_record);
+    CHECK(found.h != 0 && found.h != stale.h, "invalidate makes the old handle stale");
+    CHECK(kept_record->value == 7, "record survives invalidation");
+    map.erase(found);
+
+    // Clear + reuse: the free-list head must reset (regression: it dangled
+    // into freed segments).
+    map.clear();
+    Handle<Payload> after_clear = map.emplace(Payload{42});
+    CHECK(after_clear.h != 0, "emplace after clear works");
+    CHECK(map[after_clear].value == 42, "payload after clear");
+    map.erase(after_clear);
+
+    // Allocation failure during segment expansion: emplace returns {} and the
+    // map stays usable.
+    g_alloc_budget = 0;
+    SlotMap<Payload> failmap(alloc, [](Payload*, void*) {});
+    Handle<Payload> f = failmap.emplace(Payload{1});
+    CHECK(f.h == 0, "emplace reports allocation failure");
+    g_alloc_budget = 10000000;
+    Handle<Payload> f2 = failmap.emplace(Payload{2});
+    CHECK(f2.h != 0, "map usable after failed expansion");
+
+    printf("  PASS\n");
+}
+
+// --- Vector::insert with nontrivial T ----------------------------------------------------------
+static void test_vector_nontrivial_insert() {
+    printf("--- Test: vector nontrivial insert ---\n");
+    Allocator alloc(test_allocator, nullptr);
+    g_alloc_budget = 10000000;
+
+    Vector<std::string> v(alloc);
+    // Append via insert at end
+    std::string s0 = "zero";
+    v.insert(v.end(), s0);
+    // Middle insert
+    std::string s1 = "one";
+    v.insert(v.end(), s1);
+    std::string sm = "mid";
+    v.insert(v.begin() + 1, sm);
+    // Begin insert (empty vector case covered above; here at begin with data)
+    std::string sb = "first";
+    v.insert(v.begin(), sb);
+    CHECK(v.size() == 4, "insert count");
+    CHECK(v[0] == "first" && v[1] == "zero" && v[2] == "mid" && v[3] == "one",
+          "insert order with nontrivial T");
+    // Growth during insert (force realloc while inserting in the middle)
+    Vector<std::string> g(alloc);
+    for (int i = 0; i < 20; ++i) { g.push_back(std::string("v") + std::to_string(i)); }
+    std::string ins = "inserted";
+    g.insert(g.begin() + 10, ins);
+    CHECK(g.size() == 21 && g[10] == "inserted" && g[9] == "v9" && g[11] == "v10",
+          "middle insert after growth preserves order");
+
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi Common Tests\n");
     printf("====================\n\n");
@@ -332,6 +427,8 @@ int main() {
     test_vector_insert_growth();
     test_vector_alloc_failure();
     test_slotmap_generations();
+    test_slotmap_stress();
+    test_vector_nontrivial_insert();
     test_bitset();
     test_enum_ops();
     test_span();

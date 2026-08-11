@@ -26,8 +26,14 @@ render passes, root signatures, or resource-state objects in the public API.
 - **Device creation/destruction:** externally synchronized (one thread).
 - **Resource creation and non-blocking pipeline requests:** thread-safe
   (`create_texture`, `malloc`, `create_*_view`, `request_*_pipeline`, ...).
-- **Command-buffer recording:** one recording thread per command buffer.
+- **Command-buffer recording:** one recording thread per command buffer;
+  multiple command buffers may be recorded concurrently (pool selection and
+  checkout are serialized per queue).
 - **Queue submit and present:** internally serialized per queue.
+- **Queue submission, status, completion, and retirement queries**
+  (`queue_submit`, `submission_complete`, `wait_submission`,
+  `queue_process_events`): thread-safe (drained under the queue lock, callbacks
+  and native destruction run outside it).
 - **Handle destruction and retirement requests:** thread-safe, subject to the
   GPU lifetime contract below.
 - **Scratch memory:** per-thread arenas; backend operations rewind them at
@@ -57,10 +63,11 @@ dropped.
   submission completes. An invalid/failed submission retires conservatively
   after the latest submitted work completes.
 - Objects **explicitly named in recorded commands** (bound pipelines, render
-  attachments, copy sources/destinations) are automatically retained by the
-  command buffer, transferred to the queue's retirement queue at submit, and
-  released only when the submission completes. Freeing the user handle cannot
-  destroy a native object the recorded commands reference.
+  attachments, copy sources/destinations, memory-copy/index/indirect/draw-count
+  buffers, root-argument buffers) are automatically retained by the command
+  buffer, transferred to the queue's retirement queue at submit, and released
+  only when the submission completes. Freeing the user handle cannot destroy a
+  native object the recorded commands reference.
 - Native destruction happens only after **all** references are gone: user
   handles, compiler-worker references, command-buffer references, and
   in-flight references.
@@ -70,13 +77,24 @@ dropped.
 One queue-owned, timeline-keyed retirement queue handles command-pool reuse,
 pipeline destruction, texture destruction, buffer destruction, and descriptor
 slot recycling. `queue_process_events` drains batches whose timeline value has
-completed, in ascending order, outside queue locks; device shutdown drains
-everything after joining the compiler worker.
+completed, in ascending order, outside queue locks (the drain itself is
+serialized); device shutdown drains everything after joining the compiler
+worker. Texture initialization submits an internal transition command buffer
+that participates in the same pool accounting, retirement, and failure
+rollback as application command buffers; a texture freed while other
+references keep it alive stays drainable (marked Released, removed from the
+init list only at the final reference).
 
-Descriptor slots recycle only after the submission that made them safe
-completes (conservative default: after the latest submitted work; exact via
-`free_*_after`). A stale GPU-side descriptor index cannot be made safe by
-generation bits — retirement remains required.
+Descriptor slots follow an explicit state machine — `Free -> Allocated ->
+Retiring -> Free` — guarded by a descriptor allocator lock: an accepted free
+immediately moves the slot to Retiring and bumps the generation (the old
+handle is stale at once); a second free while Retiring is rejected; the slot
+is not reusable until the retirement submission completes (delayed duplicate
+retirements are verified by state and generation). A sampled/storage
+descriptor retains its owner texture record until the slot retires, so the
+texture survives its public free while a view references it. A stale
+GPU-side descriptor index cannot be made safe by generation bits — retirement
+remains required.
 
 ## Command-pool retirement
 
@@ -96,6 +114,10 @@ references at pool reset.
 - `malloc(..., align)` honors power-of-two alignment by overallocating and
   aligning the user address inside the backing allocation; invalid alignment
   is rejected.
+- `CacheIdentity` carries both `cache_uuid` (the Vulkan `pipelineCacheUUID`,
+  the primary compatibility key, read from the cache blob header) and
+  `driver_uuid` (fallback when the driver exposes no header for an empty
+  cache).
 - `flush_host_memory` / `invalidate_host_memory` synchronize non-coherent
   allocations (aligned to the non-coherent atom size, validated against the
   range). Coherent memory is a successful no-op. Call flush after writing an

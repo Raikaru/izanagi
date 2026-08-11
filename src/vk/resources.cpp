@@ -6,7 +6,7 @@ namespace gpu {
 
 // --- Descriptor heap write helpers ---------------------------------------------------
 
-void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info) {
+bool write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info) {
     VkImageDescriptorInfoEXT image_desc{
         .sType  = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
         .pNext  = nullptr,
@@ -27,10 +27,12 @@ void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCre
     VkResult result = vkWriteResourceDescriptorsEXT(d->device, 1, &res_info, &dst);
     if (result != VK_SUCCESS) {
         log_vk_impl(d, result, "write_sampled_descriptor failed", __LINE__, "resources.cpp"_sv);
+        return false;
     }
+    return true;
 }
 
-void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info) {
+bool write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info) {
     VkImageDescriptorInfoEXT image_desc{
         .sType  = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
         .pNext  = nullptr,
@@ -52,10 +54,12 @@ void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCre
     VkResult result = vkWriteResourceDescriptorsEXT(d->device, 1, &res_info, &dst);
     if (result != VK_SUCCESS) {
         log_vk_impl(d, result, "write_storage_descriptor failed", __LINE__, "resources.cpp"_sv);
+        return false;
     }
+    return true;
 }
 
-void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info) {
+bool write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info) {
     VkHostAddressRangeEXT dst{
         .address = static_cast<uint8_t*>(d->heap.sampler_host_ptr) +
                    (size_t)slot * d->heap.sampler_descriptor_size,
@@ -64,7 +68,9 @@ void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreat
     VkResult result = vkWriteSamplerDescriptorsEXT(d->device, 1, &sampler_info, &dst);
     if (result != VK_SUCCESS) {
         log_vk_impl(d, result, "write_sampler_descriptor failed", __LINE__, "resources.cpp"_sv);
+        return false;
     }
+    return true;
 }
 
 // --- Descriptor handles ------------------------------------------------------------------
@@ -95,20 +101,95 @@ static bool decode_desc_handle(uint64_t h, uint64_t expect_type, uint32_t* slot,
     return true;
 }
 
-// Validates the handle's type metadata and CPU generation; rejects stale
-// handles and double frees (logged, no-op). Returns the slot on success.
-static bool validate_free_handle(DeviceImpl* d, uint64_t handle, uint64_t expect_type,
-                                 Vector<uint16_t>& gen_table, uint32_t* slot) {
-    uint16_t gen = 0;
-    if (!decode_desc_handle(handle, expect_type, slot, &gen)) {
-        IZ_LOG(d, LogLevel::Error, "free: handle has the wrong descriptor type (corrupt or double free)");
+// Region accessors for the descriptor allocator (desc_lock held by callers).
+static TwoLevelBitset& desc_bitset(DeviceImpl* d, RetireKind kind) {
+    switch (kind) {
+        case RetireKind::SampledSlot: return d->sampled_bitset;
+        case RetireKind::StorageSlot: return d->storage_bitset;
+        default:                       return d->sampler_bitset;
+    }
+}
+static Vector<uint16_t>& desc_gen(DeviceImpl* d, RetireKind kind) {
+    switch (kind) {
+        case RetireKind::SampledSlot: return d->sampled_gen;
+        case RetireKind::StorageSlot: return d->storage_gen;
+        default:                       return d->sampler_gen;
+    }
+}
+static Vector<uint8_t>& desc_state(DeviceImpl* d, RetireKind kind) {
+    switch (kind) {
+        case RetireKind::SampledSlot: return d->sampled_state;
+        case RetireKind::StorageSlot: return d->storage_state;
+        default:                       return d->sampler_state;
+    }
+}
+
+// Accepts a descriptor free atomically: validates type/index/generation and
+// the Allocated state, moves the slot to Retiring, and bumps the generation so
+// the old handle is stale immediately. Outputs the slot and the post-bump
+// generation the retirement must verify. Returns false (no-op) for stale
+// handles, double frees (including a second free while Retiring), and wrong
+// descriptor types.
+static bool desc_free_accept(DeviceImpl* d, uint64_t handle, uint64_t expect_type, RetireKind kind,
+                             uint32_t* slot_out, uint16_t* retire_gen_out) {
+    uint32_t slot = 0;
+    uint16_t gen  = 0;
+    if (!decode_desc_handle(handle, expect_type, &slot, &gen)) {
+        IZ_LOG(d, LogLevel::Error, "descriptor free: wrong descriptor type (corrupt or double free)");
         return false;
     }
-    if (*slot >= gen_table.size() || gen_table[*slot] != gen) {
-        IZ_LOG(d, LogLevel::Error, "free: stale descriptor handle (generation mismatch)");
-        return false;
+    mutex_lock(&d->desc_lock);
+    auto& states = desc_state(d, kind);
+    auto& gens   = desc_gen(d, kind);
+    bool ok = false;
+    if (slot < states.size() &&
+        states[slot] == static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Allocated) &&
+        gens[slot] == gen) {
+        states[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Retiring);
+        gens[slot]   = static_cast<uint16_t>(gen + 1);   // old handle stale immediately
+        *slot_out       = slot;
+        *retire_gen_out = gens[slot];
+        ok = true;
+    } else {
+        IZ_LOG(d, LogLevel::Error, "descriptor free: stale handle or double free rejected");
     }
-    return true;
+    mutex_unlock(&d->desc_lock);
+    return ok;
+}
+
+// Completes a slot's retirement: verifies the slot is still Retiring with the
+// matching generation (a delayed duplicate retirement is a no-op), returns the
+// slot to Free, and releases the owner texture reference (outside the lock).
+void desc_retire_slot(DeviceImpl* d, RetireKind kind, uint32_t slot, uint16_t gen) {
+    TextureImpl* owner = nullptr;
+    mutex_lock(&d->desc_lock);
+    auto& states = desc_state(d, kind);
+    auto& gens   = desc_gen(d, kind);
+    if (slot < states.size() &&
+        states[slot] == static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Retiring) &&
+        gens[slot] == gen) {
+        states[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Free);
+        desc_bitset(d, kind).clear_bit(slot);
+        if (kind == RetireKind::SampledSlot) {
+            owner = d->sampled_owner[slot];
+            d->sampled_owner[slot] = nullptr;
+        } else if (kind == RetireKind::StorageSlot) {
+            owner = d->storage_owner[slot];
+            d->storage_owner[slot] = nullptr;
+        }
+    }
+    mutex_unlock(&d->desc_lock);
+    if (owner != nullptr) {
+        Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(owner));
+        if (h.h != 0) { release_texture_ref(d, h); }
+    }
+}
+
+// Enqueues an accepted descriptor free against the given retirement value.
+static void desc_free_enqueue(DeviceImpl* d, RetireKind kind, uint32_t slot, uint16_t gen) {
+    QueueImpl* q = d->default_queue;
+    if (q == nullptr) { return; }
+    enqueue_retire(q, q->timeline_value, RetireItem{kind, slot, gen});
 }
 
 // --- Texture creation -----------------------------------------------------------------
@@ -207,38 +288,57 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc) {
         Vector<TextureImpl::AttachmentView>(d->allocator);
 
     mutex_lock(&d->texture_init_lock);
-    d->uninitialized_textures.push_back(handle);
+    d->uninitialized_textures.push_back(&d->texture_pool[handle_cast<TextureImpl>(handle)]);
     mutex_unlock(&d->texture_init_lock);
 
     return handle;
 }
 
-void remove_uninitialized_texture(DeviceImpl* d, Handle<Texture> tex) {
+// Marks the record released (its public free/free_after was accepted). The
+// record stays in the init-transition list while other references keep it
+// alive, so a retained command buffer can still trigger the UNDEFINED->GENERAL
+// barrier for it; it is removed from the list only when the final reference
+// drops (release_texture_ref, before erase). The Released state prevents a
+// drain rollback from requeueing it.
+void remove_uninitialized_texture(DeviceImpl* d, TextureImpl* rec) {
     mutex_lock(&d->texture_init_lock);
-    for (uint32_t i = 0; i < d->uninitialized_textures.size(); ++i) {
-        if (d->uninitialized_textures[i].h == tex.h) {
-            d->uninitialized_textures.erase(d->uninitialized_textures.begin() + i,
-                                            d->uninitialized_textures.begin() + i + 1);
-            break;
-        }
-    }
+    rec->init_state = TextureInitState::Released;
     mutex_unlock(&d->texture_init_lock);
 }
 
 void release_texture_ref(DeviceImpl* d, Handle<Texture> tex) {
-    // 1 per public handle + 1 per command-buffer/in-flight retention; the
-    // pool slot (and native image) is destroyed at zero.
-    auto& t = d->texture_pool[handle_cast<TextureImpl>(tex)];
-    if (atomic_fetch_add(&t.refs, -1) == 1) {
+    // Resolve the record first (pool mutex), then serialize the decrement and
+    // the init-list removal under texture_init_lock: a concurrent submit can
+    // claim a still-listed record in that gap, so the list must never hold a
+    // pointer to a record whose refs reached zero.
+    TextureImpl* rec = &d->texture_pool[handle_cast<TextureImpl>(tex)];
+    mutex_lock(&d->texture_init_lock);
+    const bool last = (atomic_fetch_add(&rec->refs, -1) == 1);
+    if (last) {
+        for (uint32_t i = 0; i < d->uninitialized_textures.size(); ++i) {
+            if (d->uninitialized_textures[i] == rec) {
+                d->uninitialized_textures.erase(d->uninitialized_textures.begin() + i,
+                                                d->uninitialized_textures.begin() + i + 1);
+                break;
+            }
+        }
+    }
+    mutex_unlock(&d->texture_init_lock);
+    if (last) {
         d->texture_pool.erase(handle_cast<TextureImpl>(tex));
     }
 }
 
 void free(Device dev, Handle<Texture> t) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    // The init-transition list must never retain a handle whose slot is gone.
-    remove_uninitialized_texture(d, t);
-    release_texture_ref(d, t);
+    TextureImpl* rec = &d->texture_pool[handle_cast<TextureImpl>(t)];
+    remove_uninitialized_texture(d, rec);
+    // Invalidate the public handle immediately even when descriptor or
+    // command-buffer retentions keep the record alive; the user reference is
+    // released through the record's current-generation handle.
+    d->texture_pool.invalidate(handle_cast<TextureImpl>(t));
+    Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
+    if (h.h != 0) { release_texture_ref(d, h); }
 }
 
 // --- Deferred destruction against a submission ------------------------------------------------
@@ -248,37 +348,38 @@ void free_after(Device dev, Handle<Texture> tex, Submission s) {
     QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
     if (q == nullptr) { return; }
     const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
-    enqueue_retire(q, value, RetireItem{RetireKind::Texture, tex.h, 0});
+    // Invalidate the public handle immediately; the stable record survives
+    // via the deferred user reference until the submission completes.
+    TextureImpl* rec = &d->texture_pool[handle_cast<TextureImpl>(tex)];
+    d->texture_pool.invalidate(handle_cast<TextureImpl>(tex));
+    remove_uninitialized_texture(d, rec);
+    enqueue_retire(q, value, RetireItem{RetireKind::Texture, reinterpret_cast<uint64_t>(rec), 0});
+}
+
+static void desc_free_after_accept(DeviceImpl* d, uint64_t handle, uint64_t expect_type,
+                                     RetireKind kind, Submission s) {
+    uint32_t slot = 0;
+    uint16_t gen  = 0;
+    if (!desc_free_accept(d, handle, expect_type, kind, &slot, &gen)) { return; }
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+    enqueue_retire(q, value, RetireItem{kind, slot, gen});
 }
 
 void free_texture_view_after(Device dev, TextureView view, Submission s) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    uint32_t slot = 0;
-    if (!validate_free_handle(d, view, kDescTypeSampled, d->sampled_gen, &slot)) { return; }
-    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
-    if (q == nullptr) { return; }
-    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
-    enqueue_retire(q, value, RetireItem{RetireKind::SampledSlot, static_cast<uint64_t>(slot), 0});
+    desc_free_after_accept(reinterpret_cast<DeviceImpl*>(dev), view, kDescTypeSampled,
+                           RetireKind::SampledSlot, s);
 }
 
 void free_rw_texture_view_after(Device dev, TextureView view, Submission s) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    uint32_t slot = 0;
-    if (!validate_free_handle(d, view, kDescTypeStorage, d->storage_gen, &slot)) { return; }
-    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
-    if (q == nullptr) { return; }
-    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
-    enqueue_retire(q, value, RetireItem{RetireKind::StorageSlot, static_cast<uint64_t>(slot), 0});
+    desc_free_after_accept(reinterpret_cast<DeviceImpl*>(dev), view, kDescTypeStorage,
+                           RetireKind::StorageSlot, s);
 }
 
 void free_sampler_after(Device dev, SamplerId sampler, Submission s) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    uint32_t slot = 0;
-    if (!validate_free_handle(d, sampler, kDescTypeSampler, d->sampler_gen, &slot)) { return; }
-    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
-    if (q == nullptr) { return; }
-    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
-    enqueue_retire(q, value, RetireItem{RetireKind::SamplerSlot, static_cast<uint64_t>(slot), 0});
+    desc_free_after_accept(reinterpret_cast<DeviceImpl*>(dev), sampler, kDescTypeSampler,
+                           RetireKind::SamplerSlot, s);
 }
 
 // --- Texture views (object-less, heap-descriptor-only) -----------------------------------
@@ -304,41 +405,72 @@ static VkImageViewCreateInfo make_view_info(DeviceImpl* d, const TextureViewDesc
     };
 }
 
-TextureView create_texture_view(Device dev, const TextureViewDesc& desc) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    uint32_t slot = d->sampled_bitset.set_leading_zero();
+// Allocates a sampled/storage descriptor slot, retaining the owner texture
+// record (the descriptor references its image until the slot retires).
+// Returns 0 on failure; the slot state and owner are rolled back if the
+// native descriptor write fails.
+static TextureView desc_allocate_image_view(DeviceImpl* d, RetireKind kind, uint64_t type,
+                                            const TextureViewDesc& desc) {
+    TextureImpl* owner = &d->texture_pool[handle_cast<TextureImpl>(desc.texture)];
+    atomic_fetch_add(&owner->refs, 1);   // descriptor owns the texture until retirement
+    mutex_lock(&d->desc_lock);
+    uint32_t slot = desc_bitset(d, kind).set_leading_zero();
     if (slot == ~0u) {
-        IZ_LOG(d, LogLevel::Error, "Sampled texture heap full");
-        return 0;   // null descriptor index — never a valid handle
+        mutex_unlock(&d->desc_lock);
+        atomic_fetch_add(&owner->refs, -1);
+        IZ_LOG(d, LogLevel::Error, "Descriptor heap full");
+        return 0;
     }
+    auto& states = desc_state(d, kind);
+    auto& gens   = desc_gen(d, kind);
+    auto& owners = (kind == RetireKind::SampledSlot) ? d->sampled_owner : d->storage_owner;
+    states[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Allocated);
+    const uint16_t gen = static_cast<uint16_t>(gens[slot] + 1);
+    gens[slot] = gen;
+    owners[slot] = owner;
+    mutex_unlock(&d->desc_lock);
+
     auto view_info = make_view_info(d, desc);
-    write_sampled_descriptor(d, slot, view_info);
-    const uint16_t gen = static_cast<uint16_t>(d->sampled_gen[slot] + 1);
-    d->sampled_gen[slot] = gen;
-    return encode_desc_handle(slot, gen, kDescTypeSampled);
+    const bool written = (kind == RetireKind::SampledSlot)
+                             ? write_sampled_descriptor(d, slot, view_info)
+                             : write_storage_descriptor(d, slot, view_info);
+    if (!written) {
+        // Roll back the slot state and the owner reference exactly once.
+        mutex_lock(&d->desc_lock);
+        states[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Free);
+        desc_bitset(d, kind).clear_bit(slot);
+        owners[slot] = nullptr;
+        mutex_unlock(&d->desc_lock);
+        atomic_fetch_add(&owner->refs, -1);
+        IZ_LOG(d, LogLevel::Error, "create_texture_view: descriptor write failed");
+        return 0;
+    }
+    return encode_desc_handle(slot, gen, type);
+}
+
+TextureView create_texture_view(Device dev, const TextureViewDesc& desc) {
+    return desc_allocate_image_view(reinterpret_cast<DeviceImpl*>(dev), RetireKind::SampledSlot,
+                                    kDescTypeSampled, desc);
 }
 
 TextureView create_rw_texture_view(Device dev, const TextureViewDesc& desc) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    uint32_t slot = d->storage_bitset.set_leading_zero();
-    if (slot == ~0u) {
-        IZ_LOG(d, LogLevel::Error, "Storage texture heap full");
-        return 0;
-    }
-    auto view_info = make_view_info(d, desc);
-    write_storage_descriptor(d, slot, view_info);
-    const uint16_t gen = static_cast<uint16_t>(d->storage_gen[slot] + 1);
-    d->storage_gen[slot] = gen;
-    return encode_desc_handle(slot, gen, kDescTypeStorage);
+    return desc_allocate_image_view(reinterpret_cast<DeviceImpl*>(dev), RetireKind::StorageSlot,
+                                    kDescTypeStorage, desc);
 }
 
 SamplerId create_sampler(Device dev, const SamplerDesc& desc) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    mutex_lock(&d->desc_lock);
     uint32_t slot = d->sampler_bitset.set_leading_zero();
     if (slot == ~0u) {
+        mutex_unlock(&d->desc_lock);
         IZ_LOG(d, LogLevel::Error, "Sampler heap full");
         return 0;
     }
+    d->sampler_state[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Allocated);
+    const uint16_t gen = static_cast<uint16_t>(d->sampler_gen[slot] + 1);
+    d->sampler_gen[slot] = gen;
+    mutex_unlock(&d->desc_lock);
 
     const VkSamplerCreateInfo sampler_info{
         .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
@@ -360,41 +492,41 @@ SamplerId create_sampler(Device dev, const SamplerDesc& desc) {
         .borderColor      = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
         .unnormalizedCoordinates = (desc.coord == SamplerCoords::Pixel),
     };
-    write_sampler_descriptor(d, slot, sampler_info);
-    const uint16_t gen = static_cast<uint16_t>(d->sampler_gen[slot] + 1);
-    d->sampler_gen[slot] = gen;
+    if (!write_sampler_descriptor(d, slot, sampler_info)) {
+        mutex_lock(&d->desc_lock);
+        d->sampler_state[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Free);
+        d->sampler_bitset.clear_bit(slot);
+        mutex_unlock(&d->desc_lock);
+        IZ_LOG(d, LogLevel::Error, "create_sampler: descriptor write failed");
+        return 0;
+    }
     return encode_desc_handle(slot, gen, kDescTypeSampler);
 }
 
 // --- Free with deferred recycling (unified queue retirement) ---------------------
 
-static void defer_free_slot(DeviceImpl* d, uint32_t slot, RetireKind kind) {
-    QueueImpl* q = d->default_queue;
-    if (q == nullptr) { return; }
-    // Retire after the latest submitted work completes (conservative default;
-    // explicit free_*_after takes an exact submission).
-    enqueue_retire(q, q->timeline_value, RetireItem{kind, slot, 0});
-}
-
 void free_texture_view(Device dev, TextureView view) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     uint32_t slot = 0;
-    if (!validate_free_handle(d, view, kDescTypeSampled, d->sampled_gen, &slot)) { return; }
-    defer_free_slot(d, slot, RetireKind::SampledSlot);
+    uint16_t gen  = 0;
+    if (!desc_free_accept(d, view, kDescTypeSampled, RetireKind::SampledSlot, &slot, &gen)) { return; }
+    desc_free_enqueue(d, RetireKind::SampledSlot, slot, gen);
 }
 
 void free_rw_texture_view(Device dev, TextureView view) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     uint32_t slot = 0;
-    if (!validate_free_handle(d, view, kDescTypeStorage, d->storage_gen, &slot)) { return; }
-    defer_free_slot(d, slot, RetireKind::StorageSlot);
+    uint16_t gen  = 0;
+    if (!desc_free_accept(d, view, kDescTypeStorage, RetireKind::StorageSlot, &slot, &gen)) { return; }
+    desc_free_enqueue(d, RetireKind::StorageSlot, slot, gen);
 }
 
 void free_sampler(Device dev, SamplerId sampler) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     uint32_t slot = 0;
-    if (!validate_free_handle(d, sampler, kDescTypeSampler, d->sampler_gen, &slot)) { return; }
-    defer_free_slot(d, slot, RetireKind::SamplerSlot);
+    uint16_t gen  = 0;
+    if (!desc_free_accept(d, sampler, kDescTypeSampler, RetireKind::SamplerSlot, &slot, &gen)) { return; }
+    desc_free_enqueue(d, RetireKind::SamplerSlot, slot, gen);
 }
 
 }  // namespace gpu

@@ -46,6 +46,9 @@ struct Buffer {
     VkDeviceSize    user_size       = 0;   // requested size (not the padded backing)
     VkDeviceSize    user_offset     = 0;   // user_address - backing_address
     bool            coherent        = true;
+    // 1 per live allocation + 1 per command-buffer/in-flight retention;
+    // the pool slot (and native buffer) is destroyed at zero.
+    int64_t         refs            = 1;   // atomic via platform helpers
 };
 
 // Buffer/offset pair validated against the allocation's user-visible bounds.
@@ -56,7 +59,9 @@ struct BufferAndOffset {
 };
 
 // Texture layout initialization state (stored per texture record).
-enum class TextureInitState : uint8_t { NeedsTransition, TransitionQueued, Initialized };
+// Released marks a record whose public free/free_after was accepted; it must
+// not be requeued for transition and its init state is no longer tracked.
+enum class TextureInitState : uint8_t { NeedsTransition, TransitionQueued, Initialized, Released };
 
 struct TextureImpl {
     VkImage        vk_image           = VK_NULL_HANDLE;
@@ -107,9 +112,14 @@ struct PipelineRecord {
     mutex   wait_mutex = IZ_MUTEX_INIT;  // only wait_pipeline() sleeps on these
     condvar wait_cv;
 
-    MemoryBlock key_block = {};  // owned copy of all create inputs
+    MemoryBlock key_block = {};  // owned copy of byte/string create inputs
+    // Typed arrays allocated SEPARATELY (naturally aligned; never placed at
+    // arbitrary byte offsets inside key_block).
+    MemoryBlock spec_ids_block    = {};
+    MemoryBlock spec_sizes_block  = {};
+    MemoryBlock color_targets_block = {};
 
-    // --- key data (pointers into key_block) ---
+    // --- key data (pointers into key_block / the typed blocks) ---
     uint8_t* vs_bytes   = nullptr;
     uint32_t vs_size    = 0;
     char*    vs_entry   = nullptr;   // null-terminated
@@ -330,13 +340,25 @@ struct DeviceImpl {
 
     // Descriptor heap
     DescriptorHeap heap;
+    // Descriptor allocator: per-region bitset + generation + state tables,
+    // all guarded by desc_lock. Slot state machine: Free -> Allocated ->
+    // Retiring -> Free; a free acceptance bumps the generation so the old
+    // handle is stale immediately, and the retirement verifies both.
+    enum class DescriptorSlotState : uint8_t { Free = 0, Allocated = 1, Retiring = 2 };
+    mutex desc_lock = IZ_MUTEX_INIT;
     TwoLevelBitset sampled_bitset;
     TwoLevelBitset storage_bitset;
     TwoLevelBitset sampler_bitset;
-    // Per-slot CPU generations (stale-handle detection in view/sampler frees)
     Vector<uint16_t> sampled_gen;
     Vector<uint16_t> storage_gen;
     Vector<uint16_t> sampler_gen;
+    Vector<uint8_t>  sampled_state;
+    Vector<uint8_t>  storage_state;
+    Vector<uint8_t>  sampler_state;
+    // Owner texture records retained by sampled/storage descriptors (keeps
+    // the underlying image alive until the slot retires).
+    Vector<TextureImpl*> sampled_owner;
+    Vector<TextureImpl*> storage_owner;
 
     // Memory limits (for host flush/invalidate range alignment)
     VkDeviceSize non_coherent_atom_size = 1;
@@ -347,9 +369,11 @@ struct DeviceImpl {
     // cmd_begin_render_pass).
     mutex attachment_view_lock = IZ_MUTEX_INIT;
 
-    // Uninitialized textures (need UNDEFINED->GENERAL transition)
-    mutex                  texture_init_lock = IZ_MUTEX_INIT;
-    Vector<Handle<Texture>> uninitialized_textures;
+    // Uninitialized textures (need UNDEFINED->GENERAL transition). Holds
+    // stable TextureImpl records (claimed under texture_init_lock), never
+    // public handles that could go stale before the transition is submitted.
+    mutex                   texture_init_lock = IZ_MUTEX_INIT;
+    Vector<TextureImpl*>    uninitialized_textures;
 };
 
 // --- QueueImpl ----------------------------------------------------------------------
@@ -362,6 +386,9 @@ struct QueueImpl {
     uint64_t         timeline_value = 0;   // last successfully submitted value
     // Serializes queue submission and presentation on this queue.
     mutex            submit_lock   = IZ_MUTEX_INIT;
+    // Serializes command-pool selection and command-buffer checkout (multiple
+    // recording threads may record different command buffers concurrently).
+    mutex            record_lock   = IZ_MUTEX_INIT;
     Vector<CompletionEvent> pending_events;
     // Unified retirement queue: value-keyed batches (sorted ascending) of
     // resources/pipeline references/descriptor slots retired when the queue
@@ -382,11 +409,12 @@ struct CommandBufferImpl {
 
     // Pipelines bound by cmd_set_pipeline (Ready only); each holds one
     // reference. Textures explicitly named by commands (render attachments,
-    // copy sources/destinations); each holds one reference. Both are moved to
-    // retire batches at queue_submit, released at pool reset if never
-    // submitted.
+    // copy sources/destinations) and buffers named by memory/copy/draw
+    // commands each hold one reference. All are moved to retire batches at
+    // queue_submit, released at pool reset if never submitted.
     Vector<PipelineRecord*> retained_pipelines;
-    Vector<Handle<Texture>> retained_textures;
+    Vector<TextureImpl*>    retained_textures;
+    Vector<Handle<Buffer>>  retained_buffers;
 };
 
 // --- Thread-local arena state ----------------------------------------------------------
@@ -403,6 +431,9 @@ struct ThreadLocalState {
 };
 
 Arena* get_thread_local_arena(DeviceImpl* d);
+
+// Bounds-checked buffer lookup (device.cpp)
+Buffer* find_buffer_for_ptr(DeviceImpl* d, GpuPtr ptr, VkDeviceSize* out_offset);
 void   log_impl(DeviceImpl* d, LogLevel lvl, Span<const char> msg, uint32_t line, Span<const char> file);
 void   log_vk_impl(DeviceImpl* d, VkResult res, Span<const char> msg, uint32_t line, Span<const char> file);
 
@@ -417,11 +448,15 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool);
 Handle<Semaphore> create_semaphore_internal(DeviceImpl* d, uint64_t init_value);
 
 // Descriptor heap write (resources.cpp)
-void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
-void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
-void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info);
+bool write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
+bool write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
+bool write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info);
 void release_texture_ref(DeviceImpl* d, Handle<Texture> tex);
-void remove_uninitialized_texture(DeviceImpl* d, Handle<Texture> tex);
+void remove_uninitialized_texture(DeviceImpl* d, TextureImpl* rec);
+void release_buffer_ref(DeviceImpl* d, Handle<Buffer> buf);
+// Descriptor slot retirement (resources.cpp): verifies the slot is Retiring
+// with a matching generation, then frees it and releases its owner resource.
+void desc_retire_slot(DeviceImpl* d, RetireKind kind, uint32_t slot, uint16_t gen);
 
 // White-box test hooks (not part of the public API)
 uint32_t   debug_live_pipelines(DeviceImpl* d);         // records in the dedup map
@@ -434,12 +469,14 @@ int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse re
 // pipeline.cpp internals used by commands.cpp / device.cpp
 void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec);
 void free_record(DeviceImpl* d, PipelineRecord* rec);
+void free_key(DeviceImpl* d, PipelineRecord* rec);
 void process_retire_batch(DeviceImpl* d, RetireBatch* batch);
 void compiler_worker_main(void* arg);
 void store_pipeline_cache(DeviceImpl* d);
 
-// Queue retirement (commands.cpp)
-void enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item);
+// Queue retirement (commands.cpp). Returns false when the retirement storage
+// could not be allocated — the caller must retain ownership conservatively.
+bool enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item);
 
 // Descriptor heap bind (commands.cpp, called from queue_start_command_recording)
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd);
