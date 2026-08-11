@@ -19,7 +19,7 @@ namespace gpu {
 #endif
 #if defined(IZ_VK_PROFILE_BINDLESS)
 #    define IZ_REQUIRE_HEAP_TRIO 0
-#    define IZ_REQUIRE_KHR_RENDERING 4   // dyn. rendering + sync2 + copy-commands2 (KHR) + ext. dyn. state (EXT) on 1.2
+#    define IZ_REQUIRE_KHR_RENDERING 4   // dyn. rendering + sync2 + copy-commands2 (KHR) + ext. dyn. state (EXT)
 #else
 #    define IZ_REQUIRE_HEAP_TRIO 1
 #    define IZ_REQUIRE_KHR_RENDERING 0
@@ -276,13 +276,23 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
                     break;
                 }
             }
-            if (!found) { all_supported = false; break; }
+            if (!found) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+                // Precise diagnostics: which required extension is missing
+                // (e.g. dzn lacks copy_commands2 + extended_dynamic_state,
+                // which the legacy-copy / static-dynamic-state fallbacks
+                // will add in the command phase).
+                IZ_LOG(d, LogLevel::Error, "bindless: required device extension missing:");
+                log_impl(d, LogLevel::Error,
+                         Span<const char>(kRequiredDeviceExtensions[req], strlen(kRequiredDeviceExtensions[req])),
+                         __LINE__, "device.cpp"_sv);
+#endif
+                all_supported = false;
+                break;
+            }
         }
         if (!all_supported) { continue; }
 
-#if defined(IZ_VK_PROFILE_BINDLESS)
-        fprintf(stderr, "sel: dzn probe %u.%u.%u fam=%d exts=%d\n", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), graphics_family, (int)all_supported);
-#endif
         // Select based on preference
         if (best == VK_NULL_HANDLE) {
             best        = devices[i];

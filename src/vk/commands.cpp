@@ -28,6 +28,8 @@ namespace gpu {
 #    define vkCmdSetStencilOp              vkCmdSetStencilOpEXT
 #    define vkCmdSetViewportWithCount      vkCmdSetViewportWithCountEXT
 #    define vkCmdSetScissorWithCount       vkCmdSetScissorWithCountEXT
+#    define vkCmdSetFrontFace              vkCmdSetFrontFaceEXT
+#    define vkCmdSetCullMode               vkCmdSetCullModeEXT
 #endif
 
 // --- Descriptor heap binding ---------------------------------------------------------
