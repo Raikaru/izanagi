@@ -517,7 +517,7 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
 void cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
     auto* d = cmd->device;
     auto& p = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)];
-    vkCmdBindPipeline(cmd->buffer, p.bind_point, p.vk_pipeline);
+    vkCmdBindPipeline(cmd->buffer, p.shared->bind_point, p.shared->vk_pipeline);
 }
 
 void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> state) {

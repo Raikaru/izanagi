@@ -394,6 +394,30 @@ struct SamplerDesc {
     SamplerAddressing address        = SamplerAddressing::ClampToEdge;
     float             max_anisotropy = 1.0f;
 };
+// Opaque identity of the device's native pipeline cache. Use it to key
+// persistent storage per backend/driver/GPU. The cache blob is NOT
+// transferable across drivers or GPUs; the driver rejects incompatible
+// blobs at load time (treat rejection as "no cache").
+// driver_uuid is the backend's stable per-driver identity (Vulkan:
+// VkPhysicalDeviceIDProperties.driverUUID).
+struct CacheIdentity {
+    Backend  backend    = Backend::Vulkan;
+    uint32_t vendor_id  = 0;
+    uint32_t device_id  = 0;
+    uint8_t  driver_uuid[16] = {};
+};
+// Optional persistent native pipeline cache (per device, whole-blob).
+// load is called once during create_device to seed the cache; return false
+// when no usable cache exists (first run, rejected blob, etc.). store is
+// called once during destroy_device with the final blob. Both are optional;
+// provide at least one to enable caching, provide neither to keep none.
+// Blob memory in load is application-owned and only read during create_device;
+// the blob in store is valid only for the duration of the call.
+struct PipelineCacheCallbacks {
+    bool (*load)(const CacheIdentity&, void* user, MemoryBlock* blob);
+    void (*store)(const CacheIdentity&, MemoryBlock blob, void* user);
+    void* user;
+};
 struct DeviceDesc {
     GpuPreference         gpu_preference         = GpuPreference::Discrete;
     uintptr_t             native_window_handle   = 0;
@@ -404,6 +428,7 @@ struct DeviceDesc {
     ProcAllocatorCallback alloc_callback         = nullptr;
     void*                 alloc_userdata         = nullptr;
     bool                  enable_validation      = false;
+    PipelineCacheCallbacks pipeline_cache_callbacks = {};
 };
 struct DepthStencilDesc {
     DepthFlags depth_mode              = DepthFlags::None;

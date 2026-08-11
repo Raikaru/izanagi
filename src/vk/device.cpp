@@ -624,6 +624,52 @@ Device create_device(const DeviceDesc& desc) {
         goto fail;
     }
 
+    // Persistent native pipeline cache (opt-in via DeviceDesc callbacks).
+    {
+        VkPhysicalDeviceProperties2 props2{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = nullptr,
+        };
+        VkPhysicalDeviceIDProperties id_props{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+            .pNext = nullptr,
+        };
+        props2.pNext = &id_props;
+        vkGetPhysicalDeviceProperties2(d->physical_device, &props2);
+        d->cache_identity.backend   = Backend::Vulkan;
+        d->cache_identity.vendor_id = props2.properties.vendorID;
+        d->cache_identity.device_id = props2.properties.deviceID;
+        memcpy(d->cache_identity.driver_uuid, id_props.driverUUID,
+               sizeof(d->cache_identity.driver_uuid));
+
+        d->cache_callbacks = desc.pipeline_cache_callbacks;
+        if (d->cache_callbacks.load || d->cache_callbacks.store) {
+            VkPipelineCacheCreateInfo cache_info{
+                .sType           = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                .pNext           = nullptr,
+                .flags           = 0,
+                .initialDataSize = 0,
+                .pInitialData    = nullptr,
+            };
+            MemoryBlock blob{};
+            if (d->cache_callbacks.load &&
+                d->cache_callbacks.load(d->cache_identity, d->cache_callbacks.user, &blob) &&
+                blob.ptr != nullptr && blob.len > 0) {
+                cache_info.initialDataSize = blob.len;
+                cache_info.pInitialData    = blob.ptr;
+            }
+            if (!IZ_CHK(d, vkCreatePipelineCache(d->device, &cache_info, nullptr, &d->vk_pipeline_cache),
+                        "create_device: vkCreatePipelineCache failed")) {
+                // Invalid or rejected blob (driver/device mismatch): fall back
+                // to an empty cache; the app's load hook is advisory only.
+                cache_info.initialDataSize = 0;
+                cache_info.pInitialData    = nullptr;
+                IZ_CHK(d, vkCreatePipelineCache(d->device, &cache_info, nullptr, &d->vk_pipeline_cache),
+                       "create_device: vkCreatePipelineCache (empty) failed");
+            }
+        }
+    }
+
     // Initialize pools
     d->buffer_pool = SlotMap<Buffer>(d->allocator, [](Buffer* b, void* ud) {
         auto* dd = reinterpret_cast<DeviceImpl*>(ud);
@@ -646,9 +692,9 @@ Device create_device(const DeviceDesc& desc) {
         auto* dd = reinterpret_cast<DeviceImpl*>(ud);
         vkDestroySemaphore(dd->device, s->vk_semaphore, nullptr);
     }, d);
-    d->pipeline_pool = SlotMap<PipelineImpl>(d->allocator, [](PipelineImpl* p, void* ud) {
-        auto* dd = reinterpret_cast<DeviceImpl*>(ud);
-        vkDestroyPipeline(dd->device, p->vk_pipeline, nullptr);
+    d->pipeline_pool = SlotMap<PipelineImpl>(d->allocator, [](PipelineImpl*, void*) {
+        // Shared pipelines are refcounted in pipeline.cpp; free() destroys the
+        // last reference and destroy_device cleans up leaked handles.
     }, d);
     d->depth_stencil_pool = SlotMap<DepthStencilState>(d->allocator, [](DepthStencilState*, void*) {});
 
@@ -656,12 +702,16 @@ Device create_device(const DeviceDesc& desc) {
     d->ptr_map                = Vector<GpuPtrMap>(d->allocator);
     d->uninitialized_textures = Vector<Handle<Texture>>(d->allocator);
     d->deferred_frees         = Vector<DeviceImpl::DeferredFree>(d->allocator);
+    d->shared_pipelines       = Vector<SharedPipeline*>(d->allocator);
 
     return d;
 
 fail:
     if (d->surface.surface != VK_NULL_HANDLE) {
         vkDestroySurfaceKHR(d->instance, d->surface.surface, nullptr);
+    }
+    if (d->vk_pipeline_cache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(d->device, d->vk_pipeline_cache, nullptr);
     }
     if (d->device != VK_NULL_HANDLE) { vkDestroyDevice(d->device, nullptr); }
     if (d->instance != VK_NULL_HANDLE) { vkDestroyInstance(d->instance, nullptr); }
@@ -684,6 +734,39 @@ void destroy_device(Device dev) {
         }
         d->default_queue->pending_events.clear();
         d->allocator.free({.ptr = d->default_queue, .len = sizeof(QueueImpl)});
+    }
+
+    // Destroy any shared pipelines still referenced (leaked handles).
+    mutex_lock(&d->pipeline_lock);
+    for (SharedPipeline* sp : d->shared_pipelines) {
+        if (sp->vk_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(d->device, sp->vk_pipeline, nullptr);
+        }
+        if (sp->key_block.ptr != nullptr) { d->allocator.free(sp->key_block); }
+        sp->~SharedPipeline();
+        d->allocator.free({.ptr = sp, .len = sizeof(SharedPipeline)});
+    }
+    d->shared_pipelines.clear();
+    mutex_unlock(&d->pipeline_lock);
+
+    // Persist the native pipeline cache, then destroy it.
+    if (d->vk_pipeline_cache != VK_NULL_HANDLE) {
+        size_t size = 0;
+        vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, nullptr);
+        if (size > 0 && d->cache_callbacks.store) {
+            MemoryBlock blob = d->allocator.alloc(size);
+            if (blob.ptr != nullptr) {
+                VkResult r = vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, blob.ptr);
+                if (r == VK_SUCCESS && size > 0) {
+                    d->cache_callbacks.store(d->cache_identity,
+                                             MemoryBlock{blob.ptr, static_cast<uint32_t>(size)},
+                                             d->cache_callbacks.user);
+                }
+                d->allocator.free(blob);
+            }
+        }
+        vkDestroyPipelineCache(d->device, d->vk_pipeline_cache, nullptr);
+        d->vk_pipeline_cache = VK_NULL_HANDLE;
     }
 
     // Destroy pools (destructors call the registered destructors)

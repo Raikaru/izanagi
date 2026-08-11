@@ -123,6 +123,7 @@ full enum including ETC2/ASTC, so the enum set ports 1:1.
 | `cmd_draw*` / `cmd_dispatch*` | `vkCmdDraw*` / `vkCmdDispatch*` (root args via `vkCmdPushDataEXT`) | `MTL4RenderCommandEncoder` / `MTL4ComputeCommandEncoder` draw/dispatch; argument table already set |
 | `cmd_set_depth_stencil_state` | `vkCmdSetDepth*` / `vkCmdSetStencil*` dynamic state | `setDepthStencilState` |
 | `cmd_set_front_face` / `cmd_set_cull_mode` | `vkCmdSetFrontFace` / `vkCmdSetCullMode` | `setFrontFacingWinding` / `setCullMode` |
+| pipeline cache (device-internal) | whole-device `VkPipelineCache`, app load/store callbacks + opaque `CacheIdentity` | `MTLBinaryArchive` (same app hook shape) |
 
 ### Blend factors (incl. dual-source)
 

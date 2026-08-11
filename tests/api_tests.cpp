@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -18,6 +19,14 @@
 #include "izanagi/gpu.h"
 
 using namespace gpu;
+
+// White-box test hook for the pipeline dedup tests: number of live shared
+// pipeline entries (dedup table size). Declared here to avoid pulling the
+// backend's internal header into the test TU; implemented in pipeline.cpp.
+namespace gpu {
+struct DeviceImpl;
+uint32_t debug_live_pipelines(DeviceImpl*);
+}
 
 static int g_failures = 0;
 
@@ -1307,6 +1316,261 @@ static void test_dual_source_blend() {
     printf("  PASS\n");
 }
 
+// --- Test 15: Pipeline dedup ----------------------------------------------------------------
+static void test_pipeline_dedup() {
+    printf("--- Test: pipeline dedup ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("offscreen_triangle.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vertex_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fragment_src{.source = spirv, .entry_point = "fragment_main"_sv};
+    ColorTarget color_target{.format = Format::BGRA8Unorm};
+    RasterDesc raster_desc{
+        .color_targets = Span<const ColorTarget>(&color_target, 1),
+    };
+
+    auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+
+    // Identical creates share one compiled pipeline but stay distinct handles.
+    Handle<Pipeline> a = create_graphics_pipeline(d, vertex_src, fragment_src, raster_desc);
+    Handle<Pipeline> b = create_graphics_pipeline(d, vertex_src, fragment_src, raster_desc);
+    CHECK(a.h != 0 && b.h != 0, "create_graphics_pipeline failed");
+    CHECK(a.h != b.h, "identical creates must return distinct handles");
+    CHECK(debug_live_pipelines(impl) == 1, "identical creates must share one pipeline");
+
+    // Refcount: survives the first free, dies with the last.
+    free(d, a);
+    CHECK(debug_live_pipelines(impl) == 1, "pipeline must stay alive while a handle remains");
+    free(d, b);
+    CHECK(debug_live_pipelines(impl) == 0, "pipeline must die with the last handle");
+
+    // No retention: recreate after free compiles fresh (dedup only).
+    Handle<Pipeline> c = create_graphics_pipeline(d, vertex_src, fragment_src, raster_desc);
+    CHECK(c.h != 0, "recreate failed");
+    CHECK(debug_live_pipelines(impl) == 1, "recreate after free must compile a new pipeline");
+    free(d, c);
+
+    // Every key field must produce a distinct pipeline.
+    std::vector<Handle<Pipeline>> variants;
+    auto make = [&](RasterDesc rd, Span<const SpecializationConstant> sc = {}) {
+        Handle<Pipeline> h = create_graphics_pipeline(d, vertex_src, fragment_src, rd, sc);
+        CHECK(h.h != 0, "variant pipeline create failed");
+        return h;
+    };
+    {
+        RasterDesc rd = raster_desc;
+        rd.topology = Topology::TriangleStrip;
+        variants.push_back(make(rd));
+    }
+    {
+        RasterDesc rd = raster_desc;
+        rd.sample_count = 4;
+        variants.push_back(make(rd));
+    }
+    {
+        RasterDesc rd = raster_desc;
+        rd.alpha_to_coverage = true;
+        variants.push_back(make(rd));
+    }
+    {
+        ColorTarget ct{.format = Format::RGBA8Unorm};
+        RasterDesc rd = raster_desc;
+        rd.color_targets = Span<const ColorTarget>(&ct, 1);
+        variants.push_back(make(rd));
+    }
+    {
+        ColorTarget ct{.format = Format::BGRA8Unorm,
+                       .blendstate = BlendDesc{.src_color_factor = Factor::SrcAlpha}};
+        RasterDesc rd = raster_desc;
+        rd.color_targets = Span<const ColorTarget>(&ct, 1);
+        variants.push_back(make(rd));
+    }
+    {
+        RasterDesc rd = raster_desc;
+        rd.depth_format = Format::Depth32Float;
+        variants.push_back(make(rd));
+    }
+    {
+        RasterDesc rd = raster_desc;
+        rd.stencil_format = Format::Stencil8;
+        variants.push_back(make(rd));
+    }
+    {
+        SpecializationConstant sc{.constant_id = 0, .int_val = 5,
+                                  .type = SpecializationConstantType::UInt32};
+        variants.push_back(make(raster_desc, Span<const SpecializationConstant>(&sc, 1)));
+    }
+    CHECK(debug_live_pipelines(impl) == variants.size(),
+          "each varied key field must yield a distinct pipeline");
+    for (auto v : variants) { free(d, v); }
+    CHECK(debug_live_pipelines(impl) == 0, "all variant pipelines must be freed");
+
+    // Compute pipelines dedup too; specialization values are part of the key.
+    std::string comp_path = find_shader_path("spec_mul_kernel.spv");
+    auto comp_spirv = load_spirv(comp_path.c_str(), &arena);
+    CHECK(comp_spirv.size() > 0, "Failed to load spec_mul_kernel.spv");
+    if (comp_spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource comp_src{.source = comp_spirv, .entry_point = "compute_main"_sv};
+    Handle<Pipeline> p1 = create_compute_pipeline(d, comp_src);
+    Handle<Pipeline> p2 = create_compute_pipeline(d, comp_src);
+    CHECK(p1.h != 0 && p2.h != 0, "create_compute_pipeline failed");
+    CHECK(p1.h != p2.h, "compute dedup: handles must stay distinct");
+    CHECK(debug_live_pipelines(impl) == 1, "compute identical creates must share");
+
+    SpecializationConstant sc5{.constant_id = 0, .int_val = 5,
+                               .type = SpecializationConstantType::UInt32};
+    SpecializationConstant sc7{.constant_id = 0, .int_val = 7,
+                               .type = SpecializationConstantType::UInt32};
+    Handle<Pipeline> p3 = create_compute_pipeline(d, comp_src, Span<const SpecializationConstant>(&sc5, 1));
+    Handle<Pipeline> p4 = create_compute_pipeline(d, comp_src, Span<const SpecializationConstant>(&sc7, 1));
+    CHECK(p3.h != 0 && p4.h != 0, "spec-constant compute create failed");
+    CHECK(debug_live_pipelines(impl) == 3, "spec constant values must be part of the key");
+
+    free(d, p1);
+    free(d, p2);
+    free(d, p3);
+    free(d, p4);
+    CHECK(debug_live_pipelines(impl) == 0, "compute pipelines must be freed");
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 16: Persistent pipeline cache -----------------------------------------------------
+struct TestPipelineCache {
+    CacheIdentity identity;
+    std::vector<uint8_t> blob;
+    int  store_count = 0;
+    bool load_called = false;
+};
+
+static bool test_cache_load(const CacheIdentity& id, void* user, MemoryBlock* blob) {
+    auto* c = static_cast<TestPipelineCache*>(user);
+    c->identity = id;
+    c->load_called = true;
+    if (c->blob.empty()) { return false; }
+    *blob = MemoryBlock{c->blob.data(), static_cast<uint32_t>(c->blob.size())};
+    return true;
+}
+
+static void test_cache_store(const CacheIdentity& id, MemoryBlock blob, void* user) {
+    auto* c = static_cast<TestPipelineCache*>(user);
+    c->identity = id;
+    c->store_count++;
+    c->blob.assign(static_cast<uint8_t*>(blob.ptr), static_cast<uint8_t*>(blob.ptr) + blob.len);
+}
+
+static void test_pipeline_cache_persistence() {
+    printf("--- Test: pipeline cache persistence ---\n");
+
+    // Device A: cold cache; create pipelines so the blob is non-trivial.
+    TestPipelineCache cache_a;
+    DeviceDesc desc_a{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+        .pipeline_cache_callbacks = PipelineCacheCallbacks{
+            .load  = test_cache_load,
+            .store = test_cache_store,
+            .user  = &cache_a,
+        },
+    };
+    Device a = create_device(desc_a);
+    CHECK(a != nullptr, "create_device (A) failed");
+    if (a == nullptr) { return; }
+    CHECK(cache_a.load_called, "load callback must fire during create_device");
+
+    {
+        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        std::string comp_path = find_shader_path("memcpy_kernel.spv");
+        auto comp_spirv = load_spirv(comp_path.c_str(), &arena);
+        std::string gfx_path = find_shader_path("offscreen_triangle.spv");
+        auto gfx_spirv = load_spirv(gfx_path.c_str(), &arena);
+        CHECK(comp_spirv.size() > 0 && gfx_spirv.size() > 0, "shader load failed");
+        if (comp_spirv.size() && gfx_spirv.size()) {
+            ShaderSource comp_src{.source = comp_spirv, .entry_point = "compute_main"_sv};
+            Handle<Pipeline> cp = create_compute_pipeline(a, comp_src);
+            CHECK(cp.h != 0, "compute pipeline (A) failed");
+            ShaderSource vs{.source = gfx_spirv, .entry_point = "vertex_main"_sv};
+            ShaderSource fs{.source = gfx_spirv, .entry_point = "fragment_main"_sv};
+            ColorTarget ct{.format = Format::BGRA8Unorm};
+            RasterDesc rd{.color_targets = Span<const ColorTarget>(&ct, 1)};
+            Handle<Pipeline> gp = create_graphics_pipeline(a, vs, fs, rd);
+            CHECK(gp.h != 0, "graphics pipeline (A) failed");
+            if (cp.h) { free(a, cp); }
+            if (gp.h) { free(a, gp); }
+        }
+    }
+    destroy_device(a);
+    CHECK(cache_a.store_count >= 1, "store callback must fire at destroy_device");
+    CHECK(cache_a.blob.size() > 0, "stored cache blob must be non-empty");
+    CHECK(cache_a.identity.backend == Backend::Vulkan, "cache identity backend must be Vulkan");
+    CHECK(cache_a.identity.vendor_id != 0, "cache identity vendor_id must be set");
+
+    // Device B: warm cache seeded from A's blob; creates must still succeed.
+    TestPipelineCache cache_b;
+    cache_b.blob = cache_a.blob;
+    DeviceDesc desc_b{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+        .pipeline_cache_callbacks = PipelineCacheCallbacks{
+            .load  = test_cache_load,
+            .store = test_cache_store,
+            .user  = &cache_b,
+        },
+    };
+    Device b = create_device(desc_b);
+    CHECK(b != nullptr, "create_device (B) with seeded cache failed");
+    CHECK(cache_b.identity.vendor_id == cache_a.identity.vendor_id,
+          "cache identity must be stable across devices");
+    if (b != nullptr) {
+        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        std::string comp_path = find_shader_path("memcpy_kernel.spv");
+        auto comp_spirv = load_spirv(comp_path.c_str(), &arena);
+        if (comp_spirv.size() > 0) {
+            ShaderSource comp_src{.source = comp_spirv, .entry_point = "compute_main"_sv};
+            Handle<Pipeline> cp = create_compute_pipeline(b, comp_src);
+            CHECK(cp.h != 0, "compute pipeline (B) failed with seeded cache");
+            if (cp.h) { free(b, cp); }
+        }
+        destroy_device(b);
+    }
+    CHECK(cache_b.store_count >= 1, "store must fire for device B");
+    CHECK(cache_b.blob.size() > 0, "device B blob must be non-empty");
+
+    // Device C: an invalid blob must be tolerated (falls back to empty cache).
+    TestPipelineCache cache_c;
+    cache_c.blob = {0, 0, 0, 0}; // definitely not a valid pipeline cache blob
+    DeviceDesc desc_c{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Error,
+        .pipeline_cache_callbacks = PipelineCacheCallbacks{
+            .load  = test_cache_load,
+            .store = test_cache_store,
+            .user  = &cache_c,
+        },
+    };
+    Device c = create_device(desc_c);
+    CHECK(c != nullptr, "create_device (C) must tolerate an invalid cache blob");
+    if (c != nullptr) { destroy_device(c); }
+
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -1336,6 +1600,8 @@ int main() {
     test_bc1_roundtrip();
     test_msaa_resolve();
     test_generate_mipmaps();
+    test_pipeline_dedup();
+    test_pipeline_cache_persistence();
     test_dual_source_blend();
 
     printf("\n=================\n");

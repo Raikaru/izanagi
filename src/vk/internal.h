@@ -54,9 +54,40 @@ struct DepthStencilState {
     DepthStencilDesc desc;
 };
 
+// A compiled pipeline shared by every handle created from an identical
+// description. Owns one contiguous key copy (key_block) that fully
+// determines the VkPipeline; destroyed when the last handle is freed
+// (dedup only — no retention beyond live handles).
+struct SharedPipeline {
+    VkPipeline          vk_pipeline = VK_NULL_HANDLE;
+    VkPipelineBindPoint bind_point  = VK_PIPELINE_BIND_POINT_COMPUTE;
+    uint32_t            refcount    = 0;
+    MemoryBlock         key_block   = {};   // owned copy of all create inputs
+
+    // --- key data (pointers into key_block) ---
+    uint8_t* vs_bytes   = nullptr;
+    uint32_t vs_size    = 0;
+    char*    vs_entry   = nullptr;   // null-terminated
+    uint8_t* fs_bytes   = nullptr;
+    uint32_t fs_size    = 0;
+    char*    fs_entry   = nullptr;
+    uint8_t*  spec_data  = nullptr;
+    uint32_t  spec_size  = 0;
+    uint32_t* spec_ids   = nullptr;
+    uint32_t* spec_sizes = nullptr;
+    uint32_t  spec_count = 0;
+    // raster state (graphics pipelines)
+    Topology topology           = Topology::TriangleList;
+    uint8_t  sample_count       = 1;
+    bool     alpha_to_coverage  = false;
+    Format   depth_format       = Format::None;
+    Format   stencil_format     = Format::None;
+    uint8_t  color_target_count = 0;
+    ColorTarget* color_targets  = nullptr;
+};
+
 struct PipelineImpl {
-    VkPipeline            vk_pipeline = VK_NULL_HANDLE;
-    VkPipelineBindPoint   bind_point  = VK_PIPELINE_BIND_POINT_COMPUTE;
+    SharedPipeline* shared = nullptr;
 };
 
 struct SemaphoreImpl {
@@ -201,6 +232,16 @@ struct DeviceImpl {
     // Queues (single Default queue in v1)
     QueueImpl* default_queue = nullptr;
 
+    // Pipelines: dedup table + persistent native cache. pipeline_lock covers
+    // both (VkPipelineCache is externally synchronized in the Vulkan spec).
+    // SharedPipeline entries are heap-allocated (stable addresses; the vector
+    // itself reallocates).
+    mutex                    pipeline_lock = IZ_MUTEX_INIT;
+    Vector<SharedPipeline*>  shared_pipelines;
+    VkPipelineCache          vk_pipeline_cache = VK_NULL_HANDLE;
+    PipelineCacheCallbacks   cache_callbacks   = {};
+    CacheIdentity            cache_identity    = {};
+
     // Descriptor heap
     DescriptorHeap heap;
     TwoLevelBitset sampled_bitset;
@@ -277,6 +318,10 @@ void              drain_deferred_frees(DeviceImpl* d, uint64_t current_timeline)
 void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
 void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
 void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info);
+
+// White-box test hook: number of live shared pipeline entries (dedup table
+// size). Not part of the public API.
+uint32_t debug_live_pipelines(DeviceImpl* d);
 
 // Descriptor heap bind (commands.cpp, called from queue_start_command_recording)
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd);

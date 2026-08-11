@@ -41,6 +41,11 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   sample-count-1 resolve target; the pass resolves into it at end (average).
 - **`cmd_generate_mipmaps`.** Successive linear blits build mips 1..N-1 from
   mip 0 in one command (layer 0 only).
+- **Transparent pipeline dedup + persistent native cache.** Identical
+  pipeline descriptions share one compiled pipeline (refcounted, handles stay
+  distinct); an optional per-device native cache (`VkPipelineCache`) is
+  seeded/saved via app-provided load/store callbacks keyed by an opaque
+  `CacheIdentity`. The native blob is driver/GPU-specific, not transferable.
 
 ## Requirements
 
@@ -149,6 +154,8 @@ Windows-only in v1 (Vulkan 1.4 backend).
 12. BC1 block-compressed copy roundtrip
 13. MSAA 4x render + resolve
 14. `cmd_generate_mipmaps` (mip 0 → mip 3 chain)
+15. Pipeline dedup (identical descs share one pipeline; every key field distinct)
+16. Persistent pipeline cache (store/load round-trip + invalid-blob tolerance)
 
 ## Repository layout
 

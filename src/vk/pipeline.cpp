@@ -1,5 +1,7 @@
 // pipeline.cpp — compute & graphics pipelines, depth-stencil state, specialization constants.
 
+#include <cstring>
+
 #include "internal.h"
 
 namespace gpu {
@@ -69,6 +71,176 @@ static VkSpecializationInfo construct_specialization_info(
     };
 }
 
+// --- Pipeline dedup (SharedPipeline) --------------------------------------------------
+// Identical create inputs share one compiled VkPipeline (refcounted; destroyed
+// when the last handle is freed). The key is a full copy of every input that
+// reaches pipeline creation — shader bytes + entry points, specialization
+// data, and the entire baked raster state. No retention beyond live handles.
+
+static bool entry_equal(const char* stored, Span<const char> app) {
+    const size_t n = strlen(stored);
+    return n == app.size() && (n == 0 || memcmp(stored, app.data(), n) == 0);
+}
+
+static bool spec_equal(const SharedPipeline& sp, const VkSpecializationInfo& spec) {
+    if (sp.spec_count != spec.mapEntryCount || sp.spec_size != spec.dataSize) { return false; }
+    if (sp.spec_size && memcmp(sp.spec_data, spec.pData, sp.spec_size) != 0) { return false; }
+    for (uint32_t i = 0; i < sp.spec_count; ++i) {
+        if (sp.spec_ids[i] != spec.pMapEntries[i].constantID ||
+            sp.spec_sizes[i] != spec.pMapEntries[i].size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool graphics_key_equal(const SharedPipeline& sp, ShaderSource vertex, ShaderSource fragment,
+                               const VkSpecializationInfo& spec, const RasterDesc& desc) {
+    if (sp.bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) { return false; }
+    if (sp.vs_size != vertex.source.size() ||
+        (sp.vs_size && memcmp(sp.vs_bytes, vertex.source.data(), sp.vs_size) != 0)) {
+        return false;
+    }
+    if (sp.fs_size != fragment.source.size() ||
+        (sp.fs_size && memcmp(sp.fs_bytes, fragment.source.data(), sp.fs_size) != 0)) {
+        return false;
+    }
+    if (!entry_equal(sp.vs_entry, vertex.entry_point) ||
+        !entry_equal(sp.fs_entry, fragment.entry_point)) {
+        return false;
+    }
+    if (!spec_equal(sp, spec)) { return false; }
+    if (sp.topology != desc.topology || sp.sample_count != desc.sample_count ||
+        sp.alpha_to_coverage != desc.alpha_to_coverage ||
+        sp.depth_format != desc.depth_format || sp.stencil_format != desc.stencil_format ||
+        sp.color_target_count != desc.color_targets.size()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < sp.color_target_count; ++i) {
+        const ColorTarget& a = sp.color_targets[i];
+        const ColorTarget& b = desc.color_targets[i];
+        if (a.format != b.format) { return false; }
+        const BlendDesc& ba = a.blendstate;
+        const BlendDesc& bb = b.blendstate;
+        if (ba.color_op != bb.color_op || ba.src_color_factor != bb.src_color_factor ||
+            ba.dst_color_factor != bb.dst_color_factor || ba.alpha_op != bb.alpha_op ||
+            ba.src_alpha_factor != bb.src_alpha_factor || ba.dst_alpha_factor != bb.dst_alpha_factor ||
+            ba.color_write_mask != bb.color_write_mask) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool compute_key_equal(const SharedPipeline& sp, ShaderSource source,
+                              const VkSpecializationInfo& spec) {
+    if (sp.bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) { return false; }
+    if (sp.vs_size != source.source.size() ||
+        (sp.vs_size && memcmp(sp.vs_bytes, source.source.data(), sp.vs_size) != 0)) {
+        return false;
+    }
+    if (!entry_equal(sp.vs_entry, source.entry_point)) { return false; }
+    return spec_equal(sp, spec);
+}
+
+// Copies every create input into one owned block inside `sp`. Returns false on
+// allocation failure (caller must destroy the pipeline and bail).
+static bool build_key(DeviceImpl* d, SharedPipeline* sp, ShaderSource vertex, ShaderSource fragment,
+                      const VkSpecializationInfo& spec, const RasterDesc* desc) {
+    const uint32_t ct_count = desc ? static_cast<uint32_t>(desc->color_targets.size()) : 0;
+    size_t total = 0;
+    total += vertex.source.size() + vertex.entry_point.size() + 1;
+    total += fragment.source.size() + fragment.entry_point.size() + 1;
+    total += spec.dataSize + spec.mapEntryCount * 2 * sizeof(uint32_t);
+    total += ct_count * sizeof(ColorTarget);
+    if (total == 0) { total = 1; }
+
+    MemoryBlock blk = d->allocator.alloc(total);
+    if (blk.ptr == nullptr) { return false; }
+    sp->key_block = blk;
+
+    uint8_t* p = static_cast<uint8_t*>(blk.ptr);
+    auto take_space = [&p](size_t n) -> void* {
+        void* out = p;
+        p += n;
+        return out;
+    };
+    auto take_bytes = [&p](const void* src, size_t n) -> uint8_t* {
+        uint8_t* out = p;
+        if (n) { memcpy(p, src, n); }
+        p += n;
+        return out;
+    };
+    auto take_str = [&p](Span<const char> s) -> char* {
+        char* out = reinterpret_cast<char*>(p);
+        if (s.size()) { memcpy(p, s.data(), s.size()); }
+        p += s.size();
+        *p = '\0';
+        p += 1;
+        return out;
+    };
+
+    sp->vs_size  = static_cast<uint32_t>(vertex.source.size());
+    sp->vs_bytes = take_bytes(vertex.source.data(), vertex.source.size());
+    sp->vs_entry = take_str(vertex.entry_point);
+    sp->fs_size  = static_cast<uint32_t>(fragment.source.size());
+    sp->fs_bytes = take_bytes(fragment.source.data(), fragment.source.size());
+    sp->fs_entry = take_str(fragment.entry_point);
+
+    sp->spec_size = static_cast<uint32_t>(spec.dataSize);
+    sp->spec_data = take_bytes(spec.pData, spec.dataSize);
+    sp->spec_count = spec.mapEntryCount;
+    uint32_t* ids = static_cast<uint32_t*>(take_space(spec.mapEntryCount * sizeof(uint32_t)));
+    uint32_t* sizes = static_cast<uint32_t*>(take_space(spec.mapEntryCount * sizeof(uint32_t)));
+    for (uint32_t i = 0; i < spec.mapEntryCount; ++i) {
+        ids[i]   = spec.pMapEntries[i].constantID;
+        sizes[i] = spec.pMapEntries[i].size;
+    }
+    sp->spec_ids   = ids;
+    sp->spec_sizes = sizes;
+
+    if (desc) {
+        sp->topology          = desc->topology;
+        sp->sample_count      = desc->sample_count;
+        sp->alpha_to_coverage = desc->alpha_to_coverage;
+        sp->depth_format      = desc->depth_format;
+        sp->stencil_format    = desc->stencil_format;
+        sp->color_target_count = ct_count;
+        ColorTarget* cts = static_cast<ColorTarget*>(take_space(ct_count * sizeof(ColorTarget)));
+        for (uint32_t i = 0; i < ct_count; ++i) { cts[i] = desc->color_targets[i]; }
+        sp->color_targets = cts;
+    }
+    return true;
+}
+
+// Finds a live shared pipeline with identical inputs and bumps its refcount.
+// Returns nullptr on miss.
+static SharedPipeline* dedup_find(DeviceImpl* d, ShaderSource vertex, ShaderSource fragment,
+                                  const VkSpecializationInfo& spec, const RasterDesc* desc) {
+    for (SharedPipeline* sp : d->shared_pipelines) {
+        const bool eq = desc ? graphics_key_equal(*sp, vertex, fragment, spec, *desc)
+                             : compute_key_equal(*sp, vertex, spec);
+        if (eq) {
+            sp->refcount++;
+            return sp;
+        }
+    }
+    return nullptr;
+}
+
+// Allocates a zero-initialized shared entry (stable address across vector
+// growth). Returns nullptr on allocation failure.
+static SharedPipeline* alloc_shared_pipeline(DeviceImpl* d) {
+    MemoryBlock blk = d->allocator.alloc(sizeof(SharedPipeline));
+    if (blk.ptr == nullptr) { return nullptr; }
+    return ::new (blk.ptr) SharedPipeline();
+}
+
+static void free_shared_pipeline(DeviceImpl* d, SharedPipeline* sp) {
+    sp->~SharedPipeline();
+    d->allocator.free({.ptr = sp, .len = sizeof(SharedPipeline)});
+}
+
 // --- Compute pipeline ----------------------------------------------------------------
 
 Handle<Pipeline> create_compute_pipeline(Device                             dev,
@@ -116,15 +288,39 @@ Handle<Pipeline> create_compute_pipeline(Device                             dev,
     };
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (!IZ_CHK(d, vkCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline),
+
+    mutex_lock(&d->pipeline_lock);
+    if (SharedPipeline* hit = dedup_find(d, source, {}, specialization_info, nullptr)) {
+        auto h = d->pipeline_pool.emplace(PipelineImpl{hit});
+        mutex_unlock(&d->pipeline_lock);
+        return handle_cast<Pipeline>(h);
+    }
+
+    if (!IZ_CHK(d, vkCreateComputePipelines(d->device, d->vk_pipeline_cache, 1, &info, nullptr, &pipeline),
                 "create_compute_pipeline failed")) {
+        mutex_unlock(&d->pipeline_lock);
         return {};
     }
 
-    return handle_cast<Pipeline>(d->pipeline_pool.emplace(PipelineImpl{
-        .vk_pipeline = pipeline,
-        .bind_point  = VK_PIPELINE_BIND_POINT_COMPUTE,
-    }));
+    SharedPipeline* sp = alloc_shared_pipeline(d);
+    if (sp == nullptr) {
+        vkDestroyPipeline(d->device, pipeline, nullptr);
+        mutex_unlock(&d->pipeline_lock);
+        return {};
+    }
+    sp->vk_pipeline = pipeline;
+    sp->bind_point  = VK_PIPELINE_BIND_POINT_COMPUTE;
+    sp->refcount    = 1;
+    if (!build_key(d, sp, source, {}, specialization_info, nullptr)) {
+        vkDestroyPipeline(d->device, pipeline, nullptr);
+        free_shared_pipeline(d, sp);
+        mutex_unlock(&d->pipeline_lock);
+        return {};
+    }
+    d->shared_pipelines.push_back(sp);
+    auto h = d->pipeline_pool.emplace(PipelineImpl{sp});
+    mutex_unlock(&d->pipeline_lock);
+    return handle_cast<Pipeline>(h);
 }
 
 // --- Graphics pipeline -----------------------------------------------------------------
@@ -342,20 +538,69 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
     };
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (!IZ_CHK(d, vkCreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &create_info, nullptr, &pipeline),
+
+    mutex_lock(&d->pipeline_lock);
+    if (SharedPipeline* hit = dedup_find(d, vertex, fragment, specialization_info, &desc)) {
+        auto h = d->pipeline_pool.emplace(PipelineImpl{hit});
+        mutex_unlock(&d->pipeline_lock);
+        return handle_cast<Pipeline>(h);
+    }
+
+    if (!IZ_CHK(d, vkCreateGraphicsPipelines(d->device, d->vk_pipeline_cache, 1, &create_info, nullptr, &pipeline),
                 "create_graphics_pipeline failed")) {
+        mutex_unlock(&d->pipeline_lock);
         return {};
     }
 
-    return handle_cast<Pipeline>(d->pipeline_pool.emplace(PipelineImpl{
-        .vk_pipeline = pipeline,
-        .bind_point  = VK_PIPELINE_BIND_POINT_GRAPHICS,
-    }));
+    SharedPipeline* sp = alloc_shared_pipeline(d);
+    if (sp == nullptr) {
+        vkDestroyPipeline(d->device, pipeline, nullptr);
+        mutex_unlock(&d->pipeline_lock);
+        return {};
+    }
+    sp->vk_pipeline = pipeline;
+    sp->bind_point  = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp->refcount    = 1;
+    if (!build_key(d, sp, vertex, fragment, specialization_info, &desc)) {
+        vkDestroyPipeline(d->device, pipeline, nullptr);
+        free_shared_pipeline(d, sp);
+        mutex_unlock(&d->pipeline_lock);
+        return {};
+    }
+    d->shared_pipelines.push_back(sp);
+    auto h = d->pipeline_pool.emplace(PipelineImpl{sp});
+    mutex_unlock(&d->pipeline_lock);
+    return handle_cast<Pipeline>(h);
 }
 
 void free(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
+
+    // Decrement the shared pipeline's refcount; destroy it with the last handle.
+    SharedPipeline* sp = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].shared;
+    mutex_lock(&d->pipeline_lock);
+    if (--sp->refcount == 0) {
+        vkDestroyPipeline(d->device, sp->vk_pipeline, nullptr);
+        if (sp->key_block.ptr != nullptr) { d->allocator.free(sp->key_block); }
+        for (uint32_t i = 0; i < d->shared_pipelines.size(); ++i) {
+            if (d->shared_pipelines[i] == sp) {
+                d->shared_pipelines[i] = d->shared_pipelines[d->shared_pipelines.size() - 1];
+                d->shared_pipelines.pop_back();
+                break;
+            }
+        }
+        free_shared_pipeline(d, sp);
+    }
+    mutex_unlock(&d->pipeline_lock);
+
     d->pipeline_pool.erase(handle_cast<PipelineImpl>(pipeline));
+}
+
+uint32_t debug_live_pipelines(DeviceImpl* d) {
+    mutex_lock(&d->pipeline_lock);
+    const uint32_t n = d->shared_pipelines.size();
+    mutex_unlock(&d->pipeline_lock);
+    return n;
 }
 
 // --- Depth-stencil state ------------------------------------------------------------
