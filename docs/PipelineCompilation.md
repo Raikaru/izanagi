@@ -118,6 +118,17 @@ last user reference is dropped while compilation is queued, the worker finishes
 and immediately retires the result. Device destruction joins the compiler
 worker before tearing down Vulkan state.
 
+## Cache misses and first-use latency
+
+A genuinely new native shader — never compiled on this driver/GPU and absent
+from the persistent cache — cannot reach Ready with zero latency: the driver
+must compile it. That compilation runs on the background worker, so it never
+blocks frame-critical threads, but until it finishes `cmd_set_pipeline`
+returns false and the application uses its fallback, skip, or wait path.
+Zero first-use latency for an unseen shader is only achievable by compiling
+earlier (prewarming), omitting the work, or explicitly falling back — never by
+silent substitution.
+
 ## Diagnostics
 
 Best-effort internal counters track requests, dedup hits, cache-only probe

@@ -1,5 +1,7 @@
 // surface.cpp — swapchain creation, acquire/present, frame pacing.
 
+#include <algorithm>
+
 #include "internal.h"
 
 namespace gpu {
@@ -64,23 +66,29 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
         return false;
     }
 
-    // Wait for idle before recreating swapchain
+    // 1. Retire old swapchain use before touching anything.
     vkDeviceWaitIdle(d->device);
 
+    // 2. Capabilities; clamp the requested extent.
     VkSurfaceCapabilitiesKHR vk_caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(d->physical_device, s.surface, &vk_caps);
 
     uint32_t image_count = vk_caps.minImageCount + 1;
-    // Prefer 3 images for presentation, clamped to caps
     if (image_count < 3 && vk_caps.maxImageCount >= 3) { image_count = 3; }
     if (vk_caps.maxImageCount > 0 && image_count > vk_caps.maxImageCount) {
         image_count = vk_caps.maxImageCount;
     }
 
-    const auto extent = VkExtent2D{.width = config.width, .height = config.height};
+    VkExtent2D extent{.width = config.width, .height = config.height};
+    if (vk_caps.currentExtent.width != 0xFFFFFFFFu) {
+        extent = vk_caps.currentExtent;
+    } else {
+        extent.width  = std::clamp(extent.width, vk_caps.minImageExtent.width, vk_caps.maxImageExtent.width);
+        extent.height = std::clamp(extent.height, vk_caps.minImageExtent.height, vk_caps.maxImageExtent.height);
+    }
 
-    VkSwapchainKHR old_swapchain = s.swapchain;
-
+    // 3. Create the candidate swapchain (handoff from the old one).
+    VkSwapchainKHR candidate = VK_NULL_HANDLE;
     const VkSwapchainCreateInfoKHR swapchain_info{
         .sType                 = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .pNext                 = nullptr,
@@ -99,85 +107,55 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
         .compositeAlpha        = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         .presentMode           = bridge(config.present_mode),
         .clipped               = true,
-        .oldSwapchain          = old_swapchain,
+        .oldSwapchain          = s.swapchain,
     };
-
-    if (!IZ_CHK(d, vkCreateSwapchainKHR(d->device, &swapchain_info, nullptr, &s.swapchain),
+    if (!IZ_CHK(d, vkCreateSwapchainKHR(d->device, &swapchain_info, nullptr, &candidate),
                 "configure_surface: vkCreateSwapchainKHR failed")) {
         return false;
     }
 
-    // Destroy old swapchain
-    if (old_swapchain != VK_NULL_HANDLE) {
-        vkDestroySwapchainKHR(d->device, old_swapchain, nullptr);
-    }
-
-    // Get swapchain images
-    image_count = 0;
-    if (!IZ_CHK(d, vkGetSwapchainImagesKHR(d->device, s.swapchain, &image_count, nullptr),
-                "configure_surface: vkGetSwapchainImagesKHR failed")) {
-        return false;
-    }
-    if (image_count > Surface::kMaxSwapchainImages) {
-        IZ_LOG(d, LogLevel::Error, "Too many swapchain images");
-        return false;
-    }
-
-    VkImage vk_images[Surface::kMaxSwapchainImages];
-    if (!IZ_CHK(d, vkGetSwapchainImagesKHR(d->device, s.swapchain, &image_count, vk_images),
-                "configure_surface: vkGetSwapchainImagesKHR failed")) {
-        return false;
-    }
-
-    s.image_count       = image_count;
-    s.swapchain_format  = bridge(config.format);
-    s.swapchain_extent  = extent;
-
-    // Create semaphores for acquire/present
+    // 4. Build candidate state (semaphores, views, texture records) fully
+    //    before touching the installed state. Any failure rolls back.
     const VkSemaphoreCreateInfo sem_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
     };
+    VkSemaphore candidate_acquire[kMaxFramesInFlight] = {};
+    VkSemaphore candidate_present[Surface::kMaxSwapchainImages] = {};
+    Handle<Texture> candidate_textures[Surface::kMaxSwapchainImages] = {};
+    uint32_t created_textures = 0;
+    VkImage vk_images[Surface::kMaxSwapchainImages];
 
-    // Free old semaphores
-    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
-        if (s.acquire_semaphores[i].h != 0) {
-            d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.acquire_semaphores[i]));
-        }
+    // 5. Query candidate images.
+    image_count = 0;
+    if (!IZ_CHK(d, vkGetSwapchainImagesKHR(d->device, candidate, &image_count, nullptr),
+                "configure_surface: vkGetSwapchainImagesKHR failed")) {
+        goto fail_candidate;
     }
-    for (uint32_t i = 0; i < Surface::kMaxSwapchainImages; ++i) {
-        if (s.present_semaphores[i].h != 0) {
-            d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.present_semaphores[i]));
-        }
+    if (image_count == 0 || image_count > Surface::kMaxSwapchainImages) {
+        IZ_LOG(d, LogLevel::Error, "Swapchain image count out of range");
+        goto fail_candidate;
+    }
+    if (!IZ_CHK(d, vkGetSwapchainImagesKHR(d->device, candidate, &image_count, vk_images),
+                "configure_surface: vkGetSwapchainImagesKHR failed")) {
+        goto fail_candidate;
     }
 
-    // Acquire semaphores: one per frame-in-flight
     for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
-        VkSemaphore sem;
-        if (!IZ_CHK(d, vkCreateSemaphore(d->device, &sem_info, nullptr, &sem),
+        if (!IZ_CHK(d, vkCreateSemaphore(d->device, &sem_info, nullptr, &candidate_acquire[i]),
                     "configure_surface: failed to create acquire semaphore")) {
-            return false;
+            goto fail_candidate;
         }
-        s.acquire_semaphores[i] = handle_cast<Semaphore>(
-            d->semaphore_pool.emplace(SemaphoreImpl{.vk_semaphore = sem}));
     }
-
-    // Present semaphores: one per swapchain image
     for (uint32_t i = 0; i < image_count; ++i) {
-        VkSemaphore sem;
-        if (!IZ_CHK(d, vkCreateSemaphore(d->device, &sem_info, nullptr, &sem),
+        if (!IZ_CHK(d, vkCreateSemaphore(d->device, &sem_info, nullptr, &candidate_present[i]),
                     "configure_surface: failed to create present semaphore")) {
-            return false;
+            goto fail_candidate;
         }
-        s.present_semaphores[i] = handle_cast<Semaphore>(
-            d->semaphore_pool.emplace(SemaphoreImpl{.vk_semaphore = sem}));
     }
-
-    // Register swapchain images as textures
     for (uint32_t i = 0; i < image_count; ++i) {
-        // Create default image view for each swapchain image
-        VkImageViewCreateInfo view_info{
+        const VkImageViewCreateInfo view_info{
             .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .pNext    = nullptr,
             .flags    = 0,
@@ -194,13 +172,12 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
                 .layerCount     = 1,
             },
         };
-        VkImageView view;
+        VkImageView view = VK_NULL_HANDLE;
         if (!IZ_CHK(d, vkCreateImageView(d->device, &view_info, nullptr, &view),
                     "configure_surface: failed to create swapchain image view")) {
-            return false;
+            goto fail_candidate;
         }
-
-        s.swapchain_images[i] = handle_cast<Texture>(d->texture_pool.emplace(TextureImpl{
+        candidate_textures[i] = handle_cast<Texture>(d->texture_pool.emplace(TextureImpl{
             .vk_image           = vk_images[i],
             .default_image_view = view,
             .vk_allocation      = VK_NULL_HANDLE,
@@ -208,19 +185,73 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
             .format             = config.format,
             .is_swapchain_image = true,
             .mip_count          = 1,
-            .dimensions         = {config.width, config.height, 1},
+            .dimensions         = {extent.width, extent.height, 1},
         }));
-        d->texture_pool[handle_cast<TextureImpl>(s.swapchain_images[i])].attachment_views =
+        created_textures = i + 1;
+        d->texture_pool[handle_cast<TextureImpl>(candidate_textures[i])].attachment_views =
             Vector<TextureImpl::AttachmentView>(d->allocator);
     }
 
-    // Frame semaphore (timeline for frame pacing)
+    // 6. Commit: retire the old state, install the candidate atomically.
+    for (uint32_t i = 0; i < Surface::kMaxSwapchainImages; ++i) {
+        if (s.swapchain_images[i].h != 0) {
+            d->texture_pool.erase(handle_cast<TextureImpl>(s.swapchain_images[i]));
+            s.swapchain_images[i] = {};
+        }
+    }
+    if (s.swapchain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(d->device, s.swapchain, nullptr);
+    }
+    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        if (s.acquire_semaphores[i].h != 0) {
+            d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.acquire_semaphores[i]));
+            s.acquire_semaphores[i] = {};
+        }
+    }
+    for (uint32_t i = 0; i < Surface::kMaxSwapchainImages; ++i) {
+        if (s.present_semaphores[i].h != 0) {
+            d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.present_semaphores[i]));
+            s.present_semaphores[i] = {};
+        }
+    }
+
+    s.swapchain        = candidate;
+    s.image_count      = image_count;
+    s.swapchain_format = bridge(config.format);
+    s.swapchain_extent = extent;
+    for (uint32_t i = 0; i < image_count; ++i) {
+        s.swapchain_images[i] = candidate_textures[i];
+        s.present_semaphores[i] =
+            handle_cast<Semaphore>(d->semaphore_pool.emplace(SemaphoreImpl{.vk_semaphore = candidate_present[i]}));
+    }
+    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        s.acquire_semaphores[i] =
+            handle_cast<Semaphore>(d->semaphore_pool.emplace(SemaphoreImpl{.vk_semaphore = candidate_acquire[i]}));
+    }
     if (s.frame_semaphore.h == 0) {
         s.frame_semaphore = create_semaphore_internal(d, 0);
     }
     s.frame_idx = 0;
-
     return true;
+
+fail_candidate:
+    // Destroy every object created for the failed candidate; the installed
+    // state is untouched.
+    for (uint32_t i = 0; i < created_textures; ++i) {
+        d->texture_pool.erase(handle_cast<TextureImpl>(candidate_textures[i]));
+    }
+    for (uint32_t i = 0; i < image_count; ++i) {
+        if (candidate_present[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(d->device, candidate_present[i], nullptr);
+        }
+    }
+    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        if (candidate_acquire[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(d->device, candidate_acquire[i], nullptr);
+        }
+    }
+    vkDestroySwapchainKHR(d->device, candidate, nullptr);
+    return false;
 }
 
 void unconfigure_surface(Device dev) {
@@ -234,6 +265,10 @@ void unconfigure_surface(Device dev) {
     s.current_image_idx = 0;
     s.image_count       = 0;
     for (uint32_t i = 0; i < Surface::kMaxSwapchainImages; ++i) {
+        if (s.swapchain_images[i].h != 0) {
+            d->texture_pool.erase(handle_cast<TextureImpl>(s.swapchain_images[i]));
+            s.swapchain_images[i] = {};
+        }
         if (s.present_semaphores[i].h != 0) {
             d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.present_semaphores[i]));
             s.present_semaphores[i] = {};

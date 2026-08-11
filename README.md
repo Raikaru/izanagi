@@ -52,6 +52,12 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   Pending → Ready/Failed; `cmd_set_pipeline` returns false for non-Ready
   pipelines so the application explicitly binds a fallback or skips. See
   [docs/PipelineCompilation.md](docs/PipelineCompilation.md).
+- **Explicit GPU lifetime.** `queue_submit` returns a `Submission` token
+  (timeline value published only on success); command pools, buffers,
+  textures, pipelines, and descriptor slots are retired by queue timeline —
+  never by presentation frame counters. `free_after` retires pointer-reachable
+  resources against a submission; command buffers auto-retain the objects they
+  name. See [docs/Architecture.md](docs/Architecture.md).
 
 ## Requirements
 
@@ -155,18 +161,28 @@ Windows-only in v1 (Vulkan 1.4 backend).
 7. Indirect dispatch (`cmd_dispatch_indirect`)
 8. Specialization constants (`kMul` overridden 1 → 5)
 9. Indirect draws — single + multi
-10. `get_texture_size_align` + placed texture creation
-11. Mip-chain + cube-face subresource copies
-12. BC1 block-compressed copy roundtrip
-13. MSAA 4x render + resolve
-14. `cmd_generate_mipmaps` (mip 0 → mip 3 chain)
-15. Pipeline dedup (identical descs share one pipeline; every key field distinct)
-16. Persistent pipeline cache (store/load round-trip + invalid-blob tolerance)
-17. Async pipeline compile (non-blocking proof, in-flight lifetime)
-18. Async Pending/Failed transitions + bind semantics
-19. Async input ownership (caller storage destroyed after request)
-20. Concurrent dedup (4 threads, one record)
-21. Shutdown with queued/compiling work
+10. Mip-chain + cube-face subresource copies
+11. BC1 block-compressed copy roundtrip
+12. MSAA 4x render + resolve
+13. `cmd_generate_mipmaps` (mip 0 → mip 3 chain)
+14. Pipeline dedup (identical descs share one pipeline; every key field distinct)
+15. Persistent pipeline cache (store/load round-trip + invalid-blob tolerance)
+16. Async pipeline compile (non-blocking proof, in-flight lifetime)
+17. Async Pending/Failed transitions + bind semantics
+18. Async input ownership (caller storage destroyed after request)
+19. Concurrent dedup (4 threads, one record)
+20. Shutdown with queued/compiling work
+21. Submission tokens (failure never advances the timeline)
+22. Headless command-pool retirement (2000 submits, no presentation)
+23. `free_after` for buffers/textures/pipelines + view/sampler retirement
+24. Command-buffer texture retention (render after handle free)
+25. Memory alignment + bounds validation + host coherence ops
+26. Descriptor handle encoding (generation, stale rejection) + device limits + depth bias
+
+GPU-independent container/arena tests (`tests/common_tests.cpp`, no Vulkan
+device required): arena alignment/mark-rewind/overflow, nested scopes,
+concurrent per-thread arenas, vector insert/growth/forced-allocation-failure,
+slot generations, bitset bounds, enum bitwise operators.
 
 ## Repository layout
 

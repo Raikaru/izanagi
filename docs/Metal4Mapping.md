@@ -1,9 +1,12 @@
 # Izanagi → Metal 4 API Mapping
 
+This document defines and evaluates the **intended** Metal mapping.
+Implementation and conformance testing against Metal remain future work — the
+Vulkan 1.4 backend is the only implemented backend. Nothing here is proof of
+full portability; treat the Metal columns as design intent.
+
 Every public Izanagi API entry, its Vulkan 1.4 implementation (v1, this repo),
-and the designed Metal 4 mapping. The Metal backend is explicitly **out of scope
-for v1** — this document proves the API ports 1:1 and locks the design
-constraints that Metal imposes on the public surface.
+and the designed Metal 4 mapping.
 
 References: [Understanding the Metal 4 core API](https://developer.apple.com/documentation/metal/understanding-the-metal-4-core-api),
 [MTL4ArgumentTable](https://developer.apple.com/documentation/metal/mtl4argumenttable),
