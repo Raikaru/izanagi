@@ -1,6 +1,7 @@
 #include "platform_utils.h"
 
 #include <cstdlib>
+#include <cstring>
 
 #if _WIN32
 
@@ -299,7 +300,13 @@ void thread_set_low_priority(thread_handle t) {
 }
 
 uintptr_t current_thread_id() {
-    return reinterpret_cast<uintptr_t>(pthread_self());
+    // pthread_t is integral on Linux but a pointer on macOS; copy
+    // representation-agnostically instead of casting.
+    pthread_t t = pthread_self();
+    uintptr_t id = 0;
+    static_assert(sizeof(t) <= sizeof(id), "pthread_t does not fit uintptr_t");
+    std::memcpy(&id, &t, sizeof(t));
+    return id;
 }
 
 double monotonic_seconds() {
