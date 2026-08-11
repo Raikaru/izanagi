@@ -40,7 +40,6 @@ set(IZANAGI_SLANGC "" CACHE FILEPATH "Path to a host slangc executable (empty = 
 # new ones. IZANAGI_PROFILE is the selected profile's advertised name.
 set(IZANAGI_VK_NATIVE_PROFILE_NAME   "IZANAGI_VK_NATIVE_1"   CACHE STRING "Native profile name (version suffix is part of the artifact key)")
 set(IZANAGI_VK_BINDLESS_PROFILE_NAME "IZANAGI_VK_BINDLESS_1" CACHE STRING "Bindless profile name (version suffix is part of the artifact key)")
-set(IZANAGI_PROFILE "${IZANAGI_VK_NATIVE_PROFILE_NAME}" CACHE STRING "Capability profile name")
 
 # Vulkan capability profile: which private mechanism implements the public
 # model. NATIVE = the modern descriptor-heap path (Vulkan 1.4 + descriptor
@@ -49,18 +48,27 @@ set(IZANAGI_PROFILE "${IZANAGI_VK_NATIVE_PROFILE_NAME}" CACHE STRING "Capability
 set(IZANAGI_VK_PROFILE "NATIVE" CACHE STRING "Vulkan capability profile: NATIVE | BINDLESS")
 set_property(CACHE IZANAGI_VK_PROFILE PROPERTY STRINGS NATIVE BINDLESS)
 
+# IZANAGI_PROFILE (the advertised profile name) is derived from the selected
+# VK profile and self-heals stale cache values; the name MUST match the
+# selected profile because it is part of the artifact identity.
+if(IZANAGI_VK_PROFILE STREQUAL "BINDLESS")
+    if(NOT IZANAGI_PROFILE MATCHES "^IZANAGI_VK_BINDLESS_")
+        set(IZANAGI_PROFILE "${IZANAGI_VK_BINDLESS_PROFILE_NAME}" CACHE STRING "Capability profile name" FORCE)
+    endif()
+else()
+    if(NOT IZANAGI_PROFILE MATCHES "^IZANAGI_VK_NATIVE_")
+        set(IZANAGI_PROFILE "${IZANAGI_VK_NATIVE_PROFILE_NAME}" CACHE STRING "Capability profile name" FORCE)
+    endif()
+endif()
+
 if(NOT IZANAGI_BACKEND STREQUAL "VULKAN_NATIVE")
     message(FATAL_ERROR
         "IZANAGI_BACKEND=${IZANAGI_BACKEND} is not implemented yet. This phase "
         "ships the portable build boundary; VULKAN_COMPAT and METAL backends land "
         "in later phases. Supported now: VULKAN_NATIVE.")
 endif()
-if(NOT IZANAGI_VK_PROFILE STREQUAL "NATIVE")
-    message(FATAL_ERROR
-        "IZANAGI_VK_PROFILE=${IZANAGI_VK_PROFILE} is declared but its backend is "
-        "not implemented yet. The BINDLESS compatibility profile (descriptor "
-        "indexing arrays + typed physical pointers) lands in its own phases. "
-        "Supported now: NATIVE.")
+if(NOT IZANAGI_VK_PROFILE STREQUAL "NATIVE" AND NOT IZANAGI_VK_PROFILE STREQUAL "BINDLESS")
+    message(FATAL_ERROR "IZANAGI_VK_PROFILE=${IZANAGI_VK_PROFILE} is not a valid profile")
 endif()
 
 # Resolve AUTO WSI per host.

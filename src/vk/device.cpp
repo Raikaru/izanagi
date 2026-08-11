@@ -1,5 +1,7 @@
 // device.cpp — instance/device creation, features, descriptor heap, memory, queues.
 
+#include <algorithm>
+
 #include "internal.h"
 
 #include <cstdio>
@@ -10,16 +12,33 @@ namespace gpu {
 // --- Required device extensions ---------------------------------------------------
 // VK_KHR_SWAPCHAIN is required only when a surface-capable WSI is selected;
 // headless builds never request it.
-static const char* kRequiredDeviceExtensions[] = {
+#if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
+#    define IZ_REQUIRE_SWAPCHAIN 1
+#else
+#    define IZ_REQUIRE_SWAPCHAIN 0
+#endif
+#if defined(IZ_VK_PROFILE_BINDLESS)
+#    define IZ_REQUIRE_HEAP_TRIO 0
+#else
+#    define IZ_REQUIRE_HEAP_TRIO 1
+#endif
+// Sized to the max possible count (+1 keeps the array well-formed even when a
+// configuration requires nothing, e.g. bindless + headless); the count is the
+// macro expression, so the extension loop only checks what is required.
+static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + 1] = {
 #if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 #endif
+    // The descriptor-heap trio is native-profile-only; the bindless profile
+    // uses descriptor-indexing arrays (core 1.2+).
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
     VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
     VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
+#endif
 };
 static constexpr size_t kRequiredDeviceExtensionsCount =
-    sizeof(kRequiredDeviceExtensions) / sizeof(kRequiredDeviceExtensions[0]);
+    IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3;
 
 // --- Logging -------------------------------------------------------------------------
 static void null_log_callback(LogLevel, Span<const char>, uint32_t, Span<const char>, void*) {}
@@ -117,7 +136,14 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
         .applicationVersion = 0,
         .pEngineName        = "izanagi",
         .engineVersion      = 0,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // Initial bindless slice targets Vulkan 1.3+ (dynamic rendering +
+        // synchronization2 are 1.3 cores; the legacy fallbacks that enable
+        // 1.2 devices land in a later phase).
+        .apiVersion         = VK_API_VERSION_1_3,
+#else
         .apiVersion         = VK_API_VERSION_1_4,
+#endif
     };
 
     // WSI extensions are enabled only when a surface-capable WSI is selected;
@@ -195,8 +221,14 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
 
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // Bindless initial slice: Vulkan 1.3+ (exact feature gate in
+        // create_device, below).
+        if (props.apiVersion < VK_API_VERSION_1_3) { continue; }
+#else
         // Require Vulkan 1.4
         if (props.apiVersion < VK_API_VERSION_1_4) { continue; }
+#endif
 
         // Find graphics+compute queue family
         uint32_t family_count = 0;
@@ -267,6 +299,7 @@ static VkResult create_logical_device(DeviceImpl* d) {
     };
 
     // Feature chain — query first, then enable
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     VkPhysicalDeviceDescriptorHeapFeaturesEXT desc_heap_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT,
     };
@@ -282,9 +315,12 @@ static VkResult create_logical_device(DeviceImpl* d) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
         .pNext = &unified_layouts_features,
     };
+#endif
     VkPhysicalDeviceVulkan13Features vulkan13_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+#if !defined(IZ_VK_PROFILE_BINDLESS)
         .pNext = &vulkan14_features,
+#endif
     };
     VkPhysicalDeviceVulkan12Features vulkan12_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -327,6 +363,29 @@ static VkResult create_logical_device(DeviceImpl* d) {
     vulkan12_features.scalarBlockLayout       = VK_TRUE;
     vulkan12_features.drawIndirectCount       = VK_TRUE;
     vulkan12_features.storagePushConstant8    = VK_TRUE;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // Bindless: descriptor-indexing arrays ARE the global heap. Enable the
+    // exact bits the global-set model needs; unsupported bits were already
+    // rejected by the bindless gate in create_device.
+    auto enable_if_supported = [](VkBool32 supported) { return supported == VK_TRUE ? VK_TRUE : VK_FALSE; };
+    vulkan12_features.descriptorIndexing = enable_if_supported(vulkan12_features.descriptorIndexing);
+    vulkan12_features.shaderSampledImageArrayNonUniformIndexing =
+        enable_if_supported(vulkan12_features.shaderSampledImageArrayNonUniformIndexing);
+    vulkan12_features.shaderStorageImageArrayNonUniformIndexing =
+        enable_if_supported(vulkan12_features.shaderStorageImageArrayNonUniformIndexing);
+    vulkan12_features.runtimeDescriptorArray =
+        enable_if_supported(vulkan12_features.runtimeDescriptorArray);
+    vulkan12_features.descriptorBindingPartiallyBound =
+        enable_if_supported(vulkan12_features.descriptorBindingPartiallyBound);
+    vulkan12_features.descriptorBindingSampledImageUpdateAfterBind =
+        enable_if_supported(vulkan12_features.descriptorBindingSampledImageUpdateAfterBind);
+    vulkan12_features.descriptorBindingStorageImageUpdateAfterBind =
+        enable_if_supported(vulkan12_features.descriptorBindingStorageImageUpdateAfterBind);
+    // REQUIRED by the initial one-set implementation (no snapshot path yet):
+    // updates while submissions are pending must be legal.
+    vulkan12_features.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    vulkan12_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
+#else
     // Clear descriptor-indexing bits — descriptor_heap replaces them
     vulkan12_features.descriptorIndexing      = VK_FALSE;
     vulkan12_features.runtimeDescriptorArray  = VK_FALSE;
@@ -337,6 +396,7 @@ static VkResult create_logical_device(DeviceImpl* d) {
     vulkan12_features.descriptorBindingStorageBufferUpdateAfterBind = VK_FALSE;
     vulkan12_features.descriptorBindingUniformBufferUpdateAfterBind = VK_FALSE;
     vulkan12_features.descriptorBindingUpdateUnusedWhilePending = VK_FALSE;
+#endif
 
     vulkan13_features.dynamicRendering = VK_TRUE;
     vulkan13_features.synchronization2 = VK_TRUE;
@@ -348,12 +408,14 @@ static VkResult create_logical_device(DeviceImpl* d) {
         vulkan13_features.pipelineCreationCacheControl = VK_TRUE;
     }
 
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     vulkan14_features.maintenance5 = VK_TRUE;
     vulkan14_features.maintenance6 = VK_TRUE;
 
     desc_heap_features.descriptorHeap             = VK_TRUE;
     untyped_ptr_features.shaderUntypedPointers    = VK_TRUE;
     unified_layouts_features.unifiedImageLayouts  = VK_TRUE;
+#endif
 
     const VkDeviceCreateInfo create_info{
         .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -374,6 +436,21 @@ static VkResult create_logical_device(DeviceImpl* d) {
     volkLoadDevice(d->device);
 
     // Verify critical features were enabled
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    if (!vulkan12_features.bufferDeviceAddress || !vulkan12_features.timelineSemaphore ||
+        !vulkan12_features.scalarBlockLayout || !vulkan12_features.drawIndirectCount ||
+        !vulkan12_features.descriptorIndexing || !vulkan12_features.runtimeDescriptorArray ||
+        !vulkan12_features.descriptorBindingPartiallyBound ||
+        !vulkan12_features.descriptorBindingSampledImageUpdateAfterBind ||
+        !vulkan12_features.descriptorBindingStorageImageUpdateAfterBind ||
+        !vulkan12_features.descriptorBindingUpdateUnusedWhilePending ||
+        !vulkan12_features.shaderSampledImageArrayNonUniformIndexing ||
+        !vulkan12_features.shaderStorageImageArrayNonUniformIndexing ||
+        !device_features.features.shaderInt64) {
+        IZ_LOG(d, LogLevel::Error, "bindless profile: required feature not enabled");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+#else
     if (!desc_heap_features.descriptorHeap) {
         IZ_LOG(d, LogLevel::Error, "VK_EXT_descriptor_heap feature not enabled");
         return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -386,6 +463,7 @@ static VkResult create_logical_device(DeviceImpl* d) {
         IZ_LOG(d, LogLevel::Error, "VK_KHR_unified_image_layouts feature not enabled");
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
+#endif
 
     return VK_SUCCESS;
 }
@@ -397,8 +475,14 @@ static VkResult create_vma_allocator(DeviceImpl* d) {
     vulkan_functions.vkGetDeviceProcAddr   = vkGetDeviceProcAddr;
 
     VmaAllocatorCreateInfo create_info{
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // Bindless slice: 1.3 device, no maintenance5 (VMA must not use
+        // 1.4-only paths).
+        .flags                       = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+#else
         .flags                       = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
                                         VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT,
+#endif
         .physicalDevice              = d->physical_device,
         .device                      = d->device,
         .preferredLargeHeapBlockSize = 0,
@@ -407,7 +491,11 @@ static VkResult create_vma_allocator(DeviceImpl* d) {
         .pHeapSizeLimit              = nullptr,
         .pVulkanFunctions            = &vulkan_functions,
         .instance                    = d->instance,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .vulkanApiVersion            = VK_API_VERSION_1_3,
+#else
         .vulkanApiVersion            = VK_API_VERSION_1_4,
+#endif
         .pTypeExternalMemoryHandleTypes = nullptr,
     };
 
@@ -415,6 +503,178 @@ static VkResult create_vma_allocator(DeviceImpl* d) {
 }
 
 // --- Descriptor heap creation ---------------------------------------------------------------
+#if defined(IZ_VK_PROFILE_BINDLESS)
+// Bindless profile: one long-lived update-after-bind descriptor set holding
+// the global arrays (binding 0 sampled, 1 storage, 2 samplers) + one shared
+// pipeline layout (set 0 + 16-byte push constants). The slot allocators /
+// generations / state machines are SHARED with the native profile — only the
+// descriptor WRITE target differs.
+static VkResult create_bindless_descriptor_sets(DeviceImpl* d) {
+    VkPhysicalDeviceDescriptorIndexingProperties indexing_props{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES,
+        .pNext = nullptr,
+    };
+    VkPhysicalDeviceProperties2 props2{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &indexing_props,
+    };
+    vkGetPhysicalDeviceProperties2(d->physical_device, &props2);
+
+    uint32_t combined = std::min(indexing_props.maxPerStageUpdateAfterBindResources,
+                                 indexing_props.maxUpdateAfterBindDescriptorsInAllPools);
+    const bool unlimited = combined == 0xFFFFFFFFu;
+    auto cap = [&](uint32_t per_stage, uint32_t per_set, uint32_t max_public) {
+        uint32_t c = std::min({per_stage, per_set, max_public});
+        if (!unlimited && c > combined) { c = combined; }
+        return c;
+    };
+    uint32_t sampled = cap(indexing_props.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                           indexing_props.maxDescriptorSetUpdateAfterBindSampledImages,
+                           kMaxSampledTextures);
+    uint32_t storage = cap(indexing_props.maxPerStageDescriptorUpdateAfterBindStorageImages,
+                           indexing_props.maxDescriptorSetUpdateAfterBindStorageImages,
+                           kMaxStorageTextures);
+    uint32_t sampler = cap(indexing_props.maxPerStageDescriptorUpdateAfterBindSamplers,
+                           indexing_props.maxDescriptorSetUpdateAfterBindSamplers,
+                           kMaxSamplers);
+    // The three arrays share the combined budget; scale proportionally when
+    // they do not fit (keeping the profile floors where possible).
+    uint64_t total = uint64_t(sampled) + storage + sampler;
+    if (!unlimited && total > combined) {
+        auto scale = [&](uint32_t& v, uint32_t floor) {
+            uint64_t nv = uint64_t(v) * combined / total;
+            if (nv < floor) { nv = floor; }
+            v = static_cast<uint32_t>(nv);
+        };
+        scale(sampled, kMinBindlessSampledImages);
+        scale(storage, kMinBindlessStorageImages);
+        scale(sampler, kMinBindlessSamplers);
+        if (uint64_t(sampled) + storage + sampler > combined) {
+            IZ_LOG(d, LogLevel::Error, "bindless: combined descriptor budget too small for the profile floors");
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+    }
+    d->bindless_sampled_capacity = sampled;
+    d->bindless_storage_capacity = storage;
+    d->bindless_sampler_capacity = sampler;
+
+    // Slot allocators sized for the bindless capacities (shared with native).
+    d->sampled_bitset = TwoLevelBitset(d->allocator, sampled);
+    d->storage_bitset = TwoLevelBitset(d->allocator, storage);
+    d->sampler_bitset = TwoLevelBitset(d->allocator, sampler);
+    d->sampled_gen   = Vector<uint16_t>(d->allocator, 0, sampled);
+    d->storage_gen   = Vector<uint16_t>(d->allocator, 0, storage);
+    d->sampler_gen   = Vector<uint16_t>(d->allocator, 0, sampler);
+    d->sampled_state = Vector<uint8_t>(d->allocator, 0, sampled);
+    d->storage_state = Vector<uint8_t>(d->allocator, 0, storage);
+    d->sampler_state = Vector<uint8_t>(d->allocator, 0, sampler);
+    d->sampled_owner = Vector<TextureImpl*>(d->allocator, nullptr, sampled);
+    d->storage_owner = Vector<TextureImpl*>(d->allocator, nullptr, storage);
+    // Reserve descriptor index zero as the null descriptor (0 is never a
+    // valid view/sampler handle) — same rule as the native heap.
+    d->sampled_bitset.set_leading_zero();
+    d->storage_bitset.set_leading_zero();
+    d->sampler_bitset.set_leading_zero();
+
+    const VkDescriptorSetLayoutBinding bindings[3] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampled, VK_SHADER_STAGE_ALL, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storage, VK_SHADER_STAGE_ALL, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLER, sampler, VK_SHADER_STAGE_ALL, nullptr},
+    };
+    // UPDATE_UNUSED_WHILE_PENDING makes updating any slot of the one global
+    // set legal while submissions using it are pending — the feature is
+    // gated at device creation (no snapshot path in this slice yet).
+    const VkDescriptorBindingFlags binding_flags[3] = {
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+            VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT,
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+            VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT,
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+            VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT |
+            VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
+    };
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+        .pNext         = nullptr,
+        .bindingCount  = 3,
+        .pBindingFlags = binding_flags,
+    };
+    VkDescriptorSetLayoutCreateInfo layout_info{
+        .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext        = &flags_info,
+        .flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
+        .bindingCount = 3,
+        .pBindings    = bindings,
+    };
+    if (!IZ_CHK(d, vkCreateDescriptorSetLayout(d->device, &layout_info, nullptr, &d->bindless_set_layout),
+                "bindless: vkCreateDescriptorSetLayout failed")) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    const VkDescriptorPoolSize pool_sizes[3] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampled},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storage},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, sampler},
+    };
+    VkDescriptorPoolCreateInfo pool_info{
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext         = nullptr,
+        .flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
+        .maxSets       = 1,
+        .poolSizeCount = 3,
+        .pPoolSizes    = pool_sizes,
+    };
+    if (!IZ_CHK(d, vkCreateDescriptorPool(d->device, &pool_info, nullptr, &d->bindless_pool),
+                "bindless: vkCreateDescriptorPool failed")) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // Binding 2 is a runtime (variable-count) descriptor array.
+    uint32_t variable_counts[1] = {sampler};
+    VkDescriptorSetVariableDescriptorCountAllocateInfo variable_info{
+        .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
+        .pNext              = nullptr,
+        .descriptorSetCount = 1,
+        .pDescriptorCounts  = variable_counts,
+    };
+    VkDescriptorSetAllocateInfo set_info{
+        .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext              = &variable_info,
+        .descriptorPool     = d->bindless_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts        = &d->bindless_set_layout,
+    };
+    if (!IZ_CHK(d, vkAllocateDescriptorSets(d->device, &set_info, &d->bindless_set),
+                "bindless: vkAllocateDescriptorSets failed")) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    const VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                      VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size   = 16,
+    };
+    VkPipelineLayoutCreateInfo pipeline_layout_info{
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext                  = nullptr,
+        .flags                  = 0,
+        .setLayoutCount         = 1,
+        .pSetLayouts            = &d->bindless_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &push_range,
+    };
+    if (!IZ_CHK(d, vkCreatePipelineLayout(d->device, &pipeline_layout_info, nullptr, &d->bindless_pipeline_layout),
+                "bindless: vkCreatePipelineLayout failed")) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    d->bindless_sampled_views   = Vector<VkImageView>(d->allocator, VK_NULL_HANDLE, sampled);
+    d->bindless_storage_views   = Vector<VkImageView>(d->allocator, VK_NULL_HANDLE, storage);
+    d->bindless_sampler_handles = Vector<VkSampler>(d->allocator, VK_NULL_HANDLE, sampler);
+    return VK_SUCCESS;
+}
+#else
 static VkResult create_descriptor_heap(DeviceImpl* d) {
     // Query heap properties
     VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_props{
@@ -571,6 +831,9 @@ static VkResult create_descriptor_heap(DeviceImpl* d) {
 }
 
 // --- Debug messenger -------------------------------------------------------------------------
+#endif  // !IZ_VK_PROFILE_BINDLESS (create_descriptor_heap)
+
+// --- Debug messenger callback (profile-neutral) ------------------------------------------------
 static VkBool32 debug_messenger_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                           VkDebugUtilsMessageTypeFlagsEXT,
                                           const VkDebugUtilsMessengerCallbackDataEXT* data,
@@ -634,10 +897,46 @@ Device create_device(const DeviceDesc& desc) {
 
     result = select_physical_device(d, desc.gpu_preference);
     if (result != VK_SUCCESS) {
-        log_vk_impl(d, result, "Failed to select physical device (need Vulkan 1.4 + descriptor_heap)", __LINE__, "device.cpp"_sv);
+        log_vk_impl(d, result, "Failed to select physical device", __LINE__, "device.cpp"_sv);
         goto fail;
     }
-
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // Capability gate: the bindless profile is decided by exact feature bits
+    // and limits, never by version or generation. Unsupported devices fail
+    // with the complete missing-requirement list.
+    {
+        VulkanProfileReport report = evaluate_vulkan_bindless_profile(query_vulkan_profile_features(d));
+        if (!report.supported) {
+            for (uint32_t i = 0; i < report.missing_count; ++i) {
+                const char* name = vulkan_requirement_name(report.missing[i]);
+                IZ_LOG(d, LogLevel::Error, "bindless profile missing requirement:");
+                log_impl(d, LogLevel::Error, Span<const char>(name, strlen(name)),
+                         __LINE__, "device.cpp"_sv);
+            }
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto fail;
+        }
+        // Temporary initial-slice gates (removed when the fallbacks land):
+        // one descriptor set (no snapshot path) requires
+        // update-unused-while-pending; the private render-pass / legacy
+        // barrier paths are not implemented yet, so dynamic rendering +
+        // synchronization2 are required (Vulkan 1.3 cores).
+        if (report.descriptor_snapshots != 1) {
+            IZ_LOG(d, LogLevel::Error,
+                   "bindless: initial implementation requires descriptorBindingUpdateUnusedWhilePending "
+                   "(the snapshot path lands in the descriptor-update phase)");
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto fail;
+        }
+        if (!report.dynamic_rendering || !report.synchronization2) {
+            IZ_LOG(d, LogLevel::Error,
+                   "bindless: initial implementation requires dynamic rendering + synchronization2 "
+                   "(the private render-pass / legacy-barrier paths land in the command phase)");
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto fail;
+        }
+    }
+#endif
     result = create_logical_device(d);
     if (result != VK_SUCCESS) {
         log_vk_impl(d, result, "Failed to create logical device", __LINE__, "device.cpp"_sv);
@@ -667,7 +966,11 @@ Device create_device(const DeviceDesc& desc) {
         goto fail;
     }
 
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    result = create_bindless_descriptor_sets(d);
+#else
     result = create_descriptor_heap(d);
+#endif
     if (result != VK_SUCCESS) {
         log_vk_impl(d, result, "Failed to create descriptor heap", __LINE__, "device.cpp"_sv);
         goto fail;
@@ -879,11 +1182,32 @@ void destroy_device(Device dev) {
 
     // Destroy pools (destructors call the registered destructors)
     d->buffer_pool.clear();
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // The descriptor-sidecar VkImageViews reference the texture images: they
+    // must be destroyed BEFORE the texture pool clears those images.
+    for (VkImageView v : d->bindless_sampled_views) {
+        if (v != VK_NULL_HANDLE) { vkDestroyImageView(d->device, v, nullptr); }
+    }
+    d->bindless_sampled_views.clear();
+    for (VkImageView v : d->bindless_storage_views) {
+        if (v != VK_NULL_HANDLE) { vkDestroyImageView(d->device, v, nullptr); }
+    }
+    d->bindless_storage_views.clear();
+    for (VkSampler smp : d->bindless_sampler_handles) {
+        if (smp != VK_NULL_HANDLE) { vkDestroySampler(d->device, smp, nullptr); }
+    }
+    d->bindless_sampler_handles.clear();
+#endif
     d->texture_pool.clear();
     d->semaphore_pool.clear();
     d->pipeline_pool.clear();
     d->depth_stencil_pool.clear();
 
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    if (d->bindless_pool != VK_NULL_HANDLE) { vkDestroyDescriptorPool(d->device, d->bindless_pool, nullptr); }
+    if (d->bindless_set_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(d->device, d->bindless_set_layout, nullptr); }
+    if (d->bindless_pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(d->device, d->bindless_pipeline_layout, nullptr); }
+#else
     // Destroy descriptor heap buffers
     if (d->heap.sampler_buffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(d->vma, d->heap.sampler_buffer, d->heap.sampler_allocation);
@@ -891,6 +1215,7 @@ void destroy_device(Device dev) {
     if (d->heap.resource_buffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(d->vma, d->heap.resource_buffer, d->heap.resource_allocation);
     }
+#endif
 
     if (d->vma != VK_NULL_HANDLE) { vmaDestroyAllocator(d->vma); }
     // Device before messenger: vkDestroyDevice's own lifetime VUIDs still
@@ -926,10 +1251,19 @@ BackendProfile device_backend_profile() {
 
 DeviceLimits device_limits(Device dev) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    uint32_t sampled = d->bindless_sampled_capacity;
+    uint32_t storage = d->bindless_storage_capacity;
+    uint32_t sampler = d->bindless_sampler_capacity;
+#else
+    uint32_t sampled = d->heap.sampled_capacity;
+    uint32_t storage = d->heap.storage_capacity;
+    uint32_t sampler = d->heap.sampler_capacity;
+#endif
     return DeviceLimits{
-        .max_sampled_textures = d->heap.sampled_capacity,
-        .max_storage_textures = d->heap.storage_capacity,
-        .max_samplers         = d->heap.sampler_capacity,
+        .max_sampled_textures = sampled,
+        .max_storage_textures = storage,
+        .max_samplers         = sampler,
         .min_uniform_alignment = d->min_uniform_alignment,
         .min_storage_alignment = d->min_storage_alignment,
         .non_coherent_atom_size = d->non_coherent_atom_size,

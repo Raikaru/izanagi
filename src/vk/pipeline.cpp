@@ -306,33 +306,76 @@ static VkResult compile_compute(DeviceImpl* d, Arena* arena, PipelineRecord* rec
         .codeSize = rec->vs_size,
         .pCode    = reinterpret_cast<const uint32_t*>(rec->vs_bytes),
     };
+    // maintenance5 lets the stage reference shader code directly via pNext
+    // (module = VK_NULL_HANDLE) — native profile only. The bindless profile
+    // (1.3) creates a real VkShaderModule and destroys it after creation.
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    VkShaderModule shader_module = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateShaderModule(d->device, &module_info, nullptr, &shader_module),
+                "compile_compute: vkCreateShaderModule failed")) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+#endif
     VkPipelineShaderStageCreateInfo stage{
         .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .pNext               = nullptr,
+#else
         .pNext               = &module_info,
+#endif
         .flags               = 0,
         .stage               = VK_SHADER_STAGE_COMPUTE_BIT,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .module              = shader_module,
+#else
         .module              = VK_NULL_HANDLE,
+#endif
         .pName               = rec->vs_entry,
         .pSpecializationInfo = &spec,
     };
 
+    // flags2 (VK_PIPELINE_CREATE_FLAGS_2_*) requires maintenance5 / Vulkan
+    // 1.4 — native profile only. The bindless profile (1.3) uses the legacy
+    // create flags + direct pNext.
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     VkPipelineCreateFlags2CreateInfo flags2{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
                  (fail_on_compile ? VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0),
     };
+#endif
     VkComputePipelineCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .pNext = nullptr,
+        .flags = static_cast<VkPipelineCreateFlags>(fail_on_compile
+                                                       ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT
+                                                       : 0),
+#else
         .pNext = &flags2,
         .flags = 0,
+#endif
         .stage = stage,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .layout             = d->bindless_pipeline_layout,
+#else
         .layout             = VK_NULL_HANDLE,
+#endif
         .basePipelineHandle = VK_NULL_HANDLE,
         .basePipelineIndex  = 0,
     };
-    if (arena->overflowed()) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
-    return vkCreateComputePipelines(d->device, d->vk_pipeline_cache, 1, &info, nullptr, out);
+    if (arena->overflowed()) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        vkDestroyShaderModule(d->device, shader_module, nullptr);
+#endif
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    VkResult result = vkCreateComputePipelines(d->device, d->vk_pipeline_cache, 1, &info, nullptr, out);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    vkDestroyShaderModule(d->device, shader_module, nullptr);
+#endif
+    return result;
 }
 
 static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
@@ -353,22 +396,50 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .codeSize = rec->fs_size,
         .pCode    = reinterpret_cast<const uint32_t*>(rec->fs_bytes),
     };
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // 1.3/no maintenance5: real shader modules, destroyed after creation.
+    VkShaderModule vert_module = VK_NULL_HANDLE;
+    VkShaderModule frag_module = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateShaderModule(d->device, &vert_module_info, nullptr, &vert_module),
+                "compile_graphics: vkCreateShaderModule(vert) failed") ||
+        !IZ_CHK(d, vkCreateShaderModule(d->device, &frag_module_info, nullptr, &frag_module),
+                "compile_graphics: vkCreateShaderModule(frag) failed")) {
+        if (vert_module != VK_NULL_HANDLE) { vkDestroyShaderModule(d->device, vert_module, nullptr); }
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+#endif
     VkPipelineShaderStageCreateInfo stages[] = {
         {
             .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+            .pNext               = nullptr,
+#else
             .pNext               = &vert_module_info,
+#endif
             .flags               = 0,
             .stage               = VK_SHADER_STAGE_VERTEX_BIT,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+            .module              = vert_module,
+#else
             .module              = VK_NULL_HANDLE,
+#endif
             .pName               = rec->vs_entry,
             .pSpecializationInfo = &spec,
         },
         {
             .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+            .pNext               = nullptr,
+#else
             .pNext               = &frag_module_info,
+#endif
             .flags               = 0,
             .stage               = VK_SHADER_STAGE_FRAGMENT_BIT,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+            .module              = frag_module,
+#else
             .module              = VK_NULL_HANDLE,
+#endif
             .pName               = rec->fs_entry,
             .pSpecializationInfo = &spec,
         },
@@ -510,17 +581,26 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .stencilAttachmentFormat = stencil_format,
     };
 
+#if !defined(IZ_VK_PROFILE_BINDLESS)
     VkPipelineCreateFlags2CreateInfo flags2{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
         .pNext = &rendering_info,
         .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
                  (fail_on_compile ? VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0),
     };
+#endif
 
     VkGraphicsPipelineCreateInfo create_info{
         .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .pNext               = &rendering_info,
+        .flags               = static_cast<VkPipelineCreateFlags>(fail_on_compile
+                                                                     ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT
+                                                                     : 0),
+#else
         .pNext               = &flags2,
         .flags               = 0,
+#endif
         .stageCount          = 2,
         .pStages             = stages,
         .pVertexInputState   = &vertex_input_state,
@@ -532,14 +612,29 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .pDepthStencilState  = nullptr,
         .pColorBlendState    = &color_blend_state,
         .pDynamicState       = &dynamic_state,
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        .layout              = d->bindless_pipeline_layout,
+#else
         .layout              = VK_NULL_HANDLE,
+#endif
         .renderPass          = VK_NULL_HANDLE,
         .subpass             = 0,
         .basePipelineHandle  = VK_NULL_HANDLE,
         .basePipelineIndex   = 0,
     };
-    if (arena->overflowed()) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
-    return vkCreateGraphicsPipelines(d->device, d->vk_pipeline_cache, 1, &create_info, nullptr, out);
+    if (arena->overflowed()) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        vkDestroyShaderModule(d->device, vert_module, nullptr);
+        vkDestroyShaderModule(d->device, frag_module, nullptr);
+#endif
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    VkResult result = vkCreateGraphicsPipelines(d->device, d->vk_pipeline_cache, 1, &create_info, nullptr, out);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    vkDestroyShaderModule(d->device, vert_module, nullptr);
+    vkDestroyShaderModule(d->device, frag_module, nullptr);
+#endif
+    return result;
 }
 
 static VkResult compile_record(DeviceImpl* d, Arena* arena, PipelineRecord* rec,

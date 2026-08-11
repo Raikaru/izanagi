@@ -10,6 +10,14 @@ namespace gpu {
 // --- Descriptor heap binding ---------------------------------------------------------
 
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // One global descriptor set bound to both bind points at recording start;
+    // every pipeline shares the same private pipeline layout.
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->bindless_pipeline_layout,
+                            0, 1, &d->bindless_set, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d->bindless_pipeline_layout,
+                            0, 1, &d->bindless_set, 0, nullptr);
+#else
     const VkBindHeapInfoEXT sampler_bind{
         .sType               = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
         .pNext               = nullptr,
@@ -26,6 +34,7 @@ void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
     };
     vkCmdBindSamplerHeapEXT(cmd, &sampler_bind);
     vkCmdBindResourceHeapEXT(cmd, &resource_bind);
+#endif
 }
 
 // --- Command pool management -----------------------------------------------------------
@@ -680,6 +689,10 @@ uint64_t debug_queue_timeline(DeviceImpl* d) {
     return d->default_queue ? d->default_queue->timeline_value : 0;
 }
 
+bool debug_validation_active(DeviceImpl* d) {
+    return d->enable_validation && d->debug_messenger != VK_NULL_HANDLE;
+}
+
 int64_t debug_pool_resets(DeviceImpl* d) {
     return atomic_load(&d->stat_pool_resets);
 }
@@ -957,8 +970,13 @@ void cmd_set_cull_mode(CommandBuffer cmd, Cull cull) {
 
 // --- Push data (root arguments) ------------------------------------------------------
 
-static void push_compute_ptr(VkCommandBuffer buf, GpuPtr dataGpu) {
+static void push_compute_ptr(DeviceImpl* d, VkCommandBuffer buf, GpuPtr dataGpu) {
     if (dataGpu != 0) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // Root pointer via ordinary push constants (private pipeline layout).
+        vkCmdPushConstants(buf, d->bindless_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(GpuPtr), &dataGpu);
+#else
         VkPushDataInfoEXT push_info{
             .sType  = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
             .pNext  = nullptr,
@@ -966,11 +984,18 @@ static void push_compute_ptr(VkCommandBuffer buf, GpuPtr dataGpu) {
             .data   = {.address = &dataGpu, .size = sizeof(VkDeviceAddress)},
         };
         vkCmdPushDataEXT(buf, &push_info);
+#endif
     }
 }
 
-static void push_graphics_ptrs(VkCommandBuffer buf, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu) {
+static void push_graphics_ptrs(DeviceImpl* d, VkCommandBuffer buf, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu) {
     if (vertexDataGpu != 0 || fragmentDataGpu != 0) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        VkDeviceAddress addresses[] = {vertexDataGpu, fragmentDataGpu};
+        vkCmdPushConstants(buf, d->bindless_pipeline_layout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, 2 * sizeof(VkDeviceAddress), addresses);
+#else
         VkDeviceAddress addresses[] = {vertexDataGpu, fragmentDataGpu};
         VkPushDataInfoEXT push_info{
             .sType  = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
@@ -979,12 +1004,13 @@ static void push_graphics_ptrs(VkCommandBuffer buf, GpuPtr vertexDataGpu, GpuPtr
             .data   = {.address = addresses, .size = 2 * sizeof(VkDeviceAddress)},
         };
         vkCmdPushDataEXT(buf, &push_info);
+#endif
     }
 }
 
 void cmd_dispatch(CommandBuffer cmd, GpuPtr dataGpu, const Dimension3D& gridDimensions) {
     retain_buffer(cmd, dataGpu);
-    push_compute_ptr(cmd->buffer, dataGpu);
+    push_compute_ptr(cmd->device, cmd->buffer, dataGpu);
     vkCmdDispatch(cmd->buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
@@ -993,7 +1019,7 @@ void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensi
     retain_buffer(cmd, dataGpu);
     retain_buffer(cmd, gridDimensionsGpu);
     auto dim = buffer_and_offset_from_ptr(d, gridDimensionsGpu);
-    push_compute_ptr(cmd->buffer, dataGpu);
+    push_compute_ptr(cmd->device, cmd->buffer, dataGpu);
     vkCmdDispatchIndirect(cmd->buffer, dim.buffer, dim.offset);
 }
 
@@ -1176,7 +1202,7 @@ void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
               uint32_t vertexCount, uint32_t instanceCount) {
     retain_buffer(cmd, vertexDataGpu);
     retain_buffer(cmd, fragmentDataGpu);
-    push_graphics_ptrs(cmd->buffer, vertexDataGpu, fragmentDataGpu);
+    push_graphics_ptrs(cmd->device, cmd->buffer, vertexDataGpu, fragmentDataGpu);
     vkCmdDraw(cmd->buffer, vertexCount, instanceCount, 0, 0);
 }
 
@@ -1185,11 +1211,16 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
     retain_buffer(cmd, args.vertexDataGpu);
     retain_buffer(cmd, args.fragmentDataGpu);
     retain_buffer(cmd, args.indicesGpu);
-    push_graphics_ptrs(cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
+    push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
         const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // 1.3/no maintenance5: legacy index buffer bind (64-bit offset).
+        vkCmdBindIndexBuffer(cmd->buffer, indices.buffer, indices.offset, bridge(args.type));
+#else
         vkCmdBindIndexBuffer2(cmd->buffer, indices.buffer, indices.offset,
                               VK_WHOLE_SIZE, bridge(args.type));
+#endif
         cmd->current_idx_buffer = args.indicesGpu;
     }
     vkCmdDrawIndexed(cmd->buffer, args.indexCount, args.instanceCount, 0, 0, 0);
@@ -1201,11 +1232,16 @@ void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedInd
     retain_buffer(cmd, args.fragmentDataGpu);
     retain_buffer(cmd, args.indicesGpu);
     retain_buffer(cmd, args.argsGpu);
-    push_graphics_ptrs(cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
+    push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
         const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // 1.3/no maintenance5: legacy index buffer bind (64-bit offset).
+        vkCmdBindIndexBuffer(cmd->buffer, indices.buffer, indices.offset, bridge(args.type));
+#else
         vkCmdBindIndexBuffer2(cmd->buffer, indices.buffer, indices.offset,
                               VK_WHOLE_SIZE, bridge(args.type));
+#endif
         cmd->current_idx_buffer = args.indicesGpu;
     }
     const auto gpu_args = buffer_and_offset_from_ptr(d, args.argsGpu);
@@ -1220,11 +1256,16 @@ void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer cmd, const MultiDra
     retain_buffer(cmd, args.indicesGpu);
     retain_buffer(cmd, args.argsGpu);
     retain_buffer(cmd, args.drawCountGpu);
-    push_graphics_ptrs(cmd->buffer, args.vertexDataGpu, args.pixelDataGpu);
+    push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.pixelDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
         const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // 1.3/no maintenance5: legacy index buffer bind (64-bit offset).
+        vkCmdBindIndexBuffer(cmd->buffer, indices.buffer, indices.offset, bridge(args.type));
+#else
         vkCmdBindIndexBuffer2(cmd->buffer, indices.buffer, indices.offset,
                               VK_WHOLE_SIZE, bridge(args.type));
+#endif
         cmd->current_idx_buffer = args.indicesGpu;
     }
     const auto gpu_args = buffer_and_offset_from_ptr(d, args.argsGpu);

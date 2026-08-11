@@ -34,6 +34,9 @@ uint64_t  debug_queue_timeline(DeviceImpl*);         // last successfully submit
 int64_t   debug_pool_resets(DeviceImpl*);            // command-pool reuse resets
 // Fills a plain feature/limit snapshot from the physical device (profile.cpp).
 VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl*);
+// True when the validation layer is actually attached (layer must be
+// installed; otherwise a validation test would be vacuous).
+bool debug_validation_active(DeviceImpl*);
 uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
 }
 
@@ -138,6 +141,13 @@ static void test_device_create_destroy() {
     Device d = create_device(desc);
     CHECK(d != nullptr, "create_device returned null");
     CHECK(device_backend() == Backend::Vulkan, "backend should be Vulkan");
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    CHECK(device_backend_profile() == BackendProfile::VulkanBindless,
+          "compiled bindless profile must be reported");
+#else
+    CHECK(device_backend_profile() == BackendProfile::VulkanNative,
+          "compiled native profile must be reported");
+#endif
     destroy_device(d);
     printf("  PASS\n");
 }
@@ -2727,6 +2737,94 @@ static void test_abi_gpu() {
     destroy_device(d);
 }
 
+// --- Test 33: validation-enabled bindless smoke -------------------------------
+// Exercises the profile's descriptor/pipeline/command paths with the
+// validation layer attached and FAILS on any Error-severity message. Only
+// meaningful when the validation layer is installed (reported explicitly);
+// otherwise the test passes vacuously and prints SKIPPED.
+static int g_validation_errors = 0;
+static void validation_log_cb(LogLevel lvl, Span<const char> msg, uint32_t line, Span<const char> file, void*) {
+    if (lvl == LogLevel::Error) {
+        g_validation_errors++;
+        printf("VALIDATION ERROR: %.*s (%.*s:%u)\n", (int)msg.size(), msg.data(),
+               (int)file.size(), file.data(), line);
+    }
+}
+
+static void test_validation_smoke() {
+    printf("--- Test: validation-enabled bindless smoke ---\n");
+    g_validation_errors = 0;
+    DeviceDesc desc{
+        .log_callback = validation_log_cb,
+        .log_level    = LogLevel::Error,
+        .enable_validation = true,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "validation-enabled device created");
+    if (d == nullptr) { return; }
+    if (!debug_validation_active(d)) {
+        printf("SKIPPED: validation layer not installed\n");
+        destroy_device(d);
+        return;
+    }
+
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {16, 16, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::Storage | UsageFlags::TransferDst,
+    };
+    Handle<Texture> tex = create_texture(d, tex_desc);
+    CHECK(tex.h != 0, "create_texture failed");
+    TextureViewDesc view_desc{
+        .texture = tex,
+        .type    = TextureType::Tex2D,
+        .format  = Format::RGBA8Unorm,
+    };
+    TextureView sampled = create_texture_view(d, view_desc);
+    TextureView storage = create_rw_texture_view(d, view_desc);
+    SamplerId sampler = create_sampler(d, {});
+    CHECK(sampled != 0 && storage != 0 && sampler != 0, "view/sampler creation failed");
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("memcpy_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "memcpy_kernel.spv load failed");
+    if (spirv.size() > 0) {
+        ShaderSource shader_src{.source = spirv, .entry_point = "compute_main"_sv};
+        Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+        CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+        if (pipeline.h != 0) {
+            GpuPtr src_buf = malloc(d, 64, Memory::Default);
+            GpuPtr dst_buf = malloc(d, 64, Memory::Default);
+            GpuPtr args_buf = malloc(d, 32, Memory::Default);
+            auto* src = reinterpret_cast<uint32_t*>(get_host_pointer(d, src_buf));
+            for (int i = 0; i < 16; ++i) { src[i] = i; }
+            struct CopyData { uint64_t dst; uint64_t src; uint32_t count; uint32_t pad; };
+            auto* args = reinterpret_cast<CopyData*>(get_host_pointer(d, args_buf));
+            args->dst = dst_buf; args->src = src_buf; args->count = 16; args->pad = 0;
+            Queue q = get_queue(d);
+            CommandBuffer cmd = queue_start_command_recording(q);
+            cmd_set_pipeline(cmd, pipeline);
+            cmd_dispatch(cmd, args_buf, Dimension3D{1, 1, 1});
+            cmd_finalize(cmd);
+            Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+            CHECK(s.status == SubmitStatus::Success, "submit failed");
+            CHECK(wait_submission(s), "dispatch did not complete");
+            free(d, src_buf); free(d, dst_buf); free(d, args_buf);
+            free(d, pipeline);
+        }
+    }
+
+    free_texture_view(d, sampled);
+    free_rw_texture_view(d, storage);
+    free_sampler(d, sampler);
+    free(d, tex);
+    destroy_device(d);
+
+    CHECK(g_validation_errors == 0, "no validation errors during the smoke");
+}
+
 // --- Test 32: capability-gated 8/16-bit storage ABI -------------------------------
 // The mandatory ABI test avoids 8/16-bit storage (optional device
 // capabilities). Reading 8/16-bit members through a physical-storage-buffer
@@ -2855,6 +2953,7 @@ int main() {
     test_typed_pointers();
     test_abi_gpu();
     test_abi_int8_16();
+    test_validation_smoke();
 
     printf("\n=================\n");
     if (g_failures == 0) {

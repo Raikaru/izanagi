@@ -14,6 +14,14 @@ using namespace gpu;
 
 static void log_cb(LogLevel, Span<const char>, uint32_t, Span<const char>, void*) {}
 
+static const char* backend_name() {
+    switch (device_backend_profile()) {
+        case BackendProfile::VulkanBindless: return "VulkanBindless";
+        case BackendProfile::Metal: return "Metal";
+        default: return "VulkanNative";
+    }
+}
+
 int main() {
     DeviceDesc desc{
         .log_callback = log_cb,
@@ -21,8 +29,9 @@ int main() {
     };
     Device dev = create_device(desc);
     if (dev == nullptr) {
-        printf("{\"backend\":\"VulkanNative\",\"profile\":\"%s\",\"profile_supported\":false,"
-               "\"missing_features\":[\"device creation failed\"]}\n", IZ_PROFILE);
+        printf("{\"backend\":\"%s\",\"profile\":\"%s\",\"profile_supported\":false,"
+               "\"missing_features\":[\"device creation failed\"]}\n",
+               backend_name(), IZ_PROFILE);
         return 1;
     }
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
@@ -47,7 +56,7 @@ int main() {
 #endif
 
     printf("{\n");
-    printf("  \"backend\": \"VulkanNative\",\n");
+    printf("  \"backend\": \"%s\",\n", backend_name());
     printf("  \"profile\": \"%s\",\n", IZ_PROFILE);
     printf("  \"profile_supported\": true,\n");
     printf("  \"platform\": \"%s\",\n", platform);

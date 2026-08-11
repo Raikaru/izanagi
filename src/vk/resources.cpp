@@ -7,6 +7,39 @@ namespace gpu {
 // --- Descriptor heap write helpers ---------------------------------------------------
 
 bool write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // vkUpdateDescriptorSets requires host synchronization on the set: hold
+    // desc_lock across the update and the sidecar assignment (callers release
+    // desc_lock before calling, see desc_allocate_image_view).
+    VkImageView view = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateImageView(d->device, &view_info, nullptr, &view),
+                "write_sampled_descriptor: vkCreateImageView failed")) {
+        return false;
+    }
+    const VkDescriptorImageInfo image_info{
+        .sampler     = VK_NULL_HANDLE,
+        .imageView   = view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const VkWriteDescriptorSet write{
+        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext           = nullptr,
+        .dstSet          = d->bindless_set,
+        .dstBinding      = 0,
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .pImageInfo      = &image_info,
+    };
+    // vkUpdateDescriptorSets returns void; validation errors surface through
+    // the debug messenger. Store the view unconditionally (freed at slot
+    // retirement or device destroy).
+    mutex_lock(&d->desc_lock);
+    vkUpdateDescriptorSets(d->device, 1, &write, 0, nullptr);
+    if (slot < d->bindless_sampled_views.size()) { d->bindless_sampled_views[slot] = view; }
+    mutex_unlock(&d->desc_lock);
+    return true;
+#else
     VkImageDescriptorInfoEXT image_desc{
         .sType  = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
         .pNext  = nullptr,
@@ -30,9 +63,37 @@ bool write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCre
         return false;
     }
     return true;
+#endif
 }
 
 bool write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    VkImageView view = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateImageView(d->device, &view_info, nullptr, &view),
+                "write_storage_descriptor: vkCreateImageView failed")) {
+        return false;
+    }
+    const VkDescriptorImageInfo image_info{
+        .sampler     = VK_NULL_HANDLE,
+        .imageView   = view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const VkWriteDescriptorSet write{
+        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext           = nullptr,
+        .dstSet          = d->bindless_set,
+        .dstBinding      = 1,
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo      = &image_info,
+    };
+    mutex_lock(&d->desc_lock);
+    vkUpdateDescriptorSets(d->device, 1, &write, 0, nullptr);
+    if (slot < d->bindless_storage_views.size()) { d->bindless_storage_views[slot] = view; }
+    mutex_unlock(&d->desc_lock);
+    return true;
+#else
     VkImageDescriptorInfoEXT image_desc{
         .sType  = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
         .pNext  = nullptr,
@@ -57,9 +118,37 @@ bool write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCre
         return false;
     }
     return true;
+#endif
 }
 
 bool write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info) {
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    VkSampler sampler = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateSampler(d->device, &sampler_info, nullptr, &sampler),
+                "write_sampler_descriptor: vkCreateSampler failed")) {
+        return false;
+    }
+    const VkDescriptorImageInfo image_info{
+        .sampler     = sampler,
+        .imageView   = VK_NULL_HANDLE,
+        .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VkWriteDescriptorSet write{
+        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext           = nullptr,
+        .dstSet          = d->bindless_set,
+        .dstBinding      = 2,
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLER,
+        .pImageInfo      = &image_info,
+    };
+    mutex_lock(&d->desc_lock);
+    vkUpdateDescriptorSets(d->device, 1, &write, 0, nullptr);
+    if (slot < d->bindless_sampler_handles.size()) { d->bindless_sampler_handles[slot] = sampler; }
+    mutex_unlock(&d->desc_lock);
+    return true;
+#else
     VkHostAddressRangeEXT dst{
         .address = static_cast<uint8_t*>(d->heap.sampler_host_ptr) +
                    (size_t)slot * d->heap.sampler_descriptor_size,
@@ -71,6 +160,7 @@ bool write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreat
         return false;
     }
     return true;
+#endif
 }
 
 // --- Descriptor handles ------------------------------------------------------------------
@@ -170,6 +260,22 @@ void desc_retire_slot(DeviceImpl* d, RetireKind kind, uint32_t slot, uint16_t ge
         gens[slot] == gen) {
         states[slot] = static_cast<uint8_t>(DeviceImpl::DescriptorSlotState::Free);
         desc_bitset(d, kind).clear_bit(slot);
+#if defined(IZ_VK_PROFILE_BINDLESS)
+        // Destroy the per-slot native handle written into the global set.
+        if (kind == RetireKind::SampledSlot && slot < d->bindless_sampled_views.size()) {
+            VkImageView v = d->bindless_sampled_views[slot];
+            d->bindless_sampled_views[slot] = VK_NULL_HANDLE;
+            if (v != VK_NULL_HANDLE) { vkDestroyImageView(d->device, v, nullptr); }
+        } else if (kind == RetireKind::StorageSlot && slot < d->bindless_storage_views.size()) {
+            VkImageView v = d->bindless_storage_views[slot];
+            d->bindless_storage_views[slot] = VK_NULL_HANDLE;
+            if (v != VK_NULL_HANDLE) { vkDestroyImageView(d->device, v, nullptr); }
+        } else if (kind == RetireKind::SamplerSlot && slot < d->bindless_sampler_handles.size()) {
+            VkSampler s = d->bindless_sampler_handles[slot];
+            d->bindless_sampler_handles[slot] = VK_NULL_HANDLE;
+            if (s != VK_NULL_HANDLE) { vkDestroySampler(d->device, s, nullptr); }
+        }
+#endif
         if (kind == RetireKind::SampledSlot) {
             owner = d->sampled_owner[slot];
             d->sampled_owner[slot] = nullptr;

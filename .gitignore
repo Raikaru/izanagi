@@ -19,3 +19,4 @@ third_party/slang.zip
 # Design reference material (loon_gpu / nvpro) — kept local, not distributed
 reference/
 build-headless/
+build-bindless/

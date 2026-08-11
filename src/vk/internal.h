@@ -341,6 +341,26 @@ struct DeviceImpl {
 
     // Descriptor heap
     DescriptorHeap heap;
+
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // Bindless profile: one long-lived update-after-bind descriptor set
+    // holding the global arrays (binding 0 sampled, 1 storage, 2 samplers)
+    // plus one shared pipeline layout (set 0 + 16-byte push constants).
+    // The slot allocators/generations/state machines above are SHARED with
+    // the native profile; only the descriptor write target differs.
+    VkDescriptorSetLayout bindless_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout      bindless_pipeline_layout = VK_NULL_HANDLE;
+    VkDescriptorPool      bindless_pool = VK_NULL_HANDLE;
+    VkDescriptorSet       bindless_set = VK_NULL_HANDLE;
+    uint32_t bindless_sampled_capacity = 0;
+    uint32_t bindless_storage_capacity = 0;
+    uint32_t bindless_sampler_capacity = 0;
+    // Per-slot native handles written into the set (created at write,
+    // destroyed at slot retirement / device destroy). Guarded by desc_lock.
+    Vector<VkImageView> bindless_sampled_views;
+    Vector<VkImageView> bindless_storage_views;
+    Vector<VkSampler>   bindless_sampler_handles;
+#endif
     // Descriptor allocator: per-region bitset + generation + state tables,
     // all guarded by desc_lock. Slot state machine: Free -> Allocated ->
     // Retiring -> Free; a free acceptance bumps the generation so the old
@@ -466,6 +486,7 @@ void       debug_set_compiler_paused(DeviceImpl* d, bool paused);
 void       debug_force_submit_failure(DeviceImpl* d, bool force);
 uint64_t   debug_queue_timeline(DeviceImpl* d);         // last successfully submitted value
 int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse resets
+bool       debug_validation_active(DeviceImpl* d);      // validation layer actually attached
 
 // Profile capability snapshot (profile.cpp): fills a plain feature/limit
 // snapshot from the physical device so evaluate_vulkan_bindless_profile
