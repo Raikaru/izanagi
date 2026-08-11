@@ -318,6 +318,12 @@ static VkResult create_logical_device(DeviceImpl* d) {
     vulkan13_features.dynamicRendering = VK_TRUE;
     vulkan13_features.synchronization2 = VK_TRUE;
     vulkan13_features.maintenance4     = VK_TRUE;
+    // Optional: lets the compiler worker probe the cache with
+    // FAIL_ON_PIPELINE_COMPILE_REQUIRED instead of compiling blind.
+    d->pipeline_cache_control = vulkan13_features.pipelineCreationCacheControl == VK_TRUE;
+    if (d->pipeline_cache_control) {
+        vulkan13_features.pipelineCreationCacheControl = VK_TRUE;
+    }
 
     vulkan14_features.maintenance5 = VK_TRUE;
     vulkan14_features.maintenance6 = VK_TRUE;
@@ -702,7 +708,17 @@ Device create_device(const DeviceDesc& desc) {
     d->ptr_map                = Vector<GpuPtrMap>(d->allocator);
     d->uninitialized_textures = Vector<Handle<Texture>>(d->allocator);
     d->deferred_frees         = Vector<DeviceImpl::DeferredFree>(d->allocator);
-    d->shared_pipelines       = Vector<SharedPipeline*>(d->allocator);
+    d->pipeline_records       = Vector<PipelineRecord*>(d->allocator);
+    d->compiler_queue         = Vector<PipelineRecord*>(d->allocator);
+
+    // Start the async compiler worker (single thread, FIFO, low priority).
+    condvar_init(&d->compiler_cv);
+    if (!thread_create(&d->compiler_thread, &compiler_worker_main, d)) {
+        IZ_LOG(d, LogLevel::Error, "create_device: failed to start compiler worker");
+        condvar_destroy(&d->compiler_cv);
+        goto fail;
+    }
+    thread_set_low_priority(d->compiler_thread);
 
     return d;
 
@@ -725,6 +741,46 @@ void destroy_device(Device dev) {
     device_wait_for_idle(d);
     unconfigure_surface(d);
 
+    // Stop accepting new pipeline requests.
+    atomic_exchange(&d->device_destroying, 1);
+
+    // Signal the compiler worker to drain its queue and exit; join it so no
+    // work touches Vulkan state after this point.
+    mutex_lock(&d->compiler_lock);
+    atomic_exchange(&d->compiler_shutdown, 1);
+    condvar_broadcast(&d->compiler_cv);
+    mutex_unlock(&d->compiler_lock);
+    thread_join(d->compiler_thread);
+    d->compiler_thread = 0;
+    condvar_destroy(&d->compiler_cv);
+
+    // Release pipeline references retained for submitted (now complete) work.
+    if (d->default_queue) {
+        for (PipelineRefBatch* batch : d->default_queue->in_flight_batches) {
+            release_inflight_batch(batch);
+        }
+        d->default_queue->in_flight_batches.clear();
+    }
+
+    // Destroy every remaining record (leaked handles, failed compiles, etc.).
+    mutex_lock(&d->pipeline_lock);
+    for (PipelineRecord* rec : d->pipeline_records) {
+        if (rec->vk_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(d->device, rec->vk_pipeline, nullptr);
+        }
+        if (rec->key_block.ptr != nullptr) { d->allocator.free(rec->key_block); }
+        free_record(d, rec);
+    }
+    d->pipeline_records.clear();
+    mutex_unlock(&d->pipeline_lock);
+
+    // Persist the native pipeline cache, then destroy it.
+    store_pipeline_cache(d);
+    if (d->vk_pipeline_cache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(d->device, d->vk_pipeline_cache, nullptr);
+        d->vk_pipeline_cache = VK_NULL_HANDLE;
+    }
+
     // Destroy queues
     if (d->default_queue) {
         for (auto& p : d->default_queue->command_superpool.pools) {
@@ -734,39 +790,6 @@ void destroy_device(Device dev) {
         }
         d->default_queue->pending_events.clear();
         d->allocator.free({.ptr = d->default_queue, .len = sizeof(QueueImpl)});
-    }
-
-    // Destroy any shared pipelines still referenced (leaked handles).
-    mutex_lock(&d->pipeline_lock);
-    for (SharedPipeline* sp : d->shared_pipelines) {
-        if (sp->vk_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(d->device, sp->vk_pipeline, nullptr);
-        }
-        if (sp->key_block.ptr != nullptr) { d->allocator.free(sp->key_block); }
-        sp->~SharedPipeline();
-        d->allocator.free({.ptr = sp, .len = sizeof(SharedPipeline)});
-    }
-    d->shared_pipelines.clear();
-    mutex_unlock(&d->pipeline_lock);
-
-    // Persist the native pipeline cache, then destroy it.
-    if (d->vk_pipeline_cache != VK_NULL_HANDLE) {
-        size_t size = 0;
-        vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, nullptr);
-        if (size > 0 && d->cache_callbacks.store) {
-            MemoryBlock blob = d->allocator.alloc(size);
-            if (blob.ptr != nullptr) {
-                VkResult r = vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, blob.ptr);
-                if (r == VK_SUCCESS && size > 0) {
-                    d->cache_callbacks.store(d->cache_identity,
-                                             MemoryBlock{blob.ptr, static_cast<uint32_t>(size)},
-                                             d->cache_callbacks.user);
-                }
-                d->allocator.free(blob);
-            }
-        }
-        vkDestroyPipelineCache(d->device, d->vk_pipeline_cache, nullptr);
-        d->vk_pipeline_cache = VK_NULL_HANDLE;
     }
 
     // Destroy pools (destructors call the registered destructors)
@@ -1027,6 +1050,7 @@ Queue get_queue(Device dev, QueueType type) {
         q->queue_family   = d->graphics_queue_family;
         q->timeline_value = 0;
         q->pending_events = Vector<CompletionEvent>(d->allocator);
+        q->in_flight_batches = Vector<PipelineRefBatch*>(d->allocator);
         d->default_queue  = q;
     }
     return d->default_queue;
@@ -1057,6 +1081,18 @@ void queue_process_events(Queue q) {
     }
     if (i != 0) {
         q->pending_events.erase(q->pending_events.begin(), q->pending_events.begin() + i);
+    }
+
+    // Release in-flight pipeline references whose timeline values completed
+    // (batches are pushed in timeline order).
+    uint32_t j = 0;
+    while (j < q->in_flight_batches.size() &&
+           q->in_flight_batches[j]->timeline_value <= current_time) {
+        release_inflight_batch(q->in_flight_batches[j]);
+        j++;
+    }
+    if (j != 0) {
+        q->in_flight_batches.erase(q->in_flight_batches.begin(), q->in_flight_batches.begin() + j);
     }
 }
 

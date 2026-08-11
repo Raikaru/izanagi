@@ -124,6 +124,7 @@ full enum including ETC2/ASTC, so the enum set ports 1:1.
 | `cmd_set_depth_stencil_state` | `vkCmdSetDepth*` / `vkCmdSetStencil*` dynamic state | `setDepthStencilState` |
 | `cmd_set_front_face` / `cmd_set_cull_mode` | `vkCmdSetFrontFace` / `vkCmdSetCullMode` | `setFrontFacingWinding` / `setCullMode` |
 | pipeline cache (device-internal) | whole-device `VkPipelineCache`, app load/store callbacks + opaque `CacheIdentity` | `MTLBinaryArchive` (same app hook shape) |
+| async pipeline request | `request_*_pipeline` -> owned record -> compiler worker -> Ready/Failed; `VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT` probe when supported | `MTL4Compiler` on a worker thread; `MTLBinaryArchive` hit check before compile |
 
 ### Blend factors (incl. dual-source)
 

@@ -1,6 +1,7 @@
 // commands.cpp — all cmd_* recording, command pool management, queue submission.
 
 #include <algorithm>
+#include <new>
 
 #include "internal.h"
 
@@ -30,6 +31,17 @@ void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
 // --- Command pool management -----------------------------------------------------------
 
 static void reset_command_pool(VkDevice device, CommandPool* pool) {
+    // Release pipeline references retained by recorded-but-never-submitted
+    // command buffers (their commands are discarded; the GPU never executed
+    // them, and the pool reuse is frame-paced past any prior completion).
+    for (uint32_t i = 0; i < pool->command_buffers.size(); ++i) {
+        auto& cb = pool->command_buffers[i];
+        if (cb.device == nullptr) { continue; }
+        for (PipelineRecord* rec : cb.retained_pipelines) {
+            release_pipeline_ref(cb.device, rec);
+        }
+        cb.retained_pipelines.clear();
+    }
     vkResetCommandPool(device, pool->command_pool, 0);
     pool->buffer_free_idx = 0;
 }
@@ -112,6 +124,8 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
             .buffer             = buf,
             .current_idx_buffer = 0,
         });
+        pool->command_buffers[pool->command_buffers.size() - 1].retained_pipelines =
+            Vector<PipelineRecord*>(d->allocator);
     }
     CommandBufferImpl* result        = &pool->command_buffers[pool->buffer_free_idx];
     result->wait_for_surface_texture = false;
@@ -308,6 +322,23 @@ void queue_submit(Queue                     q,
                              .deviceIndex = 0,
                          });
 
+    // Retain pipelines bound in these command buffers until this submit's
+    // timeline value completes (released by queue_process_events).
+    for (uint32_t i = 0; i < command_buffers.size(); ++i) {
+        auto& retained = command_buffers[i]->retained_pipelines;
+        if (retained.is_empty()) { continue; }
+        MemoryBlock blk = d->allocator.alloc(sizeof(PipelineRefBatch));
+        if (blk.ptr == nullptr) { continue; }   // refs stay in the cb; released at pool reset
+        auto* batch = ::new (blk.ptr) PipelineRefBatch{
+            .device         = d,
+            .timeline_value = q->timeline_value,
+            .records        = Vector<PipelineRecord*>(d->allocator),
+        };
+        for (PipelineRecord* rec : retained) { batch->records.push_back(rec); }
+        retained.clear();
+        q->in_flight_batches.push_back(batch);
+    }
+
     VkSubmitInfo2 submit_info{
         .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .pNext                    = nullptr,
@@ -320,6 +351,15 @@ void queue_submit(Queue                     q,
         .pSignalSemaphoreInfos    = signal_info.data(),
     };
     vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
+}
+
+// Releases the pipeline references retained for a completed submission.
+void release_inflight_batch(PipelineRefBatch* batch) {
+    auto* d = batch->device;
+    for (PipelineRecord* rec : batch->records) { release_pipeline_ref(d, rec); }
+    batch->records.clear();
+    batch->~PipelineRefBatch();
+    d->allocator.free({.ptr = batch, .len = sizeof(PipelineRefBatch)});
 }
 
 // --- Commands -------------------------------------------------------------------------
@@ -514,10 +554,23 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
     }
 }
 
-void cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
+bool cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
     auto* d = cmd->device;
-    auto& p = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)];
-    vkCmdBindPipeline(cmd->buffer, p.shared->bind_point, p.shared->vk_pipeline);
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    // Pending or Failed: record nothing so the application can explicitly
+    // bind a fallback or skip the operation. Never blocks on compilation.
+    if (rec->state.load(std::memory_order_acquire) != InternalPipelineState::Ready) {
+        return false;
+    }
+    vkCmdBindPipeline(cmd->buffer, rec->bind_point, rec->vk_pipeline);
+    // Retain the native pipeline for the command buffer's lifetime (one
+    // reference per distinct pipeline; repeated binds reuse it).
+    for (PipelineRecord* r : cmd->retained_pipelines) {
+        if (r == rec) { return true; }
+    }
+    rec->refs.fetch_add(1, std::memory_order_relaxed);
+    cmd->retained_pipelines.push_back(rec);
+    return true;
 }
 
 void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> state) {

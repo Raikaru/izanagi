@@ -52,6 +52,30 @@ void rwlock_unlock_read(rwlock* l);
 void rwlock_lock_write(rwlock* l);
 void rwlock_unlock_write(rwlock* l);
 
+// Condition variable (pairs with the mutex type above)
+struct condvar {
+#if _WIN32
+    uintptr_t impl = 0;   // CONDITION_VARIABLE (initialized by condvar_init)
+#else
+    pthread_cond_t impl = PTHREAD_COND_INITIALIZER;
+#endif
+};
+void condvar_init(condvar* cv);
+void condvar_destroy(condvar* cv);
+void condvar_wait(condvar* cv, mutex* mtx);          // releases mtx while waiting
+void condvar_signal(condvar* cv);                    // wake one
+void condvar_broadcast(condvar* cv);                 // wake all
+
+// Threads
+using thread_handle = uintptr_t;
+bool        thread_create(thread_handle* out, void (*fn)(void*), void* arg);
+void        thread_join(thread_handle t);
+void        thread_set_low_priority(thread_handle t);
+uintptr_t   current_thread_id();
+
+// Monotonic clock (seconds)
+double monotonic_seconds();
+
 // Bit manipulation
 inline constexpr uint64_t count_leading_zeros(uint64_t x) {
     if (x == 0) { return 64; }

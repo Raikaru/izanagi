@@ -20,12 +20,15 @@
 
 using namespace gpu;
 
-// White-box test hook for the pipeline dedup tests: number of live shared
-// pipeline entries (dedup table size). Declared here to avoid pulling the
-// backend's internal header into the test TU; implemented in pipeline.cpp.
+// White-box test hooks for the pipeline tests (declared here to avoid
+// pulling the backend's internal header into the test TU; implemented in
+// pipeline.cpp / platform_utils.cpp).
 namespace gpu {
 struct DeviceImpl;
-uint32_t debug_live_pipelines(DeviceImpl*);
+uint32_t  debug_live_pipelines(DeviceImpl*);         // records in the dedup map
+uintptr_t debug_last_compile_thread(DeviceImpl*);    // thread that last compiled natively
+void      debug_set_compiler_paused(DeviceImpl*, bool);
+uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
 }
 
 static int g_failures = 0;
@@ -399,6 +402,15 @@ static void sleep_ms(uint32_t ms) {
 #else
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 #endif
+}
+
+// The compiler worker releases its reference shortly after publishing Ready;
+// poll (bounded) for the dedup map to reach the expected size.
+static void poll_live_pipelines(gpu::DeviceImpl* impl, uint32_t expected) {
+    for (int i = 0; i < 200; ++i) {
+        if (gpu::debug_live_pipelines(impl) == expected) { return; }
+        sleep_ms(1);
+    }
 }
 
 // --- Test 6: Semaphore signal/wait + deferred completion callback ------------------------
@@ -1350,10 +1362,12 @@ static void test_pipeline_dedup() {
     CHECK(a.h != b.h, "identical creates must return distinct handles");
     CHECK(debug_live_pipelines(impl) == 1, "identical creates must share one pipeline");
 
-    // Refcount: survives the first free, dies with the last.
+    // Refcount: survives the first free, dies with the last (worker reference
+    // may linger briefly after Ready is published — poll for the settle).
     free(d, a);
     CHECK(debug_live_pipelines(impl) == 1, "pipeline must stay alive while a handle remains");
     free(d, b);
+    poll_live_pipelines(impl, 0);
     CHECK(debug_live_pipelines(impl) == 0, "pipeline must die with the last handle");
 
     // No retention: recreate after free compiles fresh (dedup only).
@@ -1361,6 +1375,7 @@ static void test_pipeline_dedup() {
     CHECK(c.h != 0, "recreate failed");
     CHECK(debug_live_pipelines(impl) == 1, "recreate after free must compile a new pipeline");
     free(d, c);
+    poll_live_pipelines(impl, 0);
 
     // Every key field must produce a distinct pipeline.
     std::vector<Handle<Pipeline>> variants;
@@ -1415,6 +1430,7 @@ static void test_pipeline_dedup() {
     CHECK(debug_live_pipelines(impl) == variants.size(),
           "each varied key field must yield a distinct pipeline");
     for (auto v : variants) { free(d, v); }
+    poll_live_pipelines(impl, 0);
     CHECK(debug_live_pipelines(impl) == 0, "all variant pipelines must be freed");
 
     // Compute pipelines dedup too; specialization values are part of the key.
@@ -1445,6 +1461,7 @@ static void test_pipeline_dedup() {
     free(d, p2);
     free(d, p3);
     free(d, p4);
+    poll_live_pipelines(impl, 0);
     CHECK(debug_live_pipelines(impl) == 0, "compute pipelines must be freed");
 
     destroy_device(d);
@@ -1515,6 +1532,12 @@ static void test_pipeline_cache_persistence() {
             if (gp.h) { free(a, gp); }
         }
     }
+    // Explicit flush persists the cache before device destruction (blocking;
+    // loading-screen / checkpoint use).
+    flush_pipeline_cache(a);
+    CHECK(cache_a.store_count >= 1, "flush_pipeline_cache must invoke the store callback");
+    CHECK(cache_a.blob.size() > 0, "flush must store a non-empty blob");
+
     destroy_device(a);
     CHECK(cache_a.store_count >= 1, "store callback must fire at destroy_device");
     CHECK(cache_a.blob.size() > 0, "stored cache blob must be non-empty");
@@ -1571,6 +1594,377 @@ static void test_pipeline_cache_persistence() {
     printf("  PASS\n");
 }
 
+// --- Test 18: Async pipeline request/compile (non-blocking) -------------------------------
+static void test_async_pipeline_compile() {
+    printf("--- Test: async pipeline compile ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+    const uintptr_t main_tid = gpu::current_thread_id();
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("memcpy_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource shader_src{.source = spirv, .entry_point = "compute_main"_sv};
+
+    Handle<Pipeline> p = request_compute_pipeline(d, shader_src);
+    CHECK(p.h != 0, "request_compute_pipeline returned null");
+    CHECK(get_pipeline_status(d, p) == PipelineStatus::Pending ||
+              get_pipeline_status(d, p) == PipelineStatus::Ready,
+          "fresh request must be Pending or Ready (never Failed)");
+
+    CHECK(wait_pipeline(d, p), "wait_pipeline failed for a valid shader");
+    CHECK(get_pipeline_status(d, p) == PipelineStatus::Ready, "status must be Ready after wait");
+    // Non-blocking proof: the native compile ran on the worker thread, never
+    // on the requesting thread.
+    CHECK(gpu::debug_last_compile_thread(impl) != 0, "compiler worker must have run");
+    CHECK(gpu::debug_last_compile_thread(impl) != main_tid,
+          "request path must not call vkCreate*Pipelines on the calling thread");
+
+    // End-to-end through the async path (dst[i] = src[i]*2+1).
+    constexpr uint32_t kCount = 1024;
+    GpuPtr src_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr dst_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr args_buf = malloc(d, 32, Memory::Default);
+    CHECK(src_buf != 0 && dst_buf != 0 && args_buf != 0, "malloc failed");
+    auto* src_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, src_buf));
+    for (uint32_t i = 0; i < kCount; ++i) { src_host[i] = i; }
+    struct CopyData {
+        uint64_t dst;
+        uint64_t src;
+        uint32_t count;
+        uint32_t pad;
+    };
+    auto* args_host = reinterpret_cast<CopyData*>(get_host_pointer(d, args_buf));
+    args_host->dst   = dst_buf;
+    args_host->src   = src_buf;
+    args_host->count = kCount;
+    args_host->pad   = 0;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd_set_pipeline(cmd, p), "cmd_set_pipeline must succeed for a Ready pipeline");
+    cmd_dispatch(cmd, args_buf, Dimension3D{(kCount + 63) / 64, 1, 1});
+    cmd_finalize(cmd);
+
+    // Free the user handle while the submission is in flight: the record must
+    // survive until the submitted work completes.
+    free(d, p);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* dst_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst_buf));
+    bool match = true;
+    for (uint32_t i = 0; i < kCount && match; ++i) {
+        if (dst_host[i] != i * 2 + 1) { match = false; }
+    }
+    CHECK(match, "async compute verification failed");
+
+    // After the submission completes, draining events releases the in-flight
+    // reference and destroys the record.
+    for (int i = 0; i < 200; ++i) {
+        queue_process_events(q);
+        if (gpu::debug_live_pipelines(impl) == 0) { break; }
+        sleep_ms(10);
+    }
+    CHECK(gpu::debug_live_pipelines(impl) == 0,
+          "record must be destroyed after submit completes and all refs drop");
+
+    free(d, src_buf);
+    free(d, dst_buf);
+    free(d, args_buf);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 19: Async Pending/Failed transitions + binding --------------------------------
+static void test_async_pipeline_pending_and_failed() {
+    printf("--- Test: async pipeline pending/failed ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+
+    // Deterministic Pending: park the compiler worker before requesting.
+    gpu::debug_set_compiler_paused(impl, true);
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("offscreen_triangle.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        gpu::debug_set_compiler_paused(impl, false);
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vs{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fs{.source = spirv, .entry_point = "fragment_main"_sv};
+    ColorTarget ct{.format = Format::BGRA8Unorm};
+    RasterDesc rd{.color_targets = Span<const ColorTarget>(&ct, 1)};
+
+    Queue q = get_queue(d);
+    Handle<Pipeline> p = request_graphics_pipeline(d, vs, fs, rd);
+    CHECK(p.h != 0, "request_graphics_pipeline returned null");
+    CHECK(get_pipeline_status(d, p) == PipelineStatus::Pending,
+          "pipeline must be Pending while the compiler is parked");
+
+    // Pending bind: records nothing, returns false (application fallback path).
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(!cmd_set_pipeline(cmd, p), "cmd_set_pipeline must fail for a Pending pipeline");
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    // Free while pending: the worker reference keeps the record alive; the
+    // worker finishes and retires the result.
+    free(d, p);
+    gpu::debug_set_compiler_paused(impl, false);
+    poll_live_pipelines(impl, 0);
+    CHECK(gpu::debug_live_pipelines(impl) == 0,
+          "record must be retired after free-while-pending and compilation finishes");
+
+    // Ready bind now succeeds.
+    Handle<Pipeline> p2 = request_graphics_pipeline(d, vs, fs, rd);
+    CHECK(p2.h != 0, "second request failed");
+    CHECK(wait_pipeline(d, p2), "wait_pipeline failed after unpause");
+    CHECK(get_pipeline_status(d, p2) == PipelineStatus::Ready, "status must be Ready");
+    cmd = queue_start_command_recording(q);
+    CHECK(cmd_set_pipeline(cmd, p2), "cmd_set_pipeline must succeed for Ready");
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+    free(d, p2);
+    poll_live_pipelines(impl, 0);
+
+    // Failed: garbage SPIR-V must fail deterministically on the worker.
+    uint32_t junk[8] = {0xDEADBEEFu, 1, 2, 3, 4, 5, 6, 7};
+    ShaderSource bad{
+        .source = Span<const uint8_t>(reinterpret_cast<const uint8_t*>(junk), sizeof(junk)),
+        .entry_point = "compute_main"_sv,
+    };
+    Handle<Pipeline> bad_p = request_compute_pipeline(d, bad);
+    CHECK(bad_p.h != 0, "request for an invalid shader must still return a handle");
+    CHECK(!wait_pipeline(d, bad_p), "wait_pipeline must report failure for an invalid shader");
+    CHECK(get_pipeline_status(d, bad_p) == PipelineStatus::Failed, "status must be Failed");
+    cmd = queue_start_command_recording(q);
+    CHECK(!cmd_set_pipeline(cmd, bad_p), "cmd_set_pipeline must fail for a Failed pipeline");
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+    free(d, bad_p);
+    poll_live_pipelines(impl, 0);
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 20: Async input ownership --------------------------------------------------------
+static void test_async_input_ownership() {
+    printf("--- Test: async input ownership ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    // Load the shader into temporary storage, then copy it to stack buffers
+    // that we will destroy immediately after requesting.
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("spec_mul_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0 && spirv.size() <= 8192, "Failed to load spec_mul_kernel.spv");
+    if (spirv.size() == 0 || spirv.size() > 4096) {
+        destroy_device(d);
+        return;
+    }
+
+    uint8_t temp_spv[8192];
+    char    temp_entry[32];
+    memcpy(temp_spv, spirv.data(), spirv.size());
+    memcpy(temp_entry, "compute_main", 13);
+
+    SpecializationConstant temp_sc{.constant_id = 0, .int_val = 5,
+                                   .type = SpecializationConstantType::UInt32};
+
+    ShaderSource temp_src{
+        .source = Span<const uint8_t>(temp_spv, spirv.size()),
+        .entry_point = Span<const char>(temp_entry, 12),
+    };
+    Handle<Pipeline> p = request_compute_pipeline(d, temp_src,
+                                                  Span<const SpecializationConstant>(&temp_sc, 1));
+    CHECK(p.h != 0, "request_compute_pipeline returned null");
+    if (p.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    // Destroy the caller storage immediately; the record owns its inputs.
+    memset(temp_spv, 0xAA, sizeof(temp_spv));
+    memset(temp_entry, 0xBB, sizeof(temp_entry));
+    temp_sc.int_val = 0;
+
+    CHECK(wait_pipeline(d, p), "wait_pipeline failed");
+    CHECK(get_pipeline_status(d, p) == PipelineStatus::Ready, "status must be Ready");
+
+    // kMul must be 5 (copied), not the destroyed value: dst[i] = src[i] * 5.
+    constexpr uint32_t kCount = 256;
+    GpuPtr src_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr dst_buf  = malloc(d, kCount * sizeof(uint32_t), Memory::Default);
+    GpuPtr args_buf = malloc(d, 32, Memory::Default);
+    CHECK(src_buf != 0 && dst_buf != 0 && args_buf != 0, "malloc failed");
+    auto* src_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, src_buf));
+    for (uint32_t i = 0; i < kCount; ++i) { src_host[i] = i + 1; }
+    struct CopyData {
+        uint64_t dst;
+        uint64_t src;
+        uint32_t count;
+        uint32_t pad;
+    };
+    auto* args_host = reinterpret_cast<CopyData*>(get_host_pointer(d, args_buf));
+    args_host->dst   = dst_buf;
+    args_host->src   = src_buf;
+    args_host->count = kCount;
+    args_host->pad   = 0;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd_set_pipeline(cmd, p), "cmd_set_pipeline failed");
+    cmd_dispatch(cmd, args_buf, Dimension3D{(kCount + 63) / 64, 1, 1});
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* dst_host = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst_buf));
+    bool match = true;
+    for (uint32_t i = 0; i < kCount && match; ++i) {
+        if (dst_host[i] != (i + 1) * 5) { match = false; }
+    }
+    CHECK(match, "owned specialization value not applied (kMul must be 5)");
+
+    free(d, p);
+    free(d, src_buf);
+    free(d, dst_buf);
+    free(d, args_buf);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 21: Concurrent dedup --------------------------------------------------------------
+static void test_async_dedup_concurrent() {
+    printf("--- Test: async dedup concurrent ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("memcpy_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource shader_src{.source = spirv, .entry_point = "compute_main"_sv};
+
+    constexpr int kThreads = 4;
+    std::vector<Handle<Pipeline>> handles(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t]() { handles[t] = request_compute_pipeline(d, shader_src); });
+    }
+    for (auto& th : threads) { th.join(); }
+
+    bool distinct = true;
+    for (int t = 1; t < kThreads; ++t) {
+        if (handles[t].h == handles[0].h) { distinct = false; }
+    }
+    CHECK(distinct, "concurrent requests must return distinct handles");
+    for (int t = 0; t < kThreads; ++t) {
+        CHECK(handles[t].h != 0, "concurrent request returned null");
+        CHECK(wait_pipeline(d, handles[t]), "concurrent request failed to compile");
+    }
+    CHECK(gpu::debug_live_pipelines(impl) == 1,
+          "concurrent identical requests must share one record");
+
+    for (int t = 0; t < kThreads; ++t) { free(d, handles[t]); }
+    poll_live_pipelines(impl, 0);
+    CHECK(gpu::debug_live_pipelines(impl) == 0, "concurrent handles must all free");
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 22: Shutdown with queued/compiling work ------------------------------------------
+static void test_async_shutdown_with_pending() {
+    printf("--- Test: async shutdown with pending ---\n");
+
+    // Case 1: queued work (worker parked) at destroy. The worker drains the
+    // queue during shutdown, then joins; nothing touches destroyed state.
+    {
+        DeviceDesc desc{
+            .log_callback = test_log_callback,
+            .log_level    = LogLevel::Warning,
+        };
+        Device d = create_device(desc);
+        CHECK(d != nullptr, "create_device failed");
+        auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
+        gpu::debug_set_compiler_paused(impl, true);
+
+        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        std::string shader_path = find_shader_path("memcpy_kernel.spv");
+        auto spirv = load_spirv(shader_path.c_str(), &arena);
+        if (spirv.size() > 0) {
+            ShaderSource src{.source = spirv, .entry_point = "compute_main"_sv};
+            for (int i = 0; i < 3; ++i) {
+                Handle<Pipeline> p = request_compute_pipeline(d, src);
+                CHECK(p.h != 0, "request before shutdown failed");
+                free(d, p);   // user ref dropped; worker ref keeps records alive
+            }
+        }
+        destroy_device(d);   // must not crash; workers joined before teardown
+    }
+
+    // Case 2: work actively compiling at destroy (no pause).
+    {
+        DeviceDesc desc{
+            .log_callback = test_log_callback,
+            .log_level    = LogLevel::Warning,
+        };
+        Device d = create_device(desc);
+        CHECK(d != nullptr, "create_device failed");
+        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        std::string shader_path = find_shader_path("memcpy_kernel.spv");
+        auto spirv = load_spirv(shader_path.c_str(), &arena);
+        if (spirv.size() > 0) {
+            ShaderSource src{.source = spirv, .entry_point = "compute_main"_sv};
+            Handle<Pipeline> p = request_compute_pipeline(d, src);
+            CHECK(p.h != 0, "request failed");
+            // destroy immediately while the worker may be mid-compile
+            destroy_device(d);
+        } else {
+            destroy_device(d);
+        }
+    }
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -1602,6 +1996,11 @@ int main() {
     test_generate_mipmaps();
     test_pipeline_dedup();
     test_pipeline_cache_persistence();
+    test_async_pipeline_compile();
+    test_async_pipeline_pending_and_failed();
+    test_async_input_ownership();
+    test_async_dedup_concurrent();
+    test_async_shutdown_with_pending();
     test_dual_source_blend();
 
     printf("\n=================\n");

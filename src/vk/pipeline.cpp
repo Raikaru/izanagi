@@ -1,5 +1,14 @@
-// pipeline.cpp — compute & graphics pipelines, depth-stencil state, specialization constants.
+// pipeline.cpp — compute & graphics pipelines, depth-stencil state, specialization
+// constants, and the asynchronous compiler worker.
+//
+// request_compute_pipeline / request_graphics_pipeline never block on native
+// compilation: they deep-copy the description into an owned PipelineRecord,
+// deduplicate against live records, enqueue the record on a device-owned
+// compiler worker, and return immediately. All vkCreate*Pipelines calls run on
+// the worker. Blocking create_*_pipeline are request + wait_pipeline wrappers.
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 #include "internal.h"
@@ -71,53 +80,65 @@ static VkSpecializationInfo construct_specialization_info(
     };
 }
 
-// --- Pipeline dedup (SharedPipeline) --------------------------------------------------
-// Identical create inputs share one compiled VkPipeline (refcounted; destroyed
-// when the last handle is freed). The key is a full copy of every input that
-// reaches pipeline creation — shader bytes + entry points, specialization
-// data, and the entire baked raster state. No retention beyond live handles.
+// --- Formatted logging (arena-backed) ---------------------------------------------------
+
+static void log_fmt(DeviceImpl* d, LogLevel lvl, uint32_t line, const char* file, const char* fmt, ...) {
+    Arena* arena = get_thread_local_arena(d);
+    char*  buf   = static_cast<char*>(arena->alloc(256));
+    if (buf == nullptr) { return; }
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, 256, fmt, args);
+    va_end(args);
+    log_impl(d, lvl, Span<const char>(buf, strlen(buf)), line, Span<const char>(file, strlen(file)));
+}
+
+// --- Owned canonical keys ----------------------------------------------------------------
+// The key is a full copy of every input that reaches pipeline creation — shader
+// bytes + entry points, specialization data, and the entire baked raster state.
+// No retention beyond live references.
 
 static bool entry_equal(const char* stored, Span<const char> app) {
     const size_t n = strlen(stored);
     return n == app.size() && (n == 0 || memcmp(stored, app.data(), n) == 0);
 }
 
-static bool spec_equal(const SharedPipeline& sp, const VkSpecializationInfo& spec) {
-    if (sp.spec_count != spec.mapEntryCount || sp.spec_size != spec.dataSize) { return false; }
-    if (sp.spec_size && memcmp(sp.spec_data, spec.pData, sp.spec_size) != 0) { return false; }
-    for (uint32_t i = 0; i < sp.spec_count; ++i) {
-        if (sp.spec_ids[i] != spec.pMapEntries[i].constantID ||
-            sp.spec_sizes[i] != spec.pMapEntries[i].size) {
+static bool spec_equal(const PipelineRecord& rec, const VkSpecializationInfo& spec) {
+    if (rec.spec_count != spec.mapEntryCount || rec.spec_size != spec.dataSize) { return false; }
+    if (rec.spec_size && memcmp(rec.spec_data, spec.pData, rec.spec_size) != 0) { return false; }
+    for (uint32_t i = 0; i < rec.spec_count; ++i) {
+        if (rec.spec_ids[i] != spec.pMapEntries[i].constantID ||
+            rec.spec_sizes[i] != spec.pMapEntries[i].size) {
             return false;
         }
     }
     return true;
 }
 
-static bool graphics_key_equal(const SharedPipeline& sp, ShaderSource vertex, ShaderSource fragment,
+static bool graphics_key_equal(const PipelineRecord& rec, ShaderSource vertex, ShaderSource fragment,
                                const VkSpecializationInfo& spec, const RasterDesc& desc) {
-    if (sp.bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) { return false; }
-    if (sp.vs_size != vertex.source.size() ||
-        (sp.vs_size && memcmp(sp.vs_bytes, vertex.source.data(), sp.vs_size) != 0)) {
+    if (rec.bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) { return false; }
+    if (rec.vs_size != vertex.source.size() ||
+        (rec.vs_size && memcmp(rec.vs_bytes, vertex.source.data(), rec.vs_size) != 0)) {
         return false;
     }
-    if (sp.fs_size != fragment.source.size() ||
-        (sp.fs_size && memcmp(sp.fs_bytes, fragment.source.data(), sp.fs_size) != 0)) {
+    if (rec.fs_size != fragment.source.size() ||
+        (rec.fs_size && memcmp(rec.fs_bytes, fragment.source.data(), rec.fs_size) != 0)) {
         return false;
     }
-    if (!entry_equal(sp.vs_entry, vertex.entry_point) ||
-        !entry_equal(sp.fs_entry, fragment.entry_point)) {
+    if (!entry_equal(rec.vs_entry, vertex.entry_point) ||
+        !entry_equal(rec.fs_entry, fragment.entry_point)) {
         return false;
     }
-    if (!spec_equal(sp, spec)) { return false; }
-    if (sp.topology != desc.topology || sp.sample_count != desc.sample_count ||
-        sp.alpha_to_coverage != desc.alpha_to_coverage ||
-        sp.depth_format != desc.depth_format || sp.stencil_format != desc.stencil_format ||
-        sp.color_target_count != desc.color_targets.size()) {
+    if (!spec_equal(rec, spec)) { return false; }
+    if (rec.topology != desc.topology || rec.sample_count != desc.sample_count ||
+        rec.alpha_to_coverage != desc.alpha_to_coverage ||
+        rec.depth_format != desc.depth_format || rec.stencil_format != desc.stencil_format ||
+        rec.color_target_count != desc.color_targets.size()) {
         return false;
     }
-    for (uint32_t i = 0; i < sp.color_target_count; ++i) {
-        const ColorTarget& a = sp.color_targets[i];
+    for (uint32_t i = 0; i < rec.color_target_count; ++i) {
+        const ColorTarget& a = rec.color_targets[i];
         const ColorTarget& b = desc.color_targets[i];
         if (a.format != b.format) { return false; }
         const BlendDesc& ba = a.blendstate;
@@ -132,20 +153,20 @@ static bool graphics_key_equal(const SharedPipeline& sp, ShaderSource vertex, Sh
     return true;
 }
 
-static bool compute_key_equal(const SharedPipeline& sp, ShaderSource source,
+static bool compute_key_equal(const PipelineRecord& rec, ShaderSource source,
                               const VkSpecializationInfo& spec) {
-    if (sp.bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) { return false; }
-    if (sp.vs_size != source.source.size() ||
-        (sp.vs_size && memcmp(sp.vs_bytes, source.source.data(), sp.vs_size) != 0)) {
+    if (rec.bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) { return false; }
+    if (rec.vs_size != source.source.size() ||
+        (rec.vs_size && memcmp(rec.vs_bytes, source.source.data(), rec.vs_size) != 0)) {
         return false;
     }
-    if (!entry_equal(sp.vs_entry, source.entry_point)) { return false; }
-    return spec_equal(sp, spec);
+    if (!entry_equal(rec.vs_entry, source.entry_point)) { return false; }
+    return spec_equal(rec, spec);
 }
 
-// Copies every create input into one owned block inside `sp`. Returns false on
-// allocation failure (caller must destroy the pipeline and bail).
-static bool build_key(DeviceImpl* d, SharedPipeline* sp, ShaderSource vertex, ShaderSource fragment,
+// Copies every create input into one owned block inside `rec`. Returns false on
+// allocation failure (caller must destroy the record and bail).
+static bool build_key(DeviceImpl* d, PipelineRecord* rec, ShaderSource vertex, ShaderSource fragment,
                       const VkSpecializationInfo& spec, const RasterDesc* desc) {
     const uint32_t ct_count = desc ? static_cast<uint32_t>(desc->color_targets.size()) : 0;
     size_t total = 0;
@@ -157,7 +178,7 @@ static bool build_key(DeviceImpl* d, SharedPipeline* sp, ShaderSource vertex, Sh
 
     MemoryBlock blk = d->allocator.alloc(total);
     if (blk.ptr == nullptr) { return false; }
-    sp->key_block = blk;
+    rec->key_block = blk;
 
     uint8_t* p = static_cast<uint8_t*>(blk.ptr);
     auto take_space = [&p](size_t n) -> void* {
@@ -180,103 +201,104 @@ static bool build_key(DeviceImpl* d, SharedPipeline* sp, ShaderSource vertex, Sh
         return out;
     };
 
-    sp->vs_size  = static_cast<uint32_t>(vertex.source.size());
-    sp->vs_bytes = take_bytes(vertex.source.data(), vertex.source.size());
-    sp->vs_entry = take_str(vertex.entry_point);
-    sp->fs_size  = static_cast<uint32_t>(fragment.source.size());
-    sp->fs_bytes = take_bytes(fragment.source.data(), fragment.source.size());
-    sp->fs_entry = take_str(fragment.entry_point);
+    rec->vs_size  = static_cast<uint32_t>(vertex.source.size());
+    rec->vs_bytes = take_bytes(vertex.source.data(), vertex.source.size());
+    rec->vs_entry = take_str(vertex.entry_point);
+    rec->fs_size  = static_cast<uint32_t>(fragment.source.size());
+    rec->fs_bytes = take_bytes(fragment.source.data(), fragment.source.size());
+    rec->fs_entry = take_str(fragment.entry_point);
 
-    sp->spec_size = static_cast<uint32_t>(spec.dataSize);
-    sp->spec_data = take_bytes(spec.pData, spec.dataSize);
-    sp->spec_count = spec.mapEntryCount;
+    rec->spec_size = static_cast<uint32_t>(spec.dataSize);
+    rec->spec_data = take_bytes(spec.pData, spec.dataSize);
+    rec->spec_count = spec.mapEntryCount;
     uint32_t* ids = static_cast<uint32_t*>(take_space(spec.mapEntryCount * sizeof(uint32_t)));
     uint32_t* sizes = static_cast<uint32_t*>(take_space(spec.mapEntryCount * sizeof(uint32_t)));
     for (uint32_t i = 0; i < spec.mapEntryCount; ++i) {
         ids[i]   = spec.pMapEntries[i].constantID;
         sizes[i] = spec.pMapEntries[i].size;
     }
-    sp->spec_ids   = ids;
-    sp->spec_sizes = sizes;
+    rec->spec_ids   = ids;
+    rec->spec_sizes = sizes;
 
     if (desc) {
-        sp->topology          = desc->topology;
-        sp->sample_count      = desc->sample_count;
-        sp->alpha_to_coverage = desc->alpha_to_coverage;
-        sp->depth_format      = desc->depth_format;
-        sp->stencil_format    = desc->stencil_format;
-        sp->color_target_count = ct_count;
+        rec->topology          = desc->topology;
+        rec->sample_count      = desc->sample_count;
+        rec->alpha_to_coverage = desc->alpha_to_coverage;
+        rec->depth_format      = desc->depth_format;
+        rec->stencil_format    = desc->stencil_format;
+        rec->color_target_count = ct_count;
         ColorTarget* cts = static_cast<ColorTarget*>(take_space(ct_count * sizeof(ColorTarget)));
         for (uint32_t i = 0; i < ct_count; ++i) { cts[i] = desc->color_targets[i]; }
-        sp->color_targets = cts;
+        rec->color_targets = cts;
     }
     return true;
 }
 
-// Finds a live shared pipeline with identical inputs and bumps its refcount.
-// Returns nullptr on miss.
-static SharedPipeline* dedup_find(DeviceImpl* d, ShaderSource vertex, ShaderSource fragment,
-                                  const VkSpecializationInfo& spec, const RasterDesc* desc) {
-    for (SharedPipeline* sp : d->shared_pipelines) {
-        const bool eq = desc ? graphics_key_equal(*sp, vertex, fragment, spec, *desc)
-                             : compute_key_equal(*sp, vertex, spec);
-        if (eq) {
-            sp->refcount++;
-            return sp;
-        }
-    }
-    return nullptr;
-}
-
-// Allocates a zero-initialized shared entry (stable address across vector
-// growth). Returns nullptr on allocation failure.
-static SharedPipeline* alloc_shared_pipeline(DeviceImpl* d) {
-    MemoryBlock blk = d->allocator.alloc(sizeof(SharedPipeline));
+static PipelineRecord* alloc_record(DeviceImpl* d) {
+    MemoryBlock blk = d->allocator.alloc(sizeof(PipelineRecord));
     if (blk.ptr == nullptr) { return nullptr; }
-    return ::new (blk.ptr) SharedPipeline();
+    auto* rec = ::new (blk.ptr) PipelineRecord();
+    condvar_init(&rec->wait_cv);
+    return rec;
 }
 
-static void free_shared_pipeline(DeviceImpl* d, SharedPipeline* sp) {
-    sp->~SharedPipeline();
-    d->allocator.free({.ptr = sp, .len = sizeof(SharedPipeline)});
+void free_record(DeviceImpl* d, PipelineRecord* rec) {
+    condvar_destroy(&rec->wait_cv);
+    rec->~PipelineRecord();
+    d->allocator.free({.ptr = rec, .len = sizeof(PipelineRecord)});
 }
 
-// --- Compute pipeline ----------------------------------------------------------------
+// --- Worker-side compilation --------------------------------------------------------------
 
-Handle<Pipeline> create_compute_pipeline(Device                             dev,
-                                         ShaderSource                       source,
-                                         Span<const SpecializationConstant> constants) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+// Rebuilds VkSpecializationInfo from the record's owned data (offsets are the
+// cumulative sizes, matching construct_specialization_info).
+static VkSpecializationInfo rebuild_spec_info(Arena* arena, const PipelineRecord& rec) {
+    Span<VkSpecializationMapEntry> entries{};
+    uint32_t                       offset = 0;
+    for (uint32_t i = 0; i < rec.spec_count; ++i) {
+        entries = concat(arena, entries,
+                         VkSpecializationMapEntry{
+                             .constantID = rec.spec_ids[i],
+                             .offset     = offset,
+                             .size       = rec.spec_sizes[i],
+                         });
+        offset += rec.spec_sizes[i];
+    }
+    return VkSpecializationInfo{
+        .mapEntryCount = rec.spec_count,
+        .pMapEntries   = entries.data(),
+        .dataSize      = rec.spec_size,
+        .pData         = rec.spec_data,
+    };
+}
 
-    Arena* arena = get_thread_local_arena(d);
-    const VkSpecializationInfo specialization_info =
-        construct_specialization_info(constants, arena);
+static VkResult compile_compute(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
+                                bool fail_on_compile, VkPipeline* out) {
+    VkSpecializationInfo spec = rebuild_spec_info(arena, *rec);
 
-    // maintenance5: chain VkShaderModuleCreateInfo into the stage create info
     VkShaderModuleCreateInfo module_info{
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext    = nullptr,
         .flags    = 0,
-        .codeSize = source.source.size(),
-        .pCode    = reinterpret_cast<const uint32_t*>(source.source.data()),
+        .codeSize = rec->vs_size,
+        .pCode    = reinterpret_cast<const uint32_t*>(rec->vs_bytes),
     };
-
     VkPipelineShaderStageCreateInfo stage{
         .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .pNext               = &module_info,
         .flags               = 0,
         .stage               = VK_SHADER_STAGE_COMPUTE_BIT,
         .module              = VK_NULL_HANDLE,
-        .pName               = make_null_terminated(arena, source.entry_point),
-        .pSpecializationInfo = &specialization_info,
+        .pName               = rec->vs_entry,
+        .pSpecializationInfo = &spec,
     };
 
     VkPipelineCreateFlags2CreateInfo flags2{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
         .pNext = nullptr,
-        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
+                 (fail_on_compile ? VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0),
     };
-
     VkComputePipelineCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .pNext = &flags2,
@@ -286,72 +308,27 @@ Handle<Pipeline> create_compute_pipeline(Device                             dev,
         .basePipelineHandle = VK_NULL_HANDLE,
         .basePipelineIndex  = 0,
     };
-
-    VkPipeline pipeline = VK_NULL_HANDLE;
-
-    mutex_lock(&d->pipeline_lock);
-    if (SharedPipeline* hit = dedup_find(d, source, {}, specialization_info, nullptr)) {
-        auto h = d->pipeline_pool.emplace(PipelineImpl{hit});
-        mutex_unlock(&d->pipeline_lock);
-        return handle_cast<Pipeline>(h);
-    }
-
-    if (!IZ_CHK(d, vkCreateComputePipelines(d->device, d->vk_pipeline_cache, 1, &info, nullptr, &pipeline),
-                "create_compute_pipeline failed")) {
-        mutex_unlock(&d->pipeline_lock);
-        return {};
-    }
-
-    SharedPipeline* sp = alloc_shared_pipeline(d);
-    if (sp == nullptr) {
-        vkDestroyPipeline(d->device, pipeline, nullptr);
-        mutex_unlock(&d->pipeline_lock);
-        return {};
-    }
-    sp->vk_pipeline = pipeline;
-    sp->bind_point  = VK_PIPELINE_BIND_POINT_COMPUTE;
-    sp->refcount    = 1;
-    if (!build_key(d, sp, source, {}, specialization_info, nullptr)) {
-        vkDestroyPipeline(d->device, pipeline, nullptr);
-        free_shared_pipeline(d, sp);
-        mutex_unlock(&d->pipeline_lock);
-        return {};
-    }
-    d->shared_pipelines.push_back(sp);
-    auto h = d->pipeline_pool.emplace(PipelineImpl{sp});
-    mutex_unlock(&d->pipeline_lock);
-    return handle_cast<Pipeline>(h);
+    return vkCreateComputePipelines(d->device, d->vk_pipeline_cache, 1, &info, nullptr, out);
 }
 
-// --- Graphics pipeline -----------------------------------------------------------------
+static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
+                                 bool fail_on_compile, VkPipeline* out) {
+    VkSpecializationInfo spec = rebuild_spec_info(arena, *rec);
 
-Handle<Pipeline> create_graphics_pipeline(Device                             dev,
-                                          ShaderSource                       vertex,
-                                          ShaderSource                       fragment,
-                                          const RasterDesc&                  desc,
-                                          Span<const SpecializationConstant> constants) {
-    auto* d = reinterpret_cast<DeviceImpl*>(dev);
-
-    Arena* arena = get_thread_local_arena(d);
-    const VkSpecializationInfo specialization_info =
-        construct_specialization_info(constants, arena);
-
-    // Shader module create infos chained into stages (maintenance5)
     VkShaderModuleCreateInfo vert_module_info{
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext    = nullptr,
         .flags    = 0,
-        .codeSize = vertex.source.size(),
-        .pCode    = reinterpret_cast<const uint32_t*>(vertex.source.data()),
+        .codeSize = rec->vs_size,
+        .pCode    = reinterpret_cast<const uint32_t*>(rec->vs_bytes),
     };
     VkShaderModuleCreateInfo frag_module_info{
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext    = nullptr,
         .flags    = 0,
-        .codeSize = fragment.source.size(),
-        .pCode    = reinterpret_cast<const uint32_t*>(fragment.source.data()),
+        .codeSize = rec->fs_size,
+        .pCode    = reinterpret_cast<const uint32_t*>(rec->fs_bytes),
     };
-
     VkPipelineShaderStageCreateInfo stages[] = {
         {
             .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -359,8 +336,8 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
             .flags               = 0,
             .stage               = VK_SHADER_STAGE_VERTEX_BIT,
             .module              = VK_NULL_HANDLE,
-            .pName               = make_null_terminated(arena, vertex.entry_point),
-            .pSpecializationInfo = &specialization_info,
+            .pName               = rec->vs_entry,
+            .pSpecializationInfo = &spec,
         },
         {
             .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -368,12 +345,11 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
             .flags               = 0,
             .stage               = VK_SHADER_STAGE_FRAGMENT_BIT,
             .module              = VK_NULL_HANDLE,
-            .pName               = make_null_terminated(arena, fragment.entry_point),
-            .pSpecializationInfo = &specialization_info,
+            .pName               = rec->fs_entry,
+            .pSpecializationInfo = &spec,
         },
     };
 
-    // Vertex input: none (vertex data via BDA pointers in push data)
     VkPipelineVertexInputStateCreateInfo vertex_input_state{
         .sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .pNext                           = nullptr,
@@ -388,18 +364,15 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .pNext                  = nullptr,
         .flags                  = 0,
-        .topology               = bridge(desc.topology),
+        .topology               = bridge(rec->topology),
         .primitiveRestartEnable = false,
     };
 
-    // Color blend + attachment formats
-    Span<VkPipelineColorBlendAttachmentState> color_blend_states{};
-    Span<VkFormat>                            color_formats{};
-    // Dual-source factors are optional: reject deterministically when the
-    // device does not support dualSrcBlend (no silent fallback).
+    // Color blend + attachment formats. Dual-source factors are optional:
+    // reject deterministically when unsupported (no silent fallback).
     const bool needs_dual_src = [&]() {
-        for (auto& t : desc.color_targets) {
-            const auto& b = t.blendstate;
+        for (uint32_t i = 0; i < rec->color_target_count; ++i) {
+            const auto& b = rec->color_targets[i].blendstate;
             if (b.src_color_factor == Factor::Src1Color || b.src_color_factor == Factor::OneMinusSrc1Color ||
                 b.dst_color_factor == Factor::Src1Color || b.dst_color_factor == Factor::OneMinusSrc1Color ||
                 b.src_alpha_factor == Factor::Src1Color || b.src_alpha_factor == Factor::OneMinusSrc1Color ||
@@ -417,11 +390,14 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
         IZ_LOG(d, LogLevel::Error,
                "create_graphics_pipeline: dual-source blend factors requested but the "
                "device does not support dualSrcBlend");
-        return {};
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     }
-    for (auto& t : desc.color_targets) {
-        color_blend_states = concat(arena, color_blend_states, bridge(t.blendstate));
-        color_formats      = concat(arena, color_formats, bridge(t.format));
+
+    Span<VkPipelineColorBlendAttachmentState> color_blend_states{};
+    Span<VkFormat>                            color_formats{};
+    for (uint32_t i = 0; i < rec->color_target_count; ++i) {
+        color_blend_states = concat(arena, color_blend_states, bridge(rec->color_targets[i].blendstate));
+        color_formats      = concat(arena, color_formats, bridge(rec->color_targets[i].format));
     }
 
     VkPipelineColorBlendStateCreateInfo color_blend_state{
@@ -455,11 +431,11 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
         .sType                 = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .pNext                 = nullptr,
         .flags                 = 0,
-        .rasterizationSamples  = static_cast<VkSampleCountFlagBits>(desc.sample_count == 0 ? 1 : desc.sample_count),
+        .rasterizationSamples  = static_cast<VkSampleCountFlagBits>(rec->sample_count == 0 ? 1 : rec->sample_count),
         .sampleShadingEnable   = false,
         .minSampleShading      = 1.0f,
         .pSampleMask           = nullptr,
-        .alphaToCoverageEnable = desc.alpha_to_coverage,
+        .alphaToCoverageEnable = rec->alpha_to_coverage,
         .alphaToOneEnable      = false,
     };
 
@@ -496,8 +472,8 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
         .pDynamicStates    = dynamic_states,
     };
 
-    VkFormat depth_format   = bridge(desc.depth_format);
-    VkFormat stencil_format = bridge(desc.stencil_format);
+    VkFormat depth_format   = bridge(rec->depth_format);
+    VkFormat stencil_format = bridge(rec->stencil_format);
 
     VkPipelineRenderingCreateInfo rendering_info{
         .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
@@ -512,7 +488,8 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
     VkPipelineCreateFlags2CreateInfo flags2{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
         .pNext = &rendering_info,
-        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
+                 (fail_on_compile ? VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0),
     };
 
     VkGraphicsPipelineCreateInfo create_info{
@@ -536,71 +513,356 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
         .basePipelineHandle  = VK_NULL_HANDLE,
         .basePipelineIndex   = 0,
     };
+    return vkCreateGraphicsPipelines(d->device, d->vk_pipeline_cache, 1, &create_info, nullptr, out);
+}
 
-    VkPipeline pipeline = VK_NULL_HANDLE;
+static VkResult compile_record(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
+                               bool fail_on_compile, VkPipeline* out) {
+    return rec->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS
+               ? compile_graphics(d, arena, rec, fail_on_compile, out)
+               : compile_compute(d, arena, rec, fail_on_compile, out);
+}
+
+// Compiles one record on the worker and publishes Ready or Failed (monotonic).
+static void process_record(DeviceImpl* d, PipelineRecord* rec) {
+    Arena*      arena = get_thread_local_arena(d);
+    const bool  probing = d->pipeline_cache_control;
+    const double t0 = monotonic_seconds();
+    VkPipeline  pipeline = VK_NULL_HANDLE;
+    VkResult    result;
+
+    rec->state.store(probing ? InternalPipelineState::ProbingCache
+                             : InternalPipelineState::Compiling,
+                     std::memory_order_relaxed);
+    if (probing) {
+        // Cache-only probe. VK_PIPELINE_COMPILE_REQUIRED is expected control
+        // flow, not an error: it means the driver would compile, so run the
+        // real create (without the fail-on-compile bit).
+        result = compile_record(d, arena, rec, /*fail_on_compile=*/true, &pipeline);
+        if (result == VK_PIPELINE_COMPILE_REQUIRED) {
+            atomic_fetch_add(&d->stat_compile_required, 1);
+            rec->state.store(InternalPipelineState::Compiling, std::memory_order_relaxed);
+            result = compile_record(d, arena, rec, /*fail_on_compile=*/false, &pipeline);
+        } else if (result == VK_SUCCESS) {
+            atomic_fetch_add(&d->stat_probe_hits, 1);
+        }
+    } else {
+        result = compile_record(d, arena, rec, /*fail_on_compile=*/false, &pipeline);
+    }
+
+    const double elapsed_ms = (monotonic_seconds() - t0) * 1000.0;
+    if (result == VK_SUCCESS) {
+        atomic_fetch_add(&d->stat_full_compiles, 1);
+        rec->vk_pipeline = pipeline;   // publish before the Ready store (release)
+        rec->state.store(InternalPipelineState::Ready, std::memory_order_release);
+        log_fmt(d, LogLevel::Info, __LINE__, "pipeline.cpp",
+                "compiled %s pipeline in %.2f ms",
+                rec->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? "graphics" : "compute",
+                elapsed_ms);
+    } else {
+        atomic_fetch_add(&d->stat_failures, 1);
+        rec->failure_result = result;
+        rec->state.store(InternalPipelineState::Failed, std::memory_order_release);
+        log_vk_impl(d, result, "pipeline compilation failed", __LINE__, "pipeline.cpp"_sv);
+    }
+
+    mutex_lock(&rec->wait_mutex);
+    condvar_broadcast(&rec->wait_cv);
+    mutex_unlock(&rec->wait_mutex);
+}
+
+void compiler_worker_main(void* arg) {
+    auto* d = static_cast<DeviceImpl*>(arg);
+    d->compiler_thread_id = current_thread_id();
+    for (;;) {
+        PipelineRecord* rec = nullptr;
+        mutex_lock(&d->compiler_lock);
+        while (!atomic_load(&d->compiler_shutdown) &&
+               (d->compiler_queue.is_empty() || atomic_load(&d->compiler_paused))) {
+            condvar_wait(&d->compiler_cv, &d->compiler_lock);
+        }
+        if (d->compiler_queue.is_empty() && atomic_load(&d->compiler_shutdown)) {
+            mutex_unlock(&d->compiler_lock);
+            break;
+        }
+        rec = d->compiler_queue[0];
+        d->compiler_queue.erase(d->compiler_queue.begin(), d->compiler_queue.begin() + 1);
+        atomic_fetch_add(&d->compiler_busy, 1);
+        mutex_unlock(&d->compiler_lock);
+
+        process_record(d, rec);
+        release_pipeline_ref(d, rec);   // the worker's reference
+
+        mutex_lock(&d->compiler_lock);
+        atomic_fetch_add(&d->compiler_busy, -1);
+        condvar_broadcast(&d->compiler_cv);   // wake flush_pipeline_cache waiters
+        mutex_unlock(&d->compiler_lock);
+    }
+}
+
+// --- Reference lifetime ------------------------------------------------------------------
+
+// Releases one reference; destroys the record (and its VkPipeline) with the last.
+void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec) {
+    if (rec->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) { return; }
+    // Last reference: remove from the dedup map (under the lock, re-checking
+    // that no lookup resurrected it), then destroy outside the lock.
+    mutex_lock(&d->pipeline_lock);
+    if (rec->refs.load(std::memory_order_relaxed) == 0) {
+        for (uint32_t i = 0; i < d->pipeline_records.size(); ++i) {
+            if (d->pipeline_records[i] == rec) {
+                d->pipeline_records[i] = d->pipeline_records[d->pipeline_records.size() - 1];
+                d->pipeline_records.pop_back();
+                break;
+            }
+        }
+    }
+    mutex_unlock(&d->pipeline_lock);
+
+    if (rec->vk_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(d->device, rec->vk_pipeline, nullptr);
+    }
+    if (rec->key_block.ptr != nullptr) { d->allocator.free(rec->key_block); }
+    free_record(d, rec);
+}
+
+// --- Request map helpers (pipeline_lock held by caller) ---------------------------------
+
+static PipelineRecord* find_record_locked(DeviceImpl* d, ShaderSource vertex, ShaderSource fragment,
+                                          const VkSpecializationInfo& spec, const RasterDesc* desc) {
+    for (PipelineRecord* rec : d->pipeline_records) {
+        if (rec->refs.load(std::memory_order_relaxed) == 0) { continue; }
+        const bool eq = desc ? graphics_key_equal(*rec, vertex, fragment, spec, *desc)
+                             : compute_key_equal(*rec, vertex, spec);
+        if (eq) {
+            rec->refs.fetch_add(1, std::memory_order_relaxed);
+            return rec;
+        }
+    }
+    return nullptr;
+}
+
+static void enqueue_record(DeviceImpl* d, PipelineRecord* rec) {
+    mutex_lock(&d->compiler_lock);
+    d->compiler_queue.push_back(rec);
+    const int64_t depth = static_cast<int64_t>(d->compiler_queue.size());
+    if (depth > atomic_load(&d->stat_max_queue_depth)) {
+        atomic_exchange(&d->stat_max_queue_depth, depth);
+    }
+    condvar_signal(&d->compiler_cv);
+    mutex_unlock(&d->compiler_lock);
+}
+
+// --- Async request API -------------------------------------------------------------------
+
+Handle<Pipeline> request_compute_pipeline(Device                             dev,
+                                          ShaderSource                       source,
+                                          Span<const SpecializationConstant> constants) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    atomic_fetch_add(&d->stat_requests, 1);
+    if (atomic_load(&d->device_destroying)) { return {}; }
+
+    Arena* arena = get_thread_local_arena(d);
+    const VkSpecializationInfo spec_info = construct_specialization_info(constants, arena);
 
     mutex_lock(&d->pipeline_lock);
-    if (SharedPipeline* hit = dedup_find(d, vertex, fragment, specialization_info, &desc)) {
+    if (PipelineRecord* hit = find_record_locked(d, source, {}, spec_info, nullptr)) {
+        atomic_fetch_add(&d->stat_dedup_hits, 1);
         auto h = d->pipeline_pool.emplace(PipelineImpl{hit});
         mutex_unlock(&d->pipeline_lock);
         return handle_cast<Pipeline>(h);
     }
-
-    if (!IZ_CHK(d, vkCreateGraphicsPipelines(d->device, d->vk_pipeline_cache, 1, &create_info, nullptr, &pipeline),
-                "create_graphics_pipeline failed")) {
-        mutex_unlock(&d->pipeline_lock);
-        return {};
-    }
-
-    SharedPipeline* sp = alloc_shared_pipeline(d);
-    if (sp == nullptr) {
-        vkDestroyPipeline(d->device, pipeline, nullptr);
-        mutex_unlock(&d->pipeline_lock);
-        return {};
-    }
-    sp->vk_pipeline = pipeline;
-    sp->bind_point  = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sp->refcount    = 1;
-    if (!build_key(d, sp, vertex, fragment, specialization_info, &desc)) {
-        vkDestroyPipeline(d->device, pipeline, nullptr);
-        free_shared_pipeline(d, sp);
-        mutex_unlock(&d->pipeline_lock);
-        return {};
-    }
-    d->shared_pipelines.push_back(sp);
-    auto h = d->pipeline_pool.emplace(PipelineImpl{sp});
     mutex_unlock(&d->pipeline_lock);
+
+    // Miss: build the owned key outside the lock (allocation), then re-check.
+    PipelineRecord* rec = alloc_record(d);
+    if (rec == nullptr) { return {}; }
+    rec->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
+    if (!build_key(d, rec, source, {}, spec_info, nullptr)) {
+        free_record(d, rec);
+        return {};
+    }
+
+    mutex_lock(&d->pipeline_lock);
+    if (PipelineRecord* other = find_record_locked(d, source, {}, spec_info, nullptr)) {
+        atomic_fetch_add(&d->stat_dedup_hits, 1);
+        auto h = d->pipeline_pool.emplace(PipelineImpl{other});
+        mutex_unlock(&d->pipeline_lock);
+        free_record(d, rec);
+        return handle_cast<Pipeline>(h);
+    }
+    rec->refs.store(2, std::memory_order_relaxed);   // 1 user + 1 worker
+    rec->state.store(InternalPipelineState::Queued, std::memory_order_relaxed);
+    d->pipeline_records.push_back(rec);
+    auto h = d->pipeline_pool.emplace(PipelineImpl{rec});
+    mutex_unlock(&d->pipeline_lock);
+
+    enqueue_record(d, rec);
     return handle_cast<Pipeline>(h);
+}
+
+Handle<Pipeline> request_graphics_pipeline(Device                             dev,
+                                           ShaderSource                       vertex,
+                                           ShaderSource                       fragment,
+                                           const RasterDesc&                  desc,
+                                           Span<const SpecializationConstant> constants) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    atomic_fetch_add(&d->stat_requests, 1);
+    if (atomic_load(&d->device_destroying)) { return {}; }
+
+    Arena* arena = get_thread_local_arena(d);
+    const VkSpecializationInfo spec_info = construct_specialization_info(constants, arena);
+
+    mutex_lock(&d->pipeline_lock);
+    if (PipelineRecord* hit = find_record_locked(d, vertex, fragment, spec_info, &desc)) {
+        atomic_fetch_add(&d->stat_dedup_hits, 1);
+        auto h = d->pipeline_pool.emplace(PipelineImpl{hit});
+        mutex_unlock(&d->pipeline_lock);
+        return handle_cast<Pipeline>(h);
+    }
+    mutex_unlock(&d->pipeline_lock);
+
+    PipelineRecord* rec = alloc_record(d);
+    if (rec == nullptr) { return {}; }
+    rec->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    if (!build_key(d, rec, vertex, fragment, spec_info, &desc)) {
+        free_record(d, rec);
+        return {};
+    }
+
+    mutex_lock(&d->pipeline_lock);
+    if (PipelineRecord* other = find_record_locked(d, vertex, fragment, spec_info, &desc)) {
+        atomic_fetch_add(&d->stat_dedup_hits, 1);
+        auto h = d->pipeline_pool.emplace(PipelineImpl{other});
+        mutex_unlock(&d->pipeline_lock);
+        free_record(d, rec);
+        return handle_cast<Pipeline>(h);
+    }
+    rec->refs.store(2, std::memory_order_relaxed);
+    rec->state.store(InternalPipelineState::Queued, std::memory_order_relaxed);
+    d->pipeline_records.push_back(rec);
+    auto h = d->pipeline_pool.emplace(PipelineImpl{rec});
+    mutex_unlock(&d->pipeline_lock);
+
+    enqueue_record(d, rec);
+    return handle_cast<Pipeline>(h);
+}
+
+PipelineStatus get_pipeline_status(Device dev, Handle<Pipeline> pipeline) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    switch (rec->state.load(std::memory_order_acquire)) {
+        case InternalPipelineState::Ready:  return PipelineStatus::Ready;
+        case InternalPipelineState::Failed: return PipelineStatus::Failed;
+        default:                            return PipelineStatus::Pending;
+    }
+}
+
+bool wait_pipeline(Device dev, Handle<Pipeline> pipeline) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    const double t0 = monotonic_seconds();
+
+    mutex_lock(&rec->wait_mutex);
+    for (;;) {
+        const InternalPipelineState st = rec->state.load(std::memory_order_acquire);
+        if (st == InternalPipelineState::Ready || st == InternalPipelineState::Failed) { break; }
+        condvar_wait(&rec->wait_cv, &rec->wait_mutex);
+    }
+    const bool ready = rec->state.load(std::memory_order_acquire) == InternalPipelineState::Ready;
+    mutex_unlock(&rec->wait_mutex);
+
+    const double waited_ms = (monotonic_seconds() - t0) * 1000.0;
+    if (waited_ms > 0.5) {
+        log_fmt(d, LogLevel::Info, __LINE__, "pipeline.cpp",
+                "wait_pipeline blocked %.2f ms", waited_ms);
+    }
+    return ready;
+}
+
+// --- Persistent cache ----------------------------------------------------------------------
+
+void store_pipeline_cache(DeviceImpl* d) {
+    if (d->vk_pipeline_cache == VK_NULL_HANDLE || !d->cache_callbacks.store) { return; }
+    size_t size = 0;
+    vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, nullptr);
+    if (size == 0) { return; }
+    MemoryBlock blob = d->allocator.alloc(size);
+    if (blob.ptr == nullptr) { return; }
+    VkResult r = vkGetPipelineCacheData(d->device, d->vk_pipeline_cache, &size, blob.ptr);
+    if (r == VK_SUCCESS && size > 0) {
+        d->cache_callbacks.store(d->cache_identity, MemoryBlock{blob.ptr, static_cast<uint32_t>(size)},
+                                 d->cache_callbacks.user);
+    }
+    d->allocator.free(blob);
+}
+
+void flush_pipeline_cache(Device dev) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (d->vk_pipeline_cache == VK_NULL_HANDLE) { return; }
+    // VkPipelineCache is externally synchronized: wait for the compiler worker
+    // to drain before reading cache data.
+    mutex_lock(&d->compiler_lock);
+    while (!d->compiler_queue.is_empty() || atomic_load(&d->compiler_busy) > 0) {
+        condvar_wait(&d->compiler_cv, &d->compiler_lock);
+    }
+    mutex_unlock(&d->compiler_lock);
+    store_pipeline_cache(d);
+}
+
+// --- Blocking convenience creators ---------------------------------------------------------
+
+Handle<Pipeline> create_compute_pipeline(Device                             dev,
+                                         ShaderSource                       source,
+                                         Span<const SpecializationConstant> constants) {
+    Handle<Pipeline> h = request_compute_pipeline(dev, source, constants);
+    if (h.h == 0) { return {}; }
+    if (!wait_pipeline(dev, h)) {
+        free(dev, h);   // release the user reference on failure
+        return {};
+    }
+    return h;
+}
+
+Handle<Pipeline> create_graphics_pipeline(Device                             dev,
+                                          ShaderSource                       vertex,
+                                          ShaderSource                       fragment,
+                                          const RasterDesc&                  desc,
+                                          Span<const SpecializationConstant> constants) {
+    Handle<Pipeline> h = request_graphics_pipeline(dev, vertex, fragment, desc, constants);
+    if (h.h == 0) { return {}; }
+    if (!wait_pipeline(dev, h)) {
+        free(dev, h);
+        return {};
+    }
+    return h;
 }
 
 void free(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-
-    // Decrement the shared pipeline's refcount; destroy it with the last handle.
-    SharedPipeline* sp = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].shared;
-    mutex_lock(&d->pipeline_lock);
-    if (--sp->refcount == 0) {
-        vkDestroyPipeline(d->device, sp->vk_pipeline, nullptr);
-        if (sp->key_block.ptr != nullptr) { d->allocator.free(sp->key_block); }
-        for (uint32_t i = 0; i < d->shared_pipelines.size(); ++i) {
-            if (d->shared_pipelines[i] == sp) {
-                d->shared_pipelines[i] = d->shared_pipelines[d->shared_pipelines.size() - 1];
-                d->shared_pipelines.pop_back();
-                break;
-            }
-        }
-        free_shared_pipeline(d, sp);
-    }
-    mutex_unlock(&d->pipeline_lock);
-
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    release_pipeline_ref(d, rec);   // user reference only
     d->pipeline_pool.erase(handle_cast<PipelineImpl>(pipeline));
 }
 
+// --- White-box test hooks -------------------------------------------------------------------
+
 uint32_t debug_live_pipelines(DeviceImpl* d) {
     mutex_lock(&d->pipeline_lock);
-    const uint32_t n = d->shared_pipelines.size();
+    const uint32_t n = d->pipeline_records.size();
     mutex_unlock(&d->pipeline_lock);
     return n;
+}
+
+uintptr_t debug_last_compile_thread(DeviceImpl* d) {
+    return d->compiler_thread_id;
+}
+
+void debug_set_compiler_paused(DeviceImpl* d, bool paused) {
+    mutex_lock(&d->compiler_lock);
+    atomic_exchange(&d->compiler_paused, paused ? 1 : 0);
+    condvar_broadcast(&d->compiler_cv);
+    mutex_unlock(&d->compiler_lock);
 }
 
 // --- Depth-stencil state ------------------------------------------------------------

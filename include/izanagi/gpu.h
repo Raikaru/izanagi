@@ -362,6 +362,10 @@ enum class SpecializationConstantType : uint8_t {
 
 enum class IndexType : uint8_t { UInt16, UInt32 };
 
+// Asynchronous pipeline request lifecycle. Request -> Pending, then Ready or
+// Failed (see request_compute_pipeline / request_graphics_pipeline).
+enum class PipelineStatus : uint8_t { Pending, Ready, Failed };
+
 // --- Structs -------------------------------------------------------------------
 struct Dimension2D {
     uint32_t x, y;
@@ -612,6 +616,9 @@ void             free_rw_texture_view(Device, TextureView);
 void             free_sampler(Device, SamplerId);
 
 // Pipelines & state
+// Blocking convenience creators: request + wait for Ready. May perform
+// expensive native compilation — intended for loading screens, tools, tests,
+// and small known pipeline sets. Returns a null handle on failure.
 Handle<Pipeline> create_compute_pipeline(Device,
                                          ShaderSource,
                                          Span<const SpecializationConstant> = {});
@@ -620,6 +627,27 @@ Handle<Pipeline> create_graphics_pipeline(Device,
                                           ShaderSource fragment,
                                           const RasterDesc&,
                                           Span<const SpecializationConstant> = {});
+// Asynchronous pipeline requests: never block on native compilation (a
+// device-owned compiler worker compiles in the background). The returned
+// handle is immediately valid; poll get_pipeline_status or block with
+// wait_pipeline. All inputs are deep-copied by the request. Identical
+// descriptions share one compiled pipeline.
+Handle<Pipeline> request_compute_pipeline(Device,
+                                          ShaderSource,
+                                          Span<const SpecializationConstant> = {});
+Handle<Pipeline> request_graphics_pipeline(Device,
+                                           ShaderSource vertex,
+                                           ShaderSource fragment,
+                                           const RasterDesc&,
+                                           Span<const SpecializationConstant> = {});
+PipelineStatus   get_pipeline_status(Device, Handle<Pipeline>);
+// Block until the pipeline reaches Ready or Failed. Returns true only for
+// Ready.
+bool             wait_pipeline(Device, Handle<Pipeline>);
+// Explicitly persist the native pipeline cache now (blocking: waits for
+// queued compilation to drain). For loading screens / shutdown, not frame
+// recording. No-op when no cache callbacks were provided.
+void             flush_pipeline_cache(Device);
 void             free(Device, Handle<Pipeline>);
 Handle<DepthStencilState> create_depth_stencil_state(Device, const DepthStencilDesc&);
 void                      free_depth_stencil_state(Device, Handle<DepthStencilState>);
@@ -648,7 +676,11 @@ void cmd_copy_from_texture(CommandBuffer, Handle<Texture>, GpuPtr dst, const Buf
 // StageFlags::Transfer -> consumer stage after.
 void cmd_generate_mipmaps(CommandBuffer, Handle<Texture>);
 void cmd_barrier(CommandBuffer, StageFlags before, StageFlags after);
-void cmd_set_pipeline(CommandBuffer, Handle<Pipeline>);
+// Bind a Ready pipeline; returns false and records nothing when the pipeline
+// is Pending or Failed, so the application can explicitly bind a fallback or
+// skip the operation. Ignoring the return value is valid for code that only
+// binds blocking-created pipelines.
+bool cmd_set_pipeline(CommandBuffer, Handle<Pipeline>);
 void cmd_set_depth_stencil_state(CommandBuffer, Handle<DepthStencilState>);
 void cmd_set_viewport(CommandBuffer, const Rect2D&);
 void cmd_set_scissor_rect(CommandBuffer, const Rect2D&);

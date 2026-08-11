@@ -2,6 +2,8 @@
 // Internal header shared by the Vulkan backend TUs.
 // Contains DeviceImpl, QueueImpl, CommandBufferImpl, and all backend-internal structs.
 
+#include <atomic>
+
 #include "common/containers.h"
 #include "common/platform_utils.h"
 #include "gpu_to_vk.h"
@@ -54,15 +56,26 @@ struct DepthStencilState {
     DepthStencilDesc desc;
 };
 
-// A compiled pipeline shared by every handle created from an identical
+// Pipeline state machine (monotonic; never Ready -> non-Ready).
+enum class InternalPipelineState : uint8_t { Queued, ProbingCache, Compiling, Ready, Failed };
+
+// A pipeline record shared by every handle created from an identical
 // description. Owns one contiguous key copy (key_block) that fully
-// determines the VkPipeline; destroyed when the last handle is freed
-// (dedup only — no retention beyond live handles).
-struct SharedPipeline {
-    VkPipeline          vk_pipeline = VK_NULL_HANDLE;
-    VkPipelineBindPoint bind_point  = VK_PIPELINE_BIND_POINT_COMPUTE;
-    uint32_t            refcount    = 0;
-    MemoryBlock         key_block   = {};   // owned copy of all create inputs
+// determines the VkPipeline. Compiled on a device-owned worker thread;
+// destroyed when the last reference (user handle, compiler worker, or
+// command-buffer/in-flight) is released. Dedup only — no retention beyond
+// live references.
+struct PipelineRecord {
+    std::atomic<InternalPipelineState> state{InternalPipelineState::Queued};
+    VkPipeline          vk_pipeline    = VK_NULL_HANDLE;  // published with Ready
+    VkPipelineBindPoint bind_point     = VK_PIPELINE_BIND_POINT_COMPUTE;
+    VkResult            failure_result = VK_SUCCESS;
+    std::atomic<uint32_t> refs{0};  // user + worker + command-buffer/in-flight
+
+    mutex   wait_mutex = IZ_MUTEX_INIT;  // only wait_pipeline() sleeps on these
+    condvar wait_cv;
+
+    MemoryBlock key_block = {};  // owned copy of all create inputs
 
     // --- key data (pointers into key_block) ---
     uint8_t* vs_bytes   = nullptr;
@@ -87,7 +100,15 @@ struct SharedPipeline {
 };
 
 struct PipelineImpl {
-    SharedPipeline* shared = nullptr;
+    PipelineRecord* record = nullptr;
+};
+
+// In-flight pipeline references: transferred from command buffers at submit,
+// released when the queue timeline reaches `timeline_value`.
+struct PipelineRefBatch {
+    DeviceImpl* device = nullptr;
+    uint64_t    timeline_value = 0;
+    Vector<PipelineRecord*> records;
 };
 
 struct SemaphoreImpl {
@@ -232,15 +253,37 @@ struct DeviceImpl {
     // Queues (single Default queue in v1)
     QueueImpl* default_queue = nullptr;
 
-    // Pipelines: dedup table + persistent native cache. pipeline_lock covers
-    // both (VkPipelineCache is externally synchronized in the Vulkan spec).
-    // SharedPipeline entries are heap-allocated (stable addresses; the vector
-    // itself reallocates).
+    // Pipelines: dedup map + persistent native cache + async compiler worker.
+    // pipeline_lock covers the map (and record destruction); compiler_lock
+    // covers the worker queue. VkPipelineCache is externally synchronized:
+    // only the worker creates pipelines, and flush/destroy wait for it to
+    // drain before touching cache data.
     mutex                    pipeline_lock = IZ_MUTEX_INIT;
-    Vector<SharedPipeline*>  shared_pipelines;
+    Vector<PipelineRecord*>  pipeline_records;
     VkPipelineCache          vk_pipeline_cache = VK_NULL_HANDLE;
     PipelineCacheCallbacks   cache_callbacks   = {};
     CacheIdentity            cache_identity    = {};
+    bool                     pipeline_cache_control = false;
+
+    // Async compiler worker (single thread, FIFO)
+    mutex                     compiler_lock = IZ_MUTEX_INIT;
+    condvar                   compiler_cv;
+    Vector<PipelineRecord*>   compiler_queue;
+    thread_handle             compiler_thread = 0;
+    int64_t                   compiler_shutdown = 0;  // atomic flags
+    int64_t                   compiler_busy     = 0;  // jobs currently compiling
+    int64_t                   compiler_paused   = 0;  // test hook (under compiler_lock)
+    int64_t                   device_destroying = 0;  // atomic: stop accepting requests
+    uintptr_t                 compiler_thread_id = 0;
+
+    // Compiler diagnostics counters (atomic, best-effort)
+    int64_t stat_requests        = 0;
+    int64_t stat_dedup_hits      = 0;
+    int64_t stat_probe_hits      = 0;
+    int64_t stat_compile_required = 0;
+    int64_t stat_full_compiles   = 0;
+    int64_t stat_failures        = 0;
+    int64_t stat_max_queue_depth = 0;
 
     // Descriptor heap
     DescriptorHeap heap;
@@ -271,6 +314,9 @@ struct QueueImpl {
     uint32_t         queue_family  = 0;
     uint64_t         timeline_value = 0;
     Vector<CompletionEvent> pending_events;
+    // Pipeline references retained for submitted-but-uncompleted work
+    // (sorted by timeline_value; drained by queue_process_events).
+    Vector<PipelineRefBatch*> in_flight_batches;
 };
 
 // --- CommandBufferImpl ----------------------------------------------------------------
@@ -283,6 +329,11 @@ struct CommandBufferImpl {
     GpuPtr current_idx_buffer = 0;
     bool   wait_for_surface_texture = false;
     bool   signal_surface_texture   = false;
+
+    // Pipelines bound by cmd_set_pipeline (Ready only); each holds one
+    // reference. Moved to an in-flight batch at queue_submit, released at
+    // command-pool reset if never submitted.
+    Vector<PipelineRecord*> retained_pipelines;
 };
 
 // --- Thread-local arena state ----------------------------------------------------------
@@ -319,9 +370,17 @@ void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCre
 void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
 void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info);
 
-// White-box test hook: number of live shared pipeline entries (dedup table
-// size). Not part of the public API.
-uint32_t debug_live_pipelines(DeviceImpl* d);
+// White-box test hooks (not part of the public API)
+uint32_t   debug_live_pipelines(DeviceImpl* d);         // records in the dedup map
+uintptr_t  debug_last_compile_thread(DeviceImpl* d);    // thread id of the last native compile (0 = none)
+void       debug_set_compiler_paused(DeviceImpl* d, bool paused);
+
+// pipeline.cpp internals used by commands.cpp / device.cpp
+void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec);
+void free_record(DeviceImpl* d, PipelineRecord* rec);
+void release_inflight_batch(PipelineRefBatch* batch);
+void compiler_worker_main(void* arg);
+void store_pipeline_cache(DeviceImpl* d);
 
 // Descriptor heap bind (commands.cpp, called from queue_start_command_recording)
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd);

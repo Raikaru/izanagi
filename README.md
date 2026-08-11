@@ -46,6 +46,12 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   distinct); an optional per-device native cache (`VkPipelineCache`) is
   seeded/saved via app-provided load/store callbacks keyed by an opaque
   `CacheIdentity`. The native blob is driver/GPU-specific, not transferable.
+- **Asynchronous pipeline compilation.** `request_*_pipeline` deep-copies the
+  description and compiles on a device-owned worker thread — never on the
+  frame-critical thread. `get_pipeline_status`/`wait_pipeline` track
+  Pending → Ready/Failed; `cmd_set_pipeline` returns false for non-Ready
+  pipelines so the application explicitly binds a fallback or skips. See
+  [docs/PipelineCompilation.md](docs/PipelineCompilation.md).
 
 ## Requirements
 
@@ -156,6 +162,11 @@ Windows-only in v1 (Vulkan 1.4 backend).
 14. `cmd_generate_mipmaps` (mip 0 → mip 3 chain)
 15. Pipeline dedup (identical descs share one pipeline; every key field distinct)
 16. Persistent pipeline cache (store/load round-trip + invalid-blob tolerance)
+17. Async pipeline compile (non-blocking proof, in-flight lifetime)
+18. Async Pending/Failed transitions + bind semantics
+19. Async input ownership (caller storage destroyed after request)
+20. Concurrent dedup (4 threads, one record)
+21. Shutdown with queued/compiling work
 
 ## Repository layout
 

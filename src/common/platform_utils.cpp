@@ -1,5 +1,7 @@
 #include "platform_utils.h"
 
+#include <cstdlib>
+
 #if _WIN32
 
 #    include <intrin.h>
@@ -14,10 +16,23 @@ __declspec(dllimport) void __stdcall          AcquireSRWLockShared(void* SRWLock
 __declspec(dllimport) int __stdcall           TryAcquireSRWLockExclusive(void* SRWLock);
 __declspec(dllimport) void __stdcall          ReleaseSRWLockExclusive(void* SRWLock);
 __declspec(dllimport) void __stdcall          ReleaseSRWLockShared(void* SWRLock);
+__declspec(dllimport) void __stdcall          InitializeConditionVariable(void* ConditionVariable);
+__declspec(dllimport) int __stdcall           SleepConditionVariableSRW(void* ConditionVariable, void* SRWLock, unsigned long dwMilliseconds, unsigned long dwFlags);
+__declspec(dllimport) void __stdcall          WakeAllConditionVariable(void* ConditionVariable);
+__declspec(dllimport) void __stdcall          WakeConditionVariable(void* ConditionVariable);
+__declspec(dllimport) void* __stdcall         CreateThread(void* lpThreadAttributes, unsigned long dwStackSize, void* lpStartAddress, void* lpParameter, unsigned long dwCreationFlags, unsigned long* lpThreadId);
+__declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void* hHandle, unsigned long dwMilliseconds);
+__declspec(dllimport) int __stdcall           CloseHandle(void* hObject);
+__declspec(dllimport) int __stdcall           SetThreadPriority(void* hThread, int nPriority);
+__declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
+__declspec(dllimport) int __stdcall           QueryPerformanceCounter(long long* lpPerformanceCount);
+__declspec(dllimport) int __stdcall           QueryPerformanceFrequency(long long* lpFrequency);
 }
 
 #elif __linux__ || __APPLE__
 #    include <pthread.h>
+#    include <sched.h>
+#    include <time.h>
 #else
 #    error "Unimplemented platform"
 #endif
@@ -85,6 +100,78 @@ void rwlock_unlock_write(rwlock* l) {
     ReleaseSRWLockExclusive(l);
 }
 
+void condvar_init(condvar* cv) {
+    InitializeConditionVariable(&cv->impl);
+}
+
+void condvar_destroy(condvar* cv) {
+    (void)cv; // CONDITION_VARIABLE needs no teardown
+}
+
+void condvar_wait(condvar* cv, mutex* mtx) {
+    SleepConditionVariableSRW(&cv->impl, mtx, 0xFFFFFFFFul, 0);
+}
+
+void condvar_signal(condvar* cv) {
+    WakeConditionVariable(&cv->impl);
+}
+
+void condvar_broadcast(condvar* cv) {
+    WakeAllConditionVariable(&cv->impl);
+}
+
+struct thread_start {
+    void (*fn)(void*);
+    void* arg;
+};
+
+static unsigned long __stdcall thread_trampoline(void* p) {
+    auto* start = static_cast<thread_start*>(p);
+    void (*fn)(void*) = start->fn;
+    void* arg         = start->arg;
+    std::free(start);
+    fn(arg);
+    return 0;
+}
+
+bool thread_create(thread_handle* out, void (*fn)(void*), void* arg) {
+    auto* start = static_cast<thread_start*>(std::malloc(sizeof(thread_start)));
+    if (start == nullptr) { return false; }
+    start->fn  = fn;
+    start->arg = arg;
+    unsigned long tid = 0;
+    void* h = CreateThread(nullptr, 0, &thread_trampoline, start, 0, &tid);
+    if (h == nullptr) {
+        std::free(start);
+        return false;
+    }
+    *out = reinterpret_cast<thread_handle>(h);
+    return true;
+}
+
+void thread_join(thread_handle t) {
+    if (t != 0) {
+        WaitForSingleObject(reinterpret_cast<void*>(t), 0xFFFFFFFFul);
+        CloseHandle(reinterpret_cast<void*>(t));
+    }
+}
+
+void thread_set_low_priority(thread_handle t) {
+    if (t != 0) { SetThreadPriority(reinterpret_cast<void*>(t), -1 /* THREAD_PRIORITY_BELOW_NORMAL */); }
+}
+
+uintptr_t current_thread_id() {
+    return GetCurrentThreadId();
+}
+
+double monotonic_seconds() {
+    static long long freq = 0;
+    if (freq == 0) { QueryPerformanceFrequency(&freq); }
+    long long now = 0;
+    QueryPerformanceCounter(&now);
+    return static_cast<double>(now) / static_cast<double>(freq);
+}
+
 #elif __linux__ || __APPLE__
 tls_key tls_alloc(tls_destructor d) {
     pthread_key_t key;
@@ -146,6 +233,76 @@ void rwlock_lock_write(rwlock* l) {
 
 void rwlock_unlock_write(rwlock* l) {
     pthread_rwlock_unlock(l);
+}
+
+void condvar_init(condvar* cv) {
+    pthread_cond_init(&cv->impl, nullptr);
+}
+
+void condvar_destroy(condvar* cv) {
+    pthread_cond_destroy(&cv->impl);
+}
+
+void condvar_wait(condvar* cv, mutex* mtx) {
+    pthread_cond_wait(&cv->impl, mtx);
+}
+
+void condvar_signal(condvar* cv) {
+    pthread_cond_signal(&cv->impl);
+}
+
+void condvar_broadcast(condvar* cv) {
+    pthread_cond_broadcast(&cv->impl);
+}
+
+struct thread_start {
+    void (*fn)(void*);
+    void* arg;
+};
+
+static void* thread_trampoline(void* p) {
+    auto* start = static_cast<thread_start*>(p);
+    void (*fn)(void*) = start->fn;
+    void* arg         = start->arg;
+    std::free(start);
+    fn(arg);
+    return nullptr;
+}
+
+bool thread_create(thread_handle* out, void (*fn)(void*), void* arg) {
+    auto* start = static_cast<thread_start*>(std::malloc(sizeof(thread_start)));
+    if (start == nullptr) { return false; }
+    start->fn  = fn;
+    start->arg = arg;
+    pthread_t t;
+    if (pthread_create(&t, nullptr, &thread_trampoline, start) != 0) {
+        std::free(start);
+        return false;
+    }
+    *out = static_cast<thread_handle>(t);
+    return true;
+}
+
+void thread_join(thread_handle t) {
+    if (t != 0) { pthread_join(static_cast<pthread_t>(t), nullptr); }
+}
+
+void thread_set_low_priority(thread_handle t) {
+    if (t == 0) { return; }
+    // Best-effort: SCHED_OTHER priority tweak; may fail without privileges.
+    sched_param param{};
+    param.sched_priority = 0;
+    pthread_setschedparam(static_cast<pthread_t>(t), SCHED_OTHER, &param);
+}
+
+uintptr_t current_thread_id() {
+    return static_cast<uintptr_t>(pthread_self());
+}
+
+double monotonic_seconds() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
 #endif
