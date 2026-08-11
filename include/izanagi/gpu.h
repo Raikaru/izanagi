@@ -614,6 +614,14 @@ GpuPtr malloc(Device, size_t bytes, Memory = Memory::Default);
 GpuPtr malloc(Device, size_t bytes, size_t align, Memory = Memory::Default);
 void   free(Device, GpuPtr);
 void*  get_host_pointer(Device, GpuPtr);
+// Host-memory synchronization for non-coherent allocations. flush makes CPU
+// writes visible to the GPU (upload); invalidate makes GPU writes visible to
+// the CPU (readback). Coherent memory is a successful no-op. Ranges are
+// validated against the allocation and aligned to the non-coherent atom size.
+// Call flush after writing an upload buffer before submitting; call invalidate
+// after GPU work completes before reading a readback buffer.
+bool   flush_host_memory(Device, GpuPtr, size_t size);
+bool   invalidate_host_memory(Device, GpuPtr, size_t size);
 
 // Textures + global heap
 TextureSizeAlign get_texture_size_align(Device, const TextureDesc&);

@@ -2219,6 +2219,70 @@ static void test_texture_cb_retention() {
     printf("  PASS\n");
 }
 
+// --- Test 27: Memory alignment, bounds validation, coherence ops -----------------------------
+static void test_memory_alignment_and_bounds() {
+    printf("--- Test: memory alignment + bounds ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    GpuPtr p256 = malloc(d, 100, 256, Memory::Default);
+    CHECK(p256 != 0, "aligned malloc failed");
+    CHECK((p256 % 256) == 0, "user address honors the requested alignment");
+
+    void* hp = get_host_pointer(d, p256);
+    CHECK(hp != nullptr, "host pointer for aligned allocation");
+    void* hp16 = get_host_pointer(d, p256 + 16);
+    CHECK(hp16 == static_cast<char*>(hp) + 16, "interior host pointer is offset correctly");
+
+    // Bounds validation
+    CHECK(get_host_pointer(d, p256 + 100) == nullptr, "one-past-end rejected");
+    CHECK(get_host_pointer(d, p256 + 101) == nullptr, "past-end rejected");
+    CHECK(get_host_pointer(d, p256 - 1) == nullptr, "before-start rejected");
+
+    // 64-bit interior offsets: copy through aligned interior pointers
+    GpuPtr src = malloc(d, 64, 256, Memory::Default);
+    GpuPtr dst = malloc(d, 64, 256, Memory::Default);
+    CHECK(src != 0 && dst != 0, "aligned malloc failed");
+    memset(get_host_pointer(d, src), 0xAB, 64);
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_memcpy(cmd, dst + 8, src + 8, 48);
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "wait failed");
+    auto* d8 = reinterpret_cast<uint8_t*>(get_host_pointer(d, dst + 8));
+    CHECK(d8[0] == 0xAB && d8[47] == 0xAB, "interior copy offset correct");
+    CHECK(reinterpret_cast<uint8_t*>(get_host_pointer(d, dst))[0] == 0,
+          "bytes before the interior offset untouched");
+
+    // Invalid alignment is rejected, not silently ignored
+    CHECK(malloc(d, 64, 3, Memory::Default) == 0, "non-power-of-two alignment rejected");
+
+    // Host memory sync: coherent memory is a successful no-op; invalid ranges fail
+    CHECK(flush_host_memory(d, src, 64), "flush on coherent memory succeeds");
+    CHECK(invalidate_host_memory(d, dst, 64), "invalidate on coherent memory succeeds");
+    CHECK(!flush_host_memory(d, src + 100000, 4), "flush on a bogus pointer fails");
+    CHECK(!invalidate_host_memory(d, src, 65), "range beyond allocation bounds fails");
+
+    GpuPtr a = malloc(d, 8, 8, Memory::Default);
+    GpuPtr b = malloc(d, 8, 8, Memory::Default);
+    CHECK(a != 0 && b != 0, "small aligned malloc failed");
+    CHECK(get_host_pointer(d, a) != nullptr, "small allocation host pointer");
+    CHECK(get_host_pointer(d, a + 8) == nullptr, "adjacent allocation end is exclusive");
+    free(d, a);
+    free(d, b);
+    free(d, p256);
+    free(d, src);
+    free(d, dst);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2259,6 +2323,7 @@ int main() {
     test_headless_pool_retirement();
     test_free_after();
     test_texture_cb_retention();
+    test_memory_alignment_and_bounds();
     test_dual_source_blend();
 
     printf("\n=================\n");

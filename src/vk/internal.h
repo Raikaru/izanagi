@@ -35,10 +35,24 @@ struct CommandBufferImpl;
 // --- Internal structs ------------------------------------------------------------
 
 struct Buffer {
-    VkBuffer       vk_buffer;
-    VmaAllocation  vk_allocation;
-    void*          host_ptr;
-    GpuPtr         device_ptr;
+    VkBuffer        vk_buffer       = VK_NULL_HANDLE;
+    VmaAllocation   vk_allocation   = VK_NULL_HANDLE;
+    void*           host_ptr        = nullptr;   // mapped base (backing)
+    VkDeviceMemory  memory          = VK_NULL_HANDLE;   // for flush/invalidate ranges
+    VkDeviceSize    memory_offset   = 0;
+    VkDeviceAddress backing_address = 0;   // device address of the VkBuffer
+    VkDeviceSize    backing_size    = 0;
+    GpuPtr          user_address    = 0;   // aligned address handed to the application
+    VkDeviceSize    user_size       = 0;   // requested size (not the padded backing)
+    VkDeviceSize    user_offset     = 0;   // user_address - backing_address
+    bool            coherent        = true;
+};
+
+// Buffer/offset pair validated against the allocation's user-visible bounds.
+struct BufferAndOffset {
+    VkBuffer      buffer;
+    VkDeviceSize  offset;   // VkBuffer-relative (64-bit)
+    VmaAllocation alloc;
 };
 
 struct TextureImpl {
@@ -212,14 +226,8 @@ struct CompletionEvent {
 };
 
 // --- GPU pointer map (address -> buffer/offset) -------------------------------------
-struct BufferAndOffset {
-    VkBuffer      buffer;
-    uint32_t      offset;
-    VmaAllocation alloc;
-};
-
 struct GpuPtrMap {
-    GpuPtr        ptr;
+    GpuPtr        ptr;    // user (aligned) address, sorted ascending
     Handle<Buffer> buffer;
 };
 
@@ -310,6 +318,9 @@ struct DeviceImpl {
     TwoLevelBitset sampled_bitset;
     TwoLevelBitset storage_bitset;
     TwoLevelBitset sampler_bitset;
+
+    // Memory limits (for host flush/invalidate range alignment)
+    VkDeviceSize non_coherent_atom_size = 1;
 
     // Uninitialized textures (need UNDEFINED->GENERAL transition)
     mutex                  texture_init_lock = IZ_MUTEX_INIT;

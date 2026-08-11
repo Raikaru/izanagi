@@ -65,9 +65,12 @@ Arena* get_thread_local_arena(DeviceImpl* d) {
 }
 
 // --- Buffer/ptr map ----------------------------------------------------------------------
-BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr) {
+// Finds the live allocation whose user-visible range contains `ptr` (largest
+// base <= ptr, then bounds check against the user size). Rejects pointers in
+// gaps between allocations and past the end. Returns the buffer record and the
+// VkBuffer-relative offset (64-bit, includes the interior alignment).
+static Buffer* find_buffer_for_ptr(DeviceImpl* d, GpuPtr ptr, VkDeviceSize* out_offset) {
     rwlock_lock_read(&d->ptr_map_lock);
-    // Binary search for the largest base address <= ptr
     uint32_t lo = 0, hi = d->ptr_map.size();
     uint32_t best = ~0u;
     while (lo < hi) {
@@ -81,15 +84,30 @@ BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr) {
     }
     if (best == ~0u) {
         rwlock_unlock_read(&d->ptr_map_lock);
+        return nullptr;
+    }
+    auto& entry = d->ptr_map[best];
+    auto& buf   = d->buffer_pool[entry.buffer];
+    // Overflow-safe bounds check (exclusive end).
+    if (ptr - buf.user_address >= buf.user_size) {
+        rwlock_unlock_read(&d->ptr_map_lock);
+        return nullptr;
+    }
+    *out_offset = buf.user_offset + (ptr - buf.user_address);
+    rwlock_unlock_read(&d->ptr_map_lock);
+    return &buf;
+}
+
+BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr) {
+    VkDeviceSize offset = 0;
+    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
+    if (buf == nullptr) {
         return {.buffer = VK_NULL_HANDLE, .offset = 0, .alloc = VK_NULL_HANDLE};
     }
-    auto& entry  = d->ptr_map[best];
-    auto& buf    = d->buffer_pool[entry.buffer];
-    rwlock_unlock_read(&d->ptr_map_lock);
     return {
-        .buffer = buf.vk_buffer,
-        .offset = static_cast<uint32_t>(ptr - buf.device_ptr),
-        .alloc  = buf.vk_allocation,
+        .buffer = buf->vk_buffer,
+        .offset = offset,
+        .alloc  = buf->vk_allocation,
     };
 }
 
@@ -647,6 +665,7 @@ Device create_device(const DeviceDesc& desc) {
         d->cache_identity.device_id = props2.properties.deviceID;
         memcpy(d->cache_identity.driver_uuid, id_props.driverUUID,
                sizeof(d->cache_identity.driver_uuid));
+        d->non_coherent_atom_size = props2.properties.limits.nonCoherentAtomSize;
 
         d->cache_callbacks = desc.pipeline_cache_callbacks;
         if (d->cache_callbacks.load || d->cache_callbacks.store) {
@@ -851,17 +870,28 @@ GpuPtr malloc(Device dev, size_t bytes, Memory memory) {
 GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
 
+    // Validate alignment: must be a power of two (0 = no specific alignment).
+    if (align == 0) { align = 1; }
+    if ((align & (align - 1)) != 0) {
+        IZ_LOG(d, LogLevel::Error, "malloc: alignment must be a power of two");
+        return 0;
+    }
+
     constexpr VkBufferUsageFlags kDefaultUsages =
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 
+    // Overallocate by (align - 1) so the user address can be aligned inside.
+    const VkDeviceSize backing_size =
+        static_cast<VkDeviceSize>(bytes) + static_cast<VkDeviceSize>(align - 1);
+
     VkBufferCreateInfo create_info{
         .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext                 = nullptr,
         .flags                 = 0,
-        .size                  = bytes,
+        .size                  = backing_size,
         .usage                 = kDefaultUsages,
         .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
@@ -909,40 +939,47 @@ GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
         return 0;
     }
 
-    // Apply alignment if needed
-    if (align > 0 && alloc_result.offset % align != 0) {
-        // VMA handles alignment via vkBindBufferMemory; for strict alignment
-        // we would need a sub-allocation. For now, VMA's default alignment
-        // (minMemoryMapAlignment or buffer alignment) is sufficient.
-        // TODO: Strict alignment support if needed.
-    }
-
     VkBufferDeviceAddressInfo addr_info{
         .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
         .pNext  = nullptr,
         .buffer = vk_buffer,
     };
-    GpuPtr device_ptr = vkGetBufferDeviceAddress(d->device, &addr_info);
+    const VkDeviceAddress backing_address = vkGetBufferDeviceAddress(d->device, &addr_info);
+
+    // Align the user address inside the backing allocation.
+    const GpuPtr user_address =
+        (backing_address + align - 1) & ~(static_cast<VkDeviceAddress>(align) - 1);
+    const VkDeviceSize user_offset = user_address - backing_address;
+
+    VkMemoryPropertyFlags props = 0;
+    vmaGetMemoryTypeProperties(d->vma, alloc_result.memoryType, &props);
+    const bool coherent = (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 
     auto handle = d->buffer_pool.emplace(Buffer{
-        .vk_buffer     = vk_buffer,
-        .vk_allocation = vk_allocation,
-        .host_ptr      = alloc_result.pMappedData,
-        .device_ptr    = device_ptr,
+        .vk_buffer       = vk_buffer,
+        .vk_allocation   = vk_allocation,
+        .host_ptr        = alloc_result.pMappedData,
+        .memory          = alloc_result.deviceMemory,
+        .memory_offset   = alloc_result.offset,
+        .backing_address = backing_address,
+        .backing_size    = backing_size,
+        .user_address    = user_address,
+        .user_size       = static_cast<VkDeviceSize>(bytes),
+        .user_offset     = user_offset,
+        .coherent        = coherent,
     });
 
-    // Insert into sorted ptr_map
+    // Insert into sorted ptr_map (by user address; align_up is monotonic).
     rwlock_lock_write(&d->ptr_map_lock);
-    // Binary search for insertion point
     uint32_t lo = 0, hi = d->ptr_map.size();
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;
-        if (d->ptr_map[mid].ptr < device_ptr) { lo = mid + 1; } else { hi = mid; }
+        if (d->ptr_map[mid].ptr < user_address) { lo = mid + 1; } else { hi = mid; }
     }
-    d->ptr_map.insert(d->ptr_map.begin() + lo, GpuPtrMap{.ptr = device_ptr, .buffer = handle});
+    d->ptr_map.insert(d->ptr_map.begin() + lo, GpuPtrMap{.ptr = user_address, .buffer = handle});
     rwlock_unlock_write(&d->ptr_map_lock);
 
-    return device_ptr;
+    return user_address;
 }
 
 void free(Device dev, GpuPtr ptr) {
@@ -994,26 +1031,70 @@ void free_after(Device dev, GpuPtr ptr, Submission s) {
 
 void* get_host_pointer(Device dev, GpuPtr ptr) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    rwlock_lock_read(&d->ptr_map_lock);
-    uint32_t lo = 0, hi = d->ptr_map.size();
-    uint32_t best = ~0u;
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
-        if (d->ptr_map[mid].ptr <= ptr) {
-            best = mid;
-            lo   = mid + 1;
-        } else {
-            hi = mid;
-        }
+    VkDeviceSize offset = 0;
+    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
+    if (buf == nullptr || buf->host_ptr == nullptr) { return nullptr; }
+    return static_cast<char*>(buf->host_ptr) + buf->user_offset + (ptr - buf->user_address);
+}
+
+bool flush_host_memory(Device dev, GpuPtr ptr, size_t size) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (size == 0) { return true; }
+    VkDeviceSize offset = 0;
+    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
+    if (buf == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "flush_host_memory: pointer is not in a live allocation");
+        return false;
     }
-    if (best == ~0u) {
-        rwlock_unlock_read(&d->ptr_map_lock);
-        return nullptr;
+    if (offset + size > buf->user_offset + buf->user_size) {
+        IZ_LOG(d, LogLevel::Error, "flush_host_memory: range exceeds allocation bounds");
+        return false;
     }
-    auto& entry  = d->ptr_map[best];
-    auto& buf    = d->buffer_pool[entry.buffer];
-    rwlock_unlock_read(&d->ptr_map_lock);
-    return static_cast<char*>(buf.host_ptr) + (ptr - buf.device_ptr);
+    if (buf->coherent || buf->memory == VK_NULL_HANDLE) { return true; }
+
+    const VkDeviceSize atom       = d->non_coherent_atom_size;
+    const VkDeviceSize range_begin = buf->memory_offset + offset;
+    const VkDeviceSize range_end   = range_begin + size;
+    const VkDeviceSize aligned_begin = range_begin & ~(atom - 1);
+    const VkDeviceSize aligned_end   = (range_end + atom - 1) & ~(atom - 1);
+    const VkMappedMemoryRange range{
+        .sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .pNext  = nullptr,
+        .memory = buf->memory,
+        .offset = aligned_begin,
+        .size   = aligned_end - aligned_begin,
+    };
+    return vkFlushMappedMemoryRanges(d->device, 1, &range) == VK_SUCCESS;
+}
+
+bool invalidate_host_memory(Device dev, GpuPtr ptr, size_t size) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (size == 0) { return true; }
+    VkDeviceSize offset = 0;
+    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
+    if (buf == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "invalidate_host_memory: pointer is not in a live allocation");
+        return false;
+    }
+    if (offset + size > buf->user_offset + buf->user_size) {
+        IZ_LOG(d, LogLevel::Error, "invalidate_host_memory: range exceeds allocation bounds");
+        return false;
+    }
+    if (buf->coherent || buf->memory == VK_NULL_HANDLE) { return true; }
+
+    const VkDeviceSize atom       = d->non_coherent_atom_size;
+    const VkDeviceSize range_begin = buf->memory_offset + offset;
+    const VkDeviceSize range_end   = range_begin + size;
+    const VkDeviceSize aligned_begin = range_begin & ~(atom - 1);
+    const VkDeviceSize aligned_end   = (range_end + atom - 1) & ~(atom - 1);
+    const VkMappedMemoryRange range{
+        .sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .pNext  = nullptr,
+        .memory = buf->memory,
+        .offset = aligned_begin,
+        .size   = aligned_end - aligned_begin,
+    };
+    return vkInvalidateMappedMemoryRanges(d->device, 1, &range) == VK_SUCCESS;
 }
 
 // --- Semaphores ---------------------------------------------------------------------------
