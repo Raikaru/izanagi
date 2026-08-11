@@ -2054,6 +2054,171 @@ static void test_headless_pool_retirement() {
     printf("  PASS\n");
 }
 
+// --- Test 25: free_after (deferred destruction against a submission) --------------------------
+static void test_free_after() {
+    printf("--- Test: free_after ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    Queue q = get_queue(d);
+
+    // Buffer: used by a submission, then retired against it.
+    GpuPtr buf = malloc(d, 64, Memory::Default);
+    CHECK(buf != 0, "malloc failed");
+    CHECK(get_host_pointer(d, buf) != nullptr, "host pointer valid before free_after");
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "recording failed");
+    cmd_memcpy(cmd, buf, buf, 64);   // self-copy: the buffer is named by the submission
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    free_after(d, buf, s);
+    CHECK(get_host_pointer(d, buf) == nullptr, "free_after invalidates the pointer immediately");
+    CHECK(wait_submission(s), "submission must complete");
+    for (int i = 0; i < 100; ++i) {
+        queue_process_events(q);   // fires the retire batch
+        sleep_ms(5);
+    }
+    GpuPtr buf2 = malloc(d, 64, Memory::Default);
+    CHECK(buf2 != 0, "malloc after retirement works");
+    free(d, buf2);
+
+    // Texture: uploaded, then retired against the upload submission.
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {16, 16, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
+    };
+    Handle<Texture> tex = create_texture(d, tex_desc);
+    CHECK(tex.h != 0, "create_texture failed");
+    GpuPtr staging = malloc(d, 16 * 16 * 4, Memory::Default);
+    GpuPtr readback = malloc(d, 16 * 16 * 4, Memory::Readback);
+    auto* st = reinterpret_cast<uint8_t*>(get_host_pointer(d, staging));
+    memset(st, 0x42, 16 * 16 * 4);
+    cmd = queue_start_command_recording(q);
+    cmd_copy_to_texture(cmd, staging, tex, BufferTextureCopyInfo{.image_extent = {16, 16, 1}});
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, tex, readback, BufferTextureCopyInfo{.image_extent = {16, 16, 1}});
+    cmd_finalize(cmd);
+    Submission s2 = queue_submit(q, {&cmd, 1});
+    CHECK(s2.status == SubmitStatus::Success, "texture submit failed");
+    free_after(d, tex, s2);
+    CHECK(wait_submission(s2), "texture submission must complete");
+    for (int i = 0; i < 100; ++i) { queue_process_events(q); sleep_ms(5); }
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    CHECK(rb[0] == 0x42, "copy result intact after retirement");
+
+    // Pipeline: bound in a submission, then retired against it.
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("memcpy_kernel.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "shader load failed");
+    if (spirv.size() > 0) {
+        ShaderSource src{.source = spirv, .entry_point = "compute_main"_sv};
+        Handle<Pipeline> p = request_compute_pipeline(d, src);
+        CHECK(p.h != 0, "pipeline request failed");
+        CHECK(wait_pipeline(d, p), "pipeline must become Ready");
+        cmd = queue_start_command_recording(q);
+        CHECK(cmd_set_pipeline(cmd, p), "bind must succeed for Ready");
+        cmd_finalize(cmd);
+        Submission s3 = queue_submit(q, {&cmd, 1});
+        CHECK(s3.status == SubmitStatus::Success, "pipeline submit failed");
+        free_after(d, p, s3);
+        CHECK(wait_submission(s3), "pipeline submission must complete");
+        for (int i = 0; i < 100; ++i) { queue_process_events(q); sleep_ms(5); }
+    }
+
+    free(d, staging);
+    free(d, readback);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+// --- Test 26: command-buffer texture retention -----------------------------------------------
+static void test_texture_cb_retention() {
+    printf("--- Test: texture cb retention ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    constexpr uint32_t kSize = 64;
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::BGRA8Unorm,
+        .usage      = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> color_tex = create_texture(d, tex_desc);
+    CHECK(color_tex.h != 0, "create_texture failed");
+    if (color_tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("offscreen_triangle.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "shader load failed");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vs{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fs{.source = spirv, .entry_point = "fragment_main"_sv};
+    ColorTarget ct{.format = Format::BGRA8Unorm};
+    RasterDesc rd{.color_targets = Span<const ColorTarget>(&ct, 1)};
+    Handle<Pipeline> pipeline = create_graphics_pipeline(d, vs, fs, rd);
+    CHECK(pipeline.h != 0, "pipeline creation failed");
+    if (pipeline.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    RenderAttachment color_att{
+        .texture     = color_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{0, 0, 0, 255},
+    };
+    RenderPassDesc pass_desc{
+        .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+        .render_area       = Rect2D{.width = kSize, .height = kSize},
+    };
+    GpuPtr readback = malloc(d, kSize * kSize * 4, Memory::Readback);
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw(cmd, 0, 0, 3, 1);
+    cmd_end_render_pass(cmd);
+    cmd_barrier(cmd, StageFlags::RasterColorOut, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, color_tex, readback, BufferTextureCopyInfo{.image_extent = {kSize, kSize, 1}});
+    cmd_finalize(cmd);
+
+    // Free the user handle while the command buffer retains the texture; the
+    // recorded commands must still find a live native image.
+    free(d, color_tex);
+    free(d, pipeline);
+    Submission s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "submission must complete");
+    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    CHECK(rb[(32 * kSize + 32) * 4 + 2] == 255, "render used the retained texture correctly");
+    for (int i = 0; i < 100; ++i) { queue_process_events(q); sleep_ms(5); }
+
+    free(d, readback);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2092,6 +2257,8 @@ int main() {
     test_async_shutdown_with_pending();
     test_submission_tokens();
     test_headless_pool_retirement();
+    test_free_after();
+    test_texture_cb_retention();
     test_dual_source_blend();
 
     printf("\n=================\n");

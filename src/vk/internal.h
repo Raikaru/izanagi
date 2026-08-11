@@ -50,6 +50,9 @@ struct TextureImpl {
     bool           is_swapchain_image = false;
     uint32_t       mip_count          = 1;
     Dimension3D    dimensions         = {};
+    // 1 per public handle + 1 per command-buffer/in-flight retention;
+    // the pool slot (and native image) is destroyed at zero.
+    int64_t        refs               = 1;   // atomic via platform helpers
 };
 
 struct DepthStencilState {
@@ -103,12 +106,20 @@ struct PipelineImpl {
     PipelineRecord* record = nullptr;
 };
 
-// In-flight pipeline references: transferred from command buffers at submit,
-// released when the queue timeline reaches `timeline_value`.
-struct PipelineRefBatch {
-    DeviceImpl* device = nullptr;
-    uint64_t    timeline_value = 0;
-    Vector<PipelineRecord*> records;
+// Unified queue-timeline retirement: everything retired at a submission's
+// completion (buffers, textures, pipeline references, descriptor slots) is a
+// RetireItem in a value-keyed batch, processed by queue_process_events.
+enum class RetireKind : uint8_t { Buffer, Texture, PipelineRef, SampledSlot, StorageSlot, SamplerSlot };
+
+struct RetireItem {
+    RetireKind kind;
+    uint64_t   a;   // Buffer: buffer handle; Texture: handle.h; PipelineRef: record ptr; slots: index
+    uint64_t   b;   // reserved
+};
+
+struct RetireBatch {
+    uint64_t          value;
+    Vector<RetireItem> items;
 };
 
 struct SemaphoreImpl {
@@ -300,15 +311,6 @@ struct DeviceImpl {
     TwoLevelBitset storage_bitset;
     TwoLevelBitset sampler_bitset;
 
-    // Deferred slot recycling (timeline value at free time)
-    struct DeferredFree {
-        uint32_t slot;
-        uint64_t timeline_value;
-        uint8_t  region; // 0=sampled, 1=storage, 2=sampler
-    };
-    mutex                 deferred_lock = IZ_MUTEX_INIT;
-    Vector<DeferredFree>  deferred_frees;
-
     // Uninitialized textures (need UNDEFINED->GENERAL transition)
     mutex                  texture_init_lock = IZ_MUTEX_INIT;
     Vector<Handle<Texture>> uninitialized_textures;
@@ -325,9 +327,10 @@ struct QueueImpl {
     // Serializes queue submission and presentation on this queue.
     mutex            submit_lock   = IZ_MUTEX_INIT;
     Vector<CompletionEvent> pending_events;
-    // Pipeline references retained for submitted-but-uncompleted work
-    // (sorted by timeline_value; drained by queue_process_events).
-    Vector<PipelineRefBatch*> in_flight_batches;
+    // Unified retirement queue: value-keyed batches (sorted ascending) of
+    // resources/pipeline references/descriptor slots retired when the queue
+    // timeline passes their value. Drained by queue_process_events.
+    Vector<RetireBatch*> retire_queue;
 };
 
 // --- CommandBufferImpl ----------------------------------------------------------------
@@ -342,9 +345,12 @@ struct CommandBufferImpl {
     bool   signal_surface_texture   = false;
 
     // Pipelines bound by cmd_set_pipeline (Ready only); each holds one
-    // reference. Moved to an in-flight batch at queue_submit, released at
-    // command-pool reset if never submitted.
+    // reference. Textures explicitly named by commands (render attachments,
+    // copy sources/destinations); each holds one reference. Both are moved to
+    // retire batches at queue_submit, released at pool reset if never
+    // submitted.
     Vector<PipelineRecord*> retained_pipelines;
+    Vector<Handle<Texture>> retained_textures;
 };
 
 // --- Thread-local arena state ----------------------------------------------------------
@@ -373,12 +379,12 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool);
 
 // Surface helpers (surface.cpp)
 Handle<Semaphore> create_semaphore_internal(DeviceImpl* d, uint64_t init_value);
-void              drain_deferred_frees(DeviceImpl* d, uint64_t current_timeline);
 
 // Descriptor heap write (resources.cpp)
 void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
 void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
 void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info);
+void release_texture_ref(DeviceImpl* d, Handle<Texture> tex);
 
 // White-box test hooks (not part of the public API)
 uint32_t   debug_live_pipelines(DeviceImpl* d);         // records in the dedup map
@@ -391,9 +397,12 @@ int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse re
 // pipeline.cpp internals used by commands.cpp / device.cpp
 void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec);
 void free_record(DeviceImpl* d, PipelineRecord* rec);
-void release_inflight_batch(PipelineRefBatch* batch);
+void process_retire_batch(DeviceImpl* d, RetireBatch* batch);
 void compiler_worker_main(void* arg);
 void store_pipeline_cache(DeviceImpl* d);
+
+// Queue retirement (commands.cpp)
+void enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item);
 
 // Descriptor heap bind (commands.cpp, called from queue_start_command_recording)
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd);

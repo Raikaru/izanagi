@@ -227,9 +227,52 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc, GpuPtr locat
     return handle;
 }
 
+void release_texture_ref(DeviceImpl* d, Handle<Texture> tex) {
+    // 1 per public handle + 1 per command-buffer/in-flight retention; the
+    // pool slot (and native image) is destroyed at zero.
+    auto& t = d->texture_pool[handle_cast<TextureImpl>(tex)];
+    if (atomic_fetch_add(&t.refs, -1) == 1) {
+        d->texture_pool.erase(handle_cast<TextureImpl>(tex));
+    }
+}
+
 void free(Device dev, Handle<Texture> t) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    d->texture_pool.erase(handle_cast<TextureImpl>(t));
+    release_texture_ref(d, t);
+}
+
+// --- Deferred destruction against a submission ------------------------------------------------
+
+void free_after(Device dev, Handle<Texture> tex, Submission s) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+    enqueue_retire(q, value, RetireItem{RetireKind::Texture, tex.h, 0});
+}
+
+void free_texture_view_after(Device dev, TextureView view, Submission s) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+    enqueue_retire(q, value, RetireItem{RetireKind::SampledSlot, static_cast<uint64_t>(view), 0});
+}
+
+void free_rw_texture_view_after(Device dev, TextureView view, Submission s) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+    enqueue_retire(q, value, RetireItem{RetireKind::StorageSlot, static_cast<uint64_t>(view), 0});
+}
+
+void free_sampler_after(Device dev, SamplerId sampler, Submission s) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+    enqueue_retire(q, value, RetireItem{RetireKind::SamplerSlot, static_cast<uint64_t>(sampler), 0});
 }
 
 // --- Texture views (object-less, heap-descriptor-only) -----------------------------------
@@ -311,36 +354,29 @@ SamplerId create_sampler(Device dev, const SamplerDesc& desc) {
     return static_cast<SamplerId>(slot);
 }
 
-// --- Free with deferred recycling --------------------------------------------------------
+// --- Free with deferred recycling (unified queue retirement) ---------------------
 
-static void defer_free_slot(DeviceImpl* d, uint32_t slot, uint8_t region) {
-    // Get the queue's current timeline value for deferred recycling
-    uint64_t timeline_val = 0;
-    if (d->default_queue) {
-        timeline_val = d->default_queue->timeline_value;
-    }
-    mutex_lock(&d->deferred_lock);
-    d->deferred_frees.push_back(DeviceImpl::DeferredFree{
-        .slot           = slot,
-        .timeline_value = timeline_val,
-        .region         = region,
-    });
-    mutex_unlock(&d->deferred_lock);
+static void defer_free_slot(DeviceImpl* d, uint32_t slot, RetireKind kind) {
+    QueueImpl* q = d->default_queue;
+    if (q == nullptr) { return; }
+    // Retire after the latest submitted work completes (conservative default;
+    // explicit free_*_after takes an exact submission).
+    enqueue_retire(q, q->timeline_value, RetireItem{kind, slot, 0});
 }
 
 void free_texture_view(Device dev, TextureView view) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    defer_free_slot(d, static_cast<uint32_t>(view), 0);
+    defer_free_slot(d, static_cast<uint32_t>(view), RetireKind::SampledSlot);
 }
 
 void free_rw_texture_view(Device dev, TextureView view) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    defer_free_slot(d, static_cast<uint32_t>(view), 1);
+    defer_free_slot(d, static_cast<uint32_t>(view), RetireKind::StorageSlot);
 }
 
 void free_sampler(Device dev, SamplerId sampler) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    defer_free_slot(d, static_cast<uint32_t>(sampler), 2);
+    defer_free_slot(d, static_cast<uint32_t>(sampler), RetireKind::SamplerSlot);
 }
 
 }  // namespace gpu

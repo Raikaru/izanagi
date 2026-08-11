@@ -31,9 +31,9 @@ void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
 // --- Command pool management -----------------------------------------------------------
 
 static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
-    // Release pipeline references retained by recorded-but-never-submitted
-    // command buffers (their commands are discarded; the GPU never executed
-    // them, and pool reuse is gated on queue timeline completion).
+    // Release references retained by recorded-but-never-submitted command
+    // buffers (their commands are discarded; the GPU never executed them,
+    // and pool reuse is gated on queue timeline completion).
     for (uint32_t i = 0; i < pool->command_buffers.size(); ++i) {
         auto& cb = pool->command_buffers[i];
         if (cb.device == nullptr) { continue; }
@@ -41,10 +41,26 @@ static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
             release_pipeline_ref(cb.device, rec);
         }
         cb.retained_pipelines.clear();
+        for (Handle<Texture> tex : cb.retained_textures) {
+            release_texture_ref(cb.device, tex);
+        }
+        cb.retained_textures.clear();
     }
     vkResetCommandPool(d->device, pool->command_pool, 0);
     pool->buffer_free_idx = 0;
     atomic_fetch_add(&d->stat_pool_resets, 1);
+}
+
+// Retains a texture explicitly named by a command until the command buffer is
+// submitted (or abandoned), so freeing the user handle cannot destroy a native
+// image the recorded commands still reference.
+static void retain_texture(CommandBufferImpl* cmd, Handle<Texture> tex) {
+    for (Handle<Texture> t : cmd->retained_textures) {
+        if (t.h == tex.h) { return; }   // already retained
+    }
+    auto& t = cmd->device->texture_pool[handle_cast<TextureImpl>(tex)];
+    atomic_fetch_add(&t.refs, 1);
+    cmd->retained_textures.push_back(tex);
 }
 
 CommandPool* get_command_pool(QueueImpl* queue) {
@@ -111,6 +127,8 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
         });
         pool->command_buffers[pool->command_buffers.size() - 1].retained_pipelines =
             Vector<PipelineRecord*>(d->allocator);
+        pool->command_buffers[pool->command_buffers.size() - 1].retained_textures =
+            Vector<Handle<Texture>>(d->allocator);
     }
     CommandBufferImpl* result        = &pool->command_buffers[pool->buffer_free_idx];
     result->wait_for_surface_texture = false;
@@ -149,6 +167,73 @@ void cmd_finalize(CommandBuffer cmd) {
     IZ_CHK(d, vkEndCommandBuffer(cmd->buffer), "cmd_finalize failed");
     // The command pool stays checked out until this command buffer is
     // submitted; finalizing does not make the pool GPU-safe for reuse.
+}
+
+// --- Unified retirement queue --------------------------------------------------------------
+// Caller holds q->submit_lock.
+static void enqueue_retire_locked(DeviceImpl* d, QueueImpl* q, uint64_t value, const RetireItem& item) {
+    for (uint32_t i = 0; i < q->retire_queue.size(); ++i) {
+        RetireBatch* b = q->retire_queue[i];
+        if (b->value == value) {
+            b->items.push_back(item);
+            return;
+        }
+        if (b->value > value) {
+            MemoryBlock blk = d->allocator.alloc(sizeof(RetireBatch));
+            if (blk.ptr == nullptr) { return; }
+            auto* nb = ::new (blk.ptr) RetireBatch{
+                .value = value,
+                .items = Vector<RetireItem>(d->allocator),
+            };
+            nb->items.push_back(item);
+            q->retire_queue.insert(q->retire_queue.begin() + i, nb);
+            return;
+        }
+    }
+    MemoryBlock blk = d->allocator.alloc(sizeof(RetireBatch));
+    if (blk.ptr == nullptr) { return; }
+    auto* nb = ::new (blk.ptr) RetireBatch{
+        .value = value,
+        .items = Vector<RetireItem>(d->allocator),
+    };
+    nb->items.push_back(item);
+    q->retire_queue.push_back(nb);
+}
+
+void enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item) {
+    auto* d = q->device;
+    mutex_lock(&q->submit_lock);
+    enqueue_retire_locked(d, q, value, item);
+    mutex_unlock(&q->submit_lock);
+}
+
+// Destroys/retires the batch's resources. Called without queue locks held.
+void process_retire_batch(DeviceImpl* d, RetireBatch* batch) {
+    for (const RetireItem& item : batch->items) {
+        switch (item.kind) {
+            case RetireKind::Buffer:
+                d->buffer_pool.erase(Handle<Buffer>{.h = item.a});
+                break;
+            case RetireKind::Texture:
+                release_texture_ref(d, Handle<Texture>{.h = item.a});
+                break;
+            case RetireKind::PipelineRef:
+                release_pipeline_ref(d, reinterpret_cast<PipelineRecord*>(item.a));
+                break;
+            case RetireKind::SampledSlot:
+                d->sampled_bitset.clear_bit(static_cast<uint32_t>(item.a));
+                break;
+            case RetireKind::StorageSlot:
+                d->storage_bitset.clear_bit(static_cast<uint32_t>(item.a));
+                break;
+            case RetireKind::SamplerSlot:
+                d->sampler_bitset.clear_bit(static_cast<uint32_t>(item.a));
+                break;
+        }
+    }
+    batch->items.clear();
+    batch->~RetireBatch();
+    d->allocator.free({.ptr = batch, .len = sizeof(RetireBatch)});
 }
 
 // --- Queue submission -----------------------------------------------------------------
@@ -355,7 +440,7 @@ Submission queue_submit(Queue                     q,
     }
 
     // Success: publish the logical timeline, retire command pools, and
-    // transfer pipeline references into an in-flight batch.
+    // transfer retained references into a value-keyed retire batch.
     q->timeline_value = submit_value;
     atomic_fetch_add(&d->stat_submissions, 1);
     for (uint32_t i = 0; i < command_buffers.size(); ++i) {
@@ -364,18 +449,15 @@ Submission queue_submit(Queue                     q,
             pool->outstanding--;
             if (pool->retire_value < submit_value) { pool->retire_value = submit_value; }
         }
-        auto& retained = command_buffers[i]->retained_pipelines;
-        if (retained.is_empty()) { continue; }
-        MemoryBlock blk = d->allocator.alloc(sizeof(PipelineRefBatch));
-        if (blk.ptr == nullptr) { continue; }   // refs stay in the cb; released at pool reset
-        auto* batch = ::new (blk.ptr) PipelineRefBatch{
-            .device         = d,
-            .timeline_value = submit_value,
-            .records        = Vector<PipelineRecord*>(d->allocator),
-        };
-        for (PipelineRecord* rec : retained) { batch->records.push_back(rec); }
-        retained.clear();
-        q->in_flight_batches.push_back(batch);
+        for (PipelineRecord* rec : command_buffers[i]->retained_pipelines) {
+            enqueue_retire_locked(d, q, submit_value,
+                                  RetireItem{RetireKind::PipelineRef, reinterpret_cast<uint64_t>(rec), 0});
+        }
+        command_buffers[i]->retained_pipelines.clear();
+        for (Handle<Texture> tex : command_buffers[i]->retained_textures) {
+            enqueue_retire_locked(d, q, submit_value, RetireItem{RetireKind::Texture, tex.h, 0});
+        }
+        command_buffers[i]->retained_textures.clear();
     }
     mutex_unlock(&q->submit_lock);
     return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Success};
@@ -420,15 +502,6 @@ int64_t debug_pool_resets(DeviceImpl* d) {
     return atomic_load(&d->stat_pool_resets);
 }
 
-// Releases the pipeline references retained for a completed submission.
-void release_inflight_batch(PipelineRefBatch* batch) {
-    auto* d = batch->device;
-    for (PipelineRecord* rec : batch->records) { release_pipeline_ref(d, rec); }
-    batch->records.clear();
-    batch->~PipelineRefBatch();
-    d->allocator.free({.ptr = batch, .len = sizeof(PipelineRefBatch)});
-}
-
 // --- Commands -------------------------------------------------------------------------
 
 void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
@@ -458,6 +531,7 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
     auto* d = cmd->device;
     auto src = buffer_and_offset_from_ptr(d, srcPtr);
     auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
+    retain_texture(cmd, texture);
 
     VkBufferImageCopy2 region{
         .sType             = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -501,6 +575,7 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
     auto* d = cmd->device;
     auto dst = buffer_and_offset_from_ptr(d, destGpu);
     auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
+    retain_texture(cmd, texture);
 
     VkBufferImageCopy2 region{
         .sType             = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -734,6 +809,14 @@ void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensi
 
 void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     auto* d = cmd->device;
+    // Retain every texture named by the pass so freeing the user handle
+    // cannot destroy a native image the recorded commands reference.
+    for (const auto& attachment : desc.color_attachments) {
+        retain_texture(cmd, attachment.texture);
+        if (attachment.resolve_texture.h != 0) { retain_texture(cmd, attachment.resolve_texture); }
+    }
+    if (desc.depth_attachment.texture.h != 0) { retain_texture(cmd, desc.depth_attachment.texture); }
+    if (desc.stencil_attachment.texture.h != 0) { retain_texture(cmd, desc.stencil_attachment.texture); }
     Arena*  arena = get_thread_local_arena(d);
     ScratchScope scope(*arena);
     Span<VkRenderingAttachmentInfo> color_attachments{};

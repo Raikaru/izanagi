@@ -707,7 +707,6 @@ Device create_device(const DeviceDesc& desc) {
     // Initialize ptr_map and other vectors
     d->ptr_map                = Vector<GpuPtrMap>(d->allocator);
     d->uninitialized_textures = Vector<Handle<Texture>>(d->allocator);
-    d->deferred_frees         = Vector<DeviceImpl::DeferredFree>(d->allocator);
     d->pipeline_records       = Vector<PipelineRecord*>(d->allocator);
     d->compiler_queue         = Vector<PipelineRecord*>(d->allocator);
 
@@ -754,12 +753,14 @@ void destroy_device(Device dev) {
     d->compiler_thread = 0;
     condvar_destroy(&d->compiler_cv);
 
-    // Release pipeline references retained for submitted (now complete) work.
+    // Drain all retirement batches (GPU work is complete).
     if (d->default_queue) {
-        for (PipelineRefBatch* batch : d->default_queue->in_flight_batches) {
-            release_inflight_batch(batch);
-        }
-        d->default_queue->in_flight_batches.clear();
+        Vector<RetireBatch*> pending(d->allocator);
+        mutex_lock(&d->default_queue->submit_lock);
+        for (RetireBatch* b : d->default_queue->retire_queue) { pending.push_back(b); }
+        d->default_queue->retire_queue.clear();
+        mutex_unlock(&d->default_queue->submit_lock);
+        for (RetireBatch* b : pending) { process_retire_batch(d, b); }
     }
 
     // Destroy every remaining record (leaked handles, failed compiles, etc.).
@@ -962,6 +963,35 @@ void free(Device dev, GpuPtr ptr) {
     rwlock_unlock_write(&d->ptr_map_lock);
 }
 
+void free_after(Device dev, GpuPtr ptr, Submission s) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    // Conservative retirement for invalid/failed submissions: after the
+    // latest successfully submitted work completes.
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+
+    // Invalidate the pointer now; capture the buffer handle for destruction
+    // once the target submission completes.
+    rwlock_lock_write(&d->ptr_map_lock);
+    uint32_t lo = 0, hi = d->ptr_map.size();
+    uint32_t idx = ~0u;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (d->ptr_map[mid].ptr == ptr) { idx = mid; break; }
+        if (d->ptr_map[mid].ptr < ptr) { lo = mid + 1; } else { hi = mid; }
+    }
+    if (idx == ~0u) {
+        rwlock_unlock_write(&d->ptr_map_lock);
+        return;   // not a live allocation (already freed)
+    }
+    const Handle<Buffer> h = d->ptr_map[idx].buffer;
+    d->ptr_map.erase(d->ptr_map.begin() + idx, d->ptr_map.begin() + idx + 1);
+    rwlock_unlock_write(&d->ptr_map_lock);
+
+    enqueue_retire(q, value, RetireItem{RetireKind::Buffer, h.h, 0});
+}
+
 void* get_host_pointer(Device dev, GpuPtr ptr) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     rwlock_lock_read(&d->ptr_map_lock);
@@ -1050,7 +1080,7 @@ Queue get_queue(Device dev, QueueType type) {
         q->queue_family   = d->graphics_queue_family;
         q->timeline_value = 0;
         q->pending_events = Vector<CompletionEvent>(d->allocator);
-        q->in_flight_batches = Vector<PipelineRefBatch*>(d->allocator);
+        q->retire_queue    = Vector<RetireBatch*>(d->allocator);
         d->default_queue  = q;
     }
     return d->default_queue;
@@ -1071,9 +1101,6 @@ void queue_process_events(Queue q) {
     IZ_CHK(d, vkGetSemaphoreCounterValue(d->device, timeline_sem, &current_time),
            "queue_process_events failed");
 
-    // Drain deferred descriptor heap slot frees
-    drain_deferred_frees(d, current_time);
-
     uint32_t i = 0;
     while (i < q->pending_events.size() && q->pending_events[i].completed_time <= current_time) {
         q->pending_events[i].callback(q->pending_events[i].userdata);
@@ -1083,36 +1110,21 @@ void queue_process_events(Queue q) {
         q->pending_events.erase(q->pending_events.begin(), q->pending_events.begin() + i);
     }
 
-    // Release in-flight pipeline references whose timeline values completed
-    // (batches are pushed in timeline order).
+    // Drain the retirement queue (batches sorted by value, ascending).
+    mutex_lock(&q->submit_lock);
     uint32_t j = 0;
-    while (j < q->in_flight_batches.size() &&
-           q->in_flight_batches[j]->timeline_value <= current_time) {
-        release_inflight_batch(q->in_flight_batches[j]);
-        j++;
-    }
+    while (j < q->retire_queue.size() && q->retire_queue[j]->value <= current_time) { j++; }
+    Vector<RetireBatch*> ready(d->allocator);
+    for (uint32_t k = 0; k < j; ++k) { ready.push_back(q->retire_queue[k]); }
     if (j != 0) {
-        q->in_flight_batches.erase(q->in_flight_batches.begin(), q->in_flight_batches.begin() + j);
+        q->retire_queue.erase(q->retire_queue.begin(), q->retire_queue.begin() + j);
     }
+    mutex_unlock(&q->submit_lock);
+
+    // Process outside queue locks (may take the pipeline/map locks and
+    // destroy native objects).
+    for (RetireBatch* batch : ready) { process_retire_batch(d, batch); }
 }
 
-// --- Deferred descriptor heap slot recycling --------------------------------------------------
-void drain_deferred_frees(DeviceImpl* d, uint64_t current_timeline) {
-    mutex_lock(&d->deferred_lock);
-    uint32_t i = 0;
-    while (i < d->deferred_frees.size() && d->deferred_frees[i].timeline_value <= current_timeline) {
-        auto& df = d->deferred_frees[i];
-        switch (df.region) {
-            case 0: d->sampled_bitset.clear_bit(df.slot); break;
-            case 1: d->storage_bitset.clear_bit(df.slot); break;
-            case 2: d->sampler_bitset.clear_bit(df.slot); break;
-        }
-        i++;
-    }
-    if (i != 0) {
-        d->deferred_frees.erase(d->deferred_frees.begin(), d->deferred_frees.begin() + i);
-    }
-    mutex_unlock(&d->deferred_lock);
-}
 
 }  // namespace gpu

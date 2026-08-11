@@ -659,6 +659,21 @@ bool             wait_pipeline(Device, Handle<Pipeline>);
 // queued compilation to drain). For loading screens / shutdown, not frame
 // recording. No-op when no cache callbacks were provided.
 void             flush_pipeline_cache(Device);
+// Explicitly retire a resource against a submission. The CPU handle is
+// invalidated immediately; native destruction / descriptor recycling happens
+// only after the target submission completes. This is the normal path for
+// resources reachable through raw GPU pointers or descriptor indices stored
+// in user GPU data (the backend cannot infer such usage). An invalid or
+// failed Submission retires the resource conservatively after the latest
+// successfully submitted work completes.
+void free_after(Device, GpuPtr, Submission);
+void free_after(Device, Handle<Texture>, Submission);
+void free_after(Device, Handle<Pipeline>, Submission);
+void free_texture_view_after(Device, TextureView, Submission);
+void free_rw_texture_view_after(Device, TextureView, Submission);
+void free_sampler_after(Device, SamplerId, Submission);
+// Immediate destruction: valid only when the application guarantees no
+// recorded, pending, in-flight, or future GPU access to the resource.
 void             free(Device, Handle<Pipeline>);
 Handle<DepthStencilState> create_depth_stencil_state(Device, const DepthStencilDesc&);
 void                      free_depth_stencil_state(Device, Handle<DepthStencilState>);

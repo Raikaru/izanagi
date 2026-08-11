@@ -860,6 +860,17 @@ void free(Device dev, Handle<Pipeline> pipeline) {
     d->pipeline_pool.erase(handle_cast<PipelineImpl>(pipeline));
 }
 
+void free_after(Device dev, Handle<Pipeline> pipeline, Submission s) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
+    if (q == nullptr) { return; }
+    const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    // The user reference (and the native pipeline with it) is released when
+    // the target submission completes.
+    enqueue_retire(q, value, RetireItem{RetireKind::PipelineRef, reinterpret_cast<uint64_t>(rec), 0});
+}
+
 // --- White-box test hooks -------------------------------------------------------------------
 
 uint32_t debug_live_pipelines(DeviceImpl* d) {
