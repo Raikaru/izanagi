@@ -34,13 +34,16 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   `Memory::Default` = host-visible + device-address, `Memory::Readback` =
   host-visible readback. `get_host_pointer` maps it on the CPU side.
 - **Root arguments are raw pointers.** Pipelines take no binding layout.
-  `cmd_dispatch`/`cmd_draw` take one or two GPU pointers to user structs,
-  delivered via `vkCmdPushDataEXT` (push constants). A shader receives
-  `uniform Args { T* vert; T* frag; }` and reads everything through those.
-- **One global resource heap.** Textures, texture views, and samplers are
-  created into a device-global indexable heap (`VK_EXT_descriptor_heap`).
-  Handles are opaque uint64s; shaders use the `izanagi.slang` prelude helpers
-  (`getTexture2D`, `getSampler`) to turn them into resources.
+  `cmd_dispatch`/`cmd_draw` take one or two GPU pointers to user structs. A
+  shader receives `uniform Args { T* vert; T* frag; }` and reads everything
+  through those pointers; the backend delivers them privately (native
+  profile: `vkCmdPushDataEXT`; bindless profile: ordinary push constants).
+- **One global resource namespace.** Textures, texture views, and samplers
+  are created into a device-global indexable namespace (native profile:
+  `VK_EXT_descriptor_heap`; bindless profile: backend-private
+  descriptor-indexing arrays). Handles are opaque uint64s; shaders use the
+  `izanagi.slang` prelude helpers (`getTexture2D`, `getSampler`) to turn them
+  into resources on either profile.
 - **Stage-mask barriers only.** `cmd_barrier(StageFlags, StageFlags)` is the
   entire sync model — no image layout transitions in the public API.
 - **Timeline-semaphore sync.** Queue submissions carry optional wait/signal
