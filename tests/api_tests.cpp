@@ -86,9 +86,12 @@ static std::string find_shader_path(const char* name) {
     // Shader artifacts live under a profile subdirectory (vk_native /
     // vk_bindless) so Native and Bindless builds never collide; fall back to
     // the plain directory for older build trees.
-    const char* profile_dir = "shaders/vk_native/";
+    // Artifact identity: <profile>_spv<version> directory (see
+    // cmake/CompileSlangShader.cmake); fall back to the plain dir for older
+    // build trees.
+    const char* profile_dir = "shaders/vk_native_spv16/";
 #if defined(IZ_VK_PROFILE_BINDLESS)
-    profile_dir = "shaders/vk_bindless/";
+    profile_dir = "shaders/vk_bindless_spv15/";
 #endif
     // Resolve relative to the executable directory so tests run from any CWD.
 #ifdef _WIN32
@@ -107,13 +110,13 @@ static std::string find_shader_path(const char* name) {
 #endif
     // Fallback: try relative candidates
     const char* candidates[] = {
-        "shaders/vk_native/",
+        "shaders/vk_native_spv16/",
         "shaders/",
-        "../shaders/vk_native/",
+        "../shaders/vk_native_spv16/",
         "../shaders/",
-        "../../shaders/vk_native/",
+        "../../shaders/vk_native_spv16/",
         "../../shaders/",
-        "../../../shaders/vk_native/",
+        "../../../shaders/vk_native_spv16/",
         "../../../shaders/",
     };
     for (auto* prefix : candidates) {
@@ -2650,8 +2653,9 @@ static void test_abi_gpu() {
         uint64_t  samp;
         AbiNested nested;
         float     arr[3];
-        uint16_t  s;
-        uint8_t   bytes[3];
+        uint32_t  s;
+        uint32_t  pad;
+        uint32_t  tail_pad;   // explicit tail padding (Slang does not tail-pad)
     };
     static_assert(sizeof(AbiInner) == 12 && sizeof(AbiNested) == 24 && sizeof(AbiRoot) == 80,
                   "ABI structs must match abi_test.slang");
@@ -2673,10 +2677,9 @@ static void test_abi_gpu() {
     root->arr[0]  = 1.5f;
     root->arr[1]  = 2.5f;
     root->arr[2]  = 3.5f;
-    root->s       = 0xBEEFu;
-    root->bytes[0] = 0x11;
-    root->bytes[1] = 0x22;
-    root->bytes[2] = 0x33;
+    root->s        = 0x12345678u;
+    root->pad      = 0x9ABCDEF0u;
+    root->tail_pad = 0xCAFEBABEu;
     *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 96) = 0xABCD1234u;
 
     // Compute root ABI: the push constant is ONE pointer to a GPU-resident
@@ -2712,8 +2715,89 @@ static void test_abi_gpu() {
     CHECK(o[11] == 0xABCD1234u, "second-level pointer dereference mismatch");
     float a0, a1, a2; std::memcpy(&a0, &o[12], 4); std::memcpy(&a1, &o[13], 4); std::memcpy(&a2, &o[14], 4);
     CHECK(a0 == 1.5f && a1 == 2.5f && a2 == 3.5f, "arr mismatch");
-    CHECK(o[15] == 0xBEEFu, "uint16 field mismatch");
-    CHECK(o[16] == 0x11 && o[17] == 0x22 && o[18] == 0x33, "uint8 array mismatch");
+    CHECK(o[15] == 0x12345678u, "s mismatch");
+    CHECK(o[16] == 0x9ABCDEF0u, "pad mismatch");
+    CHECK(o[17] == 0xCAFEBABEu, "tail_pad mismatch");
+    CHECK(o[18] == 0xAB1D5EEDu, "sentinel mismatch (struct read out of order)");
+
+    free(d, buf);
+    free(d, out);
+    destroy_device(d);
+}
+
+// --- Test 32: capability-gated 8/16-bit storage ABI -------------------------------
+// The mandatory ABI test avoids 8/16-bit storage (optional device
+// capabilities). Reading 8/16-bit members through a physical-storage-buffer
+// pointer needs shaderInt8/16 AND the storageBuffer8BitAccess/16BitAccess
+// features; this test only runs when all four are present (reported by the
+// profile query).
+static void test_abi_int8_16() {
+    printf("--- Test: GPU shader ABI (8/16-bit, capability-gated) ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    VulkanProfileFeatures f = query_vulkan_profile_features(d);
+    if (!(f.shader_int8 && f.storage_buffer_8bit_access &&
+          f.shader_int16 && f.storage_buffer_16bit_access)) {
+        printf("SKIPPED: 8/16-bit storage access not supported\n");
+        destroy_device(d);
+        return;
+    }
+
+    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    std::string shader_path = find_shader_path("abi_int8_16.spv");
+    auto spirv = load_spirv(shader_path.c_str(), &arena);
+    CHECK(spirv.size() > 0, "failed to load abi_int8_16.spv");
+    if (spirv.size() == 0) { destroy_device(d); return; }
+
+    ShaderSource shader_src{.source = spirv, .entry_point = "main_cs"_sv};
+    Handle<Pipeline> pipeline = create_compute_pipeline(d, shader_src);
+    CHECK(pipeline.h != 0, "create_compute_pipeline failed");
+    if (pipeline.h == 0) { destroy_device(d); return; }
+
+    struct Int8_16Root {
+        uint16_t s16;
+        uint8_t  b8[3];
+        uint32_t tail;
+    };
+    static_assert(sizeof(Int8_16Root) == 12, "Int8_16Root must match abi_int8_16.slang");
+
+    GpuPtr buf = malloc(d, 64, Memory::Default);   // Int8_16Root @0, ArgData @16
+    GpuPtr out = malloc(d, 5 * sizeof(uint32_t), Memory::Readback);
+    CHECK(buf != 0 && out != 0, "malloc failed");
+
+    auto* root = reinterpret_cast<Int8_16Root*>(get_host_pointer(d, buf));
+    root->s16   = 0xBEEFu;
+    root->b8[0] = 0x11;
+    root->b8[1] = 0x22;
+    root->b8[2] = 0x33;
+    root->tail  = 0xDEADBEEFu;
+
+    struct Int8_16ArgData {
+        uint64_t root;
+        uint64_t out;
+    };
+    auto* arg_data = reinterpret_cast<Int8_16ArgData*>(static_cast<uint8_t*>(get_host_pointer(d, buf)) + 16);
+    arg_data->root = buf;
+    arg_data->out  = out;
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_dispatch(cmd, buf + 16, Dimension3D{1, 1, 1});
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, Span<const CommandBuffer>(&cmd, 1));
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "dispatch did not complete");
+
+    auto* o = reinterpret_cast<uint32_t*>(get_host_pointer(d, out));
+    CHECK(o[0] == 0xBEEFu, "uint16 field mismatch");
+    CHECK(o[1] == 0x11 && o[2] == 0x22 && o[3] == 0x33, "uint8 array mismatch");
+    CHECK(o[4] == 0xDEADBEEFu, "tail mismatch");
 
     free(d, buf);
     free(d, out);
@@ -2768,6 +2852,7 @@ int main() {
     test_profile_report_consistency();
     test_typed_pointers();
     test_abi_gpu();
+    test_abi_int8_16();
 
     printf("\n=================\n");
     if (g_failures == 0) {

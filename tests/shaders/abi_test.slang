@@ -1,22 +1,26 @@
-// abi_test.slang — cross-profile GPU ABI test.
+// abi_test.slang — cross-profile GPU ABI test (mandatory, capability-portable).
 //
 // Mirrors the C++ AbiRoot (tests/api_tests.cpp) EXACTLY under scalar block
 // layout + row-major matrices (the same flags every Izanagi shader is
 // compiled with). The shader reads every field of an irregular nested
-// structure — scalars of different widths, padding-sensitive fields, arrays,
+// structure — scalars of different widths (32/64-bit: this test must run on
+// every certified profile, so it deliberately avoids 8/16-bit storage, which
+// is an optional device capability), padding-sensitive fields, arrays,
 // nested structs, a GpuPtr member, TextureView/SamplerId members, and a
 // second-level pointer — and writes the interpreted values to a readback
 // buffer. The api test compares every value with the CPU expectations; any
 // layout divergence between C++ and Slang lands a wrong value and fails.
 //
 // Compute root ABI: the push constant carries exactly ONE pointer to a
-// GPU-resident argument struct.
+// GPU-resident argument struct. 8/16-bit storage coverage is in
+// abi_int8_16.slang (capability-gated).
 //
 // C++ layout contract (scalar layout):
 //   AbiInner : uint32 a @0, float b @4, uint32 c @8        -> 12
 //   AbiNested: AbiInner inner @0, uint32_t* ptr @16        -> 24
 //   AbiRoot  : u @0, f @4, gpu_ptr @8, tex @16, samp @24,
-//              nested @32, arr[3] @56, s @68, bytes[3] @70 -> 80
+//              nested @32, arr[3] @56, s @68, pad @72,
+//              tail_pad @76 (explicit)                     -> 80
 
 struct AbiInner {
     uint32_t a;
@@ -29,6 +33,10 @@ struct AbiNested {
     uint32_t* ptr;  // second-level pointer (typed; points at a scratch value)
 };
 
+// Explicit tail padding to 80 bytes: C++ structs align to 8 (size 80) while
+// Slang's scalar layout does not tail-pad — the manifest test would fail
+// (C++ array stride 80 vs shader 76). Naming the tail keeps both sides
+// explicit and compiler-independent.
 struct AbiRoot {
     uint32_t  u;
     float     f;
@@ -37,8 +45,9 @@ struct AbiRoot {
     uint64_t  samp;      // SamplerId handle
     AbiNested nested;
     float     arr[3];
-    uint16_t  s;
-    uint8_t   bytes[3];
+    uint32_t  s;
+    uint32_t  pad;
+    uint32_t  tail_pad;  // explicit tail padding -> size 80
 };
 
 struct AbiArgData {
@@ -74,8 +83,8 @@ void main_cs()
     o[13] = asuint(r.arr[1]);
     o[14] = asuint(r.arr[2]);
     o[15] = r.s;
-    o[16] = r.bytes[0];
-    o[17] = r.bytes[1];
-    o[18] = r.bytes[2];
+    o[16] = r.pad;
+    o[17] = r.tail_pad;
+    o[18] = 0xAB1D5EEDu;   // sentinel: proves the whole struct was read in order
     for (int i = 0; i < 19; ++i) { args.data.out[i] = o[i]; }
 }

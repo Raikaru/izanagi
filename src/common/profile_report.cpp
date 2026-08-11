@@ -45,6 +45,10 @@ const char* vulkan_requirement_name(VulkanProfileRequirement r) {
 VulkanProfileReport evaluate_vulkan_bindless_profile(const VulkanProfileFeatures& f) {
     VulkanProfileReport r;
     r.api_version          = f.api_version;
+    r.shader_int8                = f.shader_int8;
+    r.shader_int16               = f.shader_int16;
+    r.storage_buffer_8bit_access = f.storage_buffer_8bit_access;
+    r.storage_buffer_16bit_access = f.storage_buffer_16bit_access;
     r.dynamic_rendering    = f.dynamic_rendering;
     r.synchronization2     = f.synchronization2;
     r.descriptor_snapshots = f.descriptor_binding_update_unused_while_pending ? 1u : 2u;

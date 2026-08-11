@@ -28,9 +28,9 @@ gpu::Span<const uint8_t> example_load_shader(const char* name, uint32_t* out_siz
     if (!slash) { return {}; }
     *(slash + 1) = '\0';
 
-    const char* profile_dir = "shaders/vk_native/";
+    const char* profile_dir = "shaders/vk_native_spv16/";
 #if defined(IZ_VK_PROFILE_BINDLESS)
-    profile_dir = "shaders/vk_bindless/";
+    profile_dir = "shaders/vk_bindless_spv15/";
 #endif
 
     char path[4096];

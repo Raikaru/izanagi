@@ -75,6 +75,10 @@ int main() {
     printf("    \"dynamic_rendering\": %s,\n", bindless.dynamic_rendering ? "true" : "false");
     printf("    \"synchronization2\": %s,\n", bindless.synchronization2 ? "true" : "false");
     printf("    \"descriptor_set_snapshots\": %u,\n", bindless.descriptor_snapshots);
+    printf("    \"shader_int8\": %s,\n", bindless.shader_int8 ? "true" : "false");
+    printf("    \"shader_int16\": %s,\n", bindless.shader_int16 ? "true" : "false");
+    printf("    \"storage_buffer_8bit_access\": %s,\n", bindless.storage_buffer_8bit_access ? "true" : "false");
+    printf("    \"storage_buffer_16bit_access\": %s,\n", bindless.storage_buffer_16bit_access ? "true" : "false");
     printf("    \"sampled_image_capacity\": %u,\n", bindless.sampled_image_capacity);
     printf("    \"storage_image_capacity\": %u,\n", bindless.storage_image_capacity);
     printf("    \"sampler_capacity\": %u,\n", bindless.sampler_capacity);

@@ -314,6 +314,11 @@ static VkResult create_logical_device(DeviceImpl* d) {
     }
 
     vulkan11_features.shaderDrawParameters = VK_TRUE;
+    // 8/16-bit storage access through physical-storage-buffer pointers
+    // (needed by the capability-gated ABI test; universal on 1.1+ drivers).
+    vulkan11_features.storageBuffer16BitAccess = VK_TRUE;
+
+    vulkan12_features.storageBuffer8BitAccess = VK_TRUE;
 
     vulkan12_features.timelineSemaphore       = VK_TRUE;
     vulkan12_features.bufferDeviceAddress     = VK_TRUE;

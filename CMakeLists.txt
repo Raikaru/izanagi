@@ -228,6 +228,10 @@ if(IZANAGI_BUILD_TESTS)
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/abi_test.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/abi_test.spv
     )
+    add_slang_shader(izanagi_test_shaders7
+        SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/abi_int8_16.slang
+        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/abi_int8_16.spv
+    )
     add_slang_shader(izanagi_test_shaders_untyped NATIVE_ONLY
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/untyped_negative.slang
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/untyped_negative.spv
@@ -243,6 +247,7 @@ if(IZANAGI_BUILD_TESTS)
     target_compile_definitions(izanagi_tests PRIVATE IZ_VK_PROFILE_${IZANAGI_VK_PROFILE})
     add_dependencies(izanagi_tests izanagi_test_shaders izanagi_test_shaders2 izanagi_test_shaders3
                      izanagi_test_shaders4 izanagi_test_shaders5 izanagi_test_shaders6
+                     izanagi_test_shaders7
                      izanagi_test_shaders_untyped izanagi_test_shaders_untyped_neg)
 
     # GPU-independent container/arena/profile tests (no Vulkan device required)
@@ -256,6 +261,10 @@ if(IZANAGI_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    # The extracted shader-layout manifest test (common_tests) reads the
+    # compiled artifacts, so the common tests depend on the ABI shaders too.
+    add_dependencies(izanagi_common_tests
+                     izanagi_test_shaders5 izanagi_test_shaders6 izanagi_test_shaders7)
 
     enable_testing()
     add_test(NAME api_tests COMMAND izanagi_tests)

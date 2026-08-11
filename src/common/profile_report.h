@@ -95,6 +95,17 @@ struct VulkanProfileFeatures {
     // Lifetime
     bool timeline_semaphore = false;
 
+    // Optional shader conveniences (recorded, not required): 8/16-bit
+    // integer storage in shaders. Reading 8/16-bit members THROUGH a
+    // physical-storage-buffer pointer additionally requires the storage
+    // access bits (not just shaderInt8/16). The mandatory ABI test avoids
+    // these; the capability-gated int8/16 ABI test only runs when all four
+    // are present.
+    bool shader_int8                = false;
+    bool shader_int16               = false;
+    bool storage_buffer_8bit_access = false;
+    bool storage_buffer_16bit_access = false;
+
     // Optional rendering/sync conveniences (recorded, not required)
     bool dynamic_rendering = false;
     bool synchronization2  = false;
@@ -116,6 +127,10 @@ struct VulkanProfileReport {
     uint32_t  api_version   = 0;
 
     // Selected fallbacks (echo of the feature snapshot)
+    bool shader_int8                = false;
+    bool shader_int16               = false;
+    bool storage_buffer_8bit_access = false;
+    bool storage_buffer_16bit_access = false;
     bool dynamic_rendering = false;
     bool synchronization2  = false;
     // 1 = direct update-after-bind path; 2+ = private descriptor-set snapshot

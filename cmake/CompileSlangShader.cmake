@@ -1,13 +1,13 @@
 # add_slang_shader(TARGET <t> SOURCE <f.slang> OUTPUT <f.spv> [NATIVE_ONLY])
 #
 # Compiles a .slang file to SPIR-V at build time using slangc, for BOTH
-# capability profiles: vk_native (SPIR-V 1.6 + spvDescriptorHeapEXT) and
-# vk_bindless (SPIR-V 1.5, descriptor-indexing arrays, no descriptor-heap
-# capability). One .spv per profile containing ALL [shader(...)] entry points;
-# ShaderSource.entry_point selects at pipeline creation. Artifacts land in a
-# <profile>/ subdirectory under the shaders dir so Native and Bindless
-# artifacts of the same source never collide; the runtime loader resolves the
-# profile-specific path.
+# capability profiles: vk_native_spv16 (SPIR-V 1.6 + spvDescriptorHeapEXT)
+# and vk_bindless_spv15 (SPIR-V 1.5, descriptor-indexing arrays, no
+# descriptor-heap capability). One .spv per profile containing ALL
+# [shader(...)] entry points; ShaderSource.entry_point selects at pipeline
+# creation. Artifact identity = source name + profile/SPIR-V version
+# directory (+ entry points + profile version, verified by the extracted
+# manifest test), so Native and Bindless artifacts never collide.
 #
 # NATIVE_ONLY marks a shader that is legitimately Native-profile-only (e.g.
 # the negative compile test): the Bindless variant is not built for it.
@@ -29,13 +29,18 @@ function(add_slang_shader TARGET_NAME)
     endif()
 
     set(_base_output "${ARG_OUTPUT}")
-    # Profile-bound output paths: the native artifact ALWAYS lands under
-    # vk_native/ and the bindless artifact under vk_bindless/, regardless of
-    # the build's selected runtime profile (the runtime loader picks the
-    # directory from its own compile-time profile define).
-    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1vk_native/\\2" _native "${_base_output}")
-    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1vk_bindless/\\2" _bindless "${_base_output}")
-    if(NOT _native MATCHES "vk_native/" OR NOT _bindless MATCHES "vk_bindless/")
+    # Artifact identity scheme (ABI requirements): the artifact path encodes
+    #   <source>.<ext>               -> source identity (the file name)
+    #   vk_native_spv16|vk_bindless_spv15 -> backend profile + target SPIR-V
+    #                                        version
+    # and IZ_PROFILE (compile-time) identifies the profile version. The
+    # extracted-manifest test verifies the SPIR-V header version matches the
+    # directory and enumerates the entry points from the artifact. Native and
+    # Bindless artifacts can therefore never collide, even across profile or
+    # SPIR-V version changes.
+    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1vk_native_spv16/\\2" _native "${_base_output}")
+    string(REGEX REPLACE "^(.*/shaders/)([^/]+)$" "\\1vk_bindless_spv15/\\2" _bindless "${_base_output}")
+    if(NOT _native MATCHES "vk_native_spv16/" OR NOT _bindless MATCHES "vk_bindless_spv15/")
         message(FATAL_ERROR "add_slang_shader: OUTPUT must be under a /shaders/ directory")
     endif()
 

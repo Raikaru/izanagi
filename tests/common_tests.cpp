@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
@@ -610,7 +611,12 @@ struct alignas(8) AbiNested {
     AbiInner inner;
     uint64_t ptr;
 };
-struct alignas(8) AbiRoot {
+// Natural alignment (8) with EXPLICIT tail padding: Slang's scalar layout
+// does not tail-pad structs, so the shader mirrors the C++ tail member by
+// name (abi_test.slang tail_pad @76). C++ sizeof is 80; the extracted shader
+// manifest test proves the artifact matches exactly (a mismatch would shift
+// every element of a C++ struct array).
+struct AbiRoot {
     uint32_t  u;
     float     f;
     uint64_t  gpu_ptr;   // GpuPtr member
@@ -618,8 +624,9 @@ struct alignas(8) AbiRoot {
     uint64_t  samp;      // SamplerId handle
     AbiNested nested;
     float     arr[3];
-    uint16_t  s;
-    uint8_t   bytes[3];
+    uint32_t  s;
+    uint32_t  pad;
+    uint32_t  tail_pad;  // explicit tail padding -> size 80
 };
 // Push-constant root shapes (1 or 2 pointers = 8/16 bytes).
 struct alignas(8) AbiRoot1 {
@@ -635,7 +642,8 @@ static_assert(sizeof(TextureView) == 8, "TextureView must be 64-bit");
 static_assert(sizeof(SamplerId) == 8, "SamplerId must be 64-bit");
 static_assert(sizeof(AbiInner) == 12, "AbiInner size (shader: uint32,float,uint32)");
 static_assert(sizeof(AbiNested) == 24, "AbiNested size (inner @0, ptr @16)");
-static_assert(sizeof(AbiRoot) == 80, "AbiRoot size (scalar layout, align 8)");
+static_assert(sizeof(AbiRoot) == 80, "AbiRoot size (natural alignment + explicit tail)");
+static_assert(alignof(AbiRoot) == 8, "AbiRoot alignment 8");
 static_assert(offsetof(AbiRoot, u) == 0, "AbiRoot.u @0");
 static_assert(offsetof(AbiRoot, f) == 4, "AbiRoot.f @4");
 static_assert(offsetof(AbiRoot, gpu_ptr) == 8, "AbiRoot.gpu_ptr @8");
@@ -644,7 +652,19 @@ static_assert(offsetof(AbiRoot, samp) == 24, "AbiRoot.samp @24");
 static_assert(offsetof(AbiRoot, nested) == 32, "AbiRoot.nested @32");
 static_assert(offsetof(AbiRoot, arr) == 56, "AbiRoot.arr @56");
 static_assert(offsetof(AbiRoot, s) == 68, "AbiRoot.s @68");
-static_assert(offsetof(AbiRoot, bytes) == 70, "AbiRoot.bytes @70");
+static_assert(offsetof(AbiRoot, pad) == 72, "AbiRoot.pad @72");
+static_assert(offsetof(AbiRoot, tail_pad) == 76, "AbiRoot.tail_pad @76");
+// 8/16-bit storage ABI (capability-gated GPU test): natural alignment 4,
+// size 12 — Slang emits the same scalar layout.
+struct Int8_16Root {
+    uint16_t s16;
+    uint8_t  b8[3];
+    uint32_t tail;
+};
+static_assert(sizeof(Int8_16Root) == 12, "Int8_16Root size (scalar layout)");
+static_assert(offsetof(Int8_16Root, s16) == 0, "Int8_16Root.s16 @0");
+static_assert(offsetof(Int8_16Root, b8) == 2, "Int8_16Root.b8 @2");
+static_assert(offsetof(Int8_16Root, tail) == 8, "Int8_16Root.tail @8");
 static_assert(sizeof(AbiRoot1) == 8, "compute root: one 64-bit pointer");
 static_assert(sizeof(AbiRoot2) == 16, "graphics root: two 64-bit pointers");
 
@@ -656,6 +676,347 @@ static void test_abi_manifest() {
           "AbiRoot layout matches the shader contract");
     CHECK(sizeof(AbiRoot1) == 8 && sizeof(AbiRoot2) == 16,
           "push-constant root shapes are 8/16 bytes");
+}
+
+// --- Extracted shader-layout manifest (ABI §11.1) ------------------------------
+// Parses the COMPILED .spv artifact and extracts struct member offsets, sizes,
+// and array strides (OpMemberDecorate Offset, OpDecorate ArrayStride, type
+// widths from OpTypeInt/Float/Struct/Array/RuntimeArray/Pointer, lengths from
+// OpConstant). The comparison against C++ sizeof/alignof/offsetof fails on any
+// divergence. The shader layout is the source of truth for what the driver
+// sees: a C++ struct array must stride identically, so C++ and the shader are
+// kept in agreement explicitly (e.g. AbiRoot's named tail_pad).
+
+namespace spirv_layout {
+
+enum class Kind : uint8_t { Unknown = 0, Int, Float, Struct, Array, RuntimeArray, Ptr };
+
+struct Type {
+    Kind                  kind = Kind::Int;     // default; set explicitly per id
+    uint32_t              width = 0;            // Int/Float: bit width
+    std::vector<uint32_t> members;              // Struct: member type ids
+    uint32_t              elem_type_id = 0;     // Array: element type id
+    uint32_t              length_id    = 0;     // Array: length constant id
+};
+
+struct Module {
+    std::vector<Type>                    types;   // id-indexed
+    std::vector<std::vector<uint32_t>>   member_offsets;   // per struct id
+    std::vector<uint32_t>                array_strides;
+    std::vector<uint32_t>                constants;
+};
+
+bool parse(const std::vector<uint8_t>& spv, Module& m) {
+    if (spv.size() < 20) { return false; }
+    auto rd = [&](size_t off) -> uint32_t {
+        return uint32_t(spv[off]) | (uint32_t(spv[off + 1]) << 8) |
+               (uint32_t(spv[off + 2]) << 16) | (uint32_t(spv[off + 3]) << 24);
+    };
+    if (rd(0) != 0x07230203u) { return false; }
+    m.types.resize(rd(12) + 1);
+    m.member_offsets.resize(m.types.size());
+    m.array_strides.assign(m.types.size(), 0);
+    m.constants.assign(m.types.size(), 0);
+    size_t i = 20;
+    while (i + 4 <= spv.size()) {
+        uint32_t word = rd(i);
+        uint32_t op   = word & 0xFFFFu;
+        uint32_t n    = word >> 16;
+        if (n == 0 || i + 4 * n > spv.size()) { return false; }
+        auto opid = [&](uint32_t k) -> uint32_t { return rd(i + 4 + 4 * k); };
+        switch (op) {
+            case 21: {  // OpTypeInt <result> <width> <signed>
+                uint32_t id = opid(0);
+                if (id < m.types.size()) { m.types[id] = {Kind::Int, opid(1), {}, 0, 0}; }
+                break;
+            }
+            case 22: {  // OpTypeFloat <result> <width>
+                uint32_t id = opid(0);
+                if (id < m.types.size()) { m.types[id] = {Kind::Float, opid(1), {}, 0, 0}; }
+                break;
+            }
+            case 30: {  // OpTypeStruct <result> <member types...>
+                uint32_t id = opid(0);
+                if (id < m.types.size()) {
+                    Type t{Kind::Struct, 0, {}, 0, 0};
+                    for (uint32_t k = 1; k + 1 < n; ++k) { t.members.push_back(opid(k)); }
+                    m.types[id] = std::move(t);
+                }
+                break;
+            }
+            case 28: {  // OpTypeArray <result> <elementType> <lengthId>
+                uint32_t id = opid(0);
+                if (id < m.types.size()) { m.types[id] = {Kind::Array, 0, {}, opid(1), opid(2)}; }
+                break;
+            }
+            case 29: {  // OpTypeRuntimeArray <result> <elementType>
+                uint32_t id = opid(0);
+                if (id < m.types.size()) { m.types[id] = {Kind::RuntimeArray, 0, {}, opid(1), 0}; }
+                break;
+            }
+            case 32: {  // OpTypePointer <result> <storageClass> <type>
+                uint32_t id = opid(0);
+                if (id < m.types.size()) { m.types[id] = {Kind::Ptr, 0, {}, 0, 0}; }
+                break;
+            }
+            case 43:  // OpConstant <resultType> <resultId> <value>
+                if (n >= 4) {
+                    uint32_t id = opid(1);   // result ID
+                    if (id < m.constants.size()) { m.constants[id] = opid(2); }
+                }
+                break;
+            case 72: {  // OpMemberDecorate <struct> <member> <decoration> [operands]
+                if (n >= 4) {
+                    uint32_t sid = opid(0), member = opid(1), dec = opid(2);
+                    if (dec == 35 && sid < m.member_offsets.size()) {
+                        auto& offs = m.member_offsets[sid];
+                        if (offs.size() <= member) { offs.resize(member + 1, 0); }
+                        offs[member] = opid(3);
+                    }
+                }
+                break;
+            }
+            case 71:  // OpDecorate <target> <decoration> [operands]
+                if (n >= 3) {
+                    uint32_t tid = opid(0), dec = opid(1);
+                    if (dec == 6 && tid < m.array_strides.size()) { m.array_strides[tid] = opid(2); }
+                }
+                break;
+            default: break;
+        }
+        i += 4 * n;
+    }
+    return true;
+}
+
+uint32_t type_size(const Module& m, uint32_t id, uint32_t depth = 0) {
+    if (depth > 8 || id >= m.types.size()) { return 0; }
+    const Type& t = m.types[id];
+    switch (t.kind) {
+        case Kind::Int:
+        case Kind::Float: return t.width / 8;
+        case Kind::Ptr:   return 8;
+        case Kind::Array: {
+            uint32_t stride = id < m.array_strides.size() ? m.array_strides[id] : 4;
+            uint32_t len    = t.length_id < m.constants.size() ? m.constants[t.length_id] : 0;
+            return stride * len;
+        }
+        case Kind::Struct: {
+            const auto& offs = m.member_offsets[id];
+            uint32_t size = 0;
+            for (uint32_t k = 0; k < t.members.size(); ++k) {
+                uint32_t off = k < offs.size() ? offs[k] : 0;
+                size = std::max(size, off + type_size(m, t.members[k], depth + 1));
+            }
+            return size;
+        }
+        case Kind::Unknown:
+        default: return 0;
+    }
+}
+
+}  // namespace spirv_layout
+
+// Finds a compiled shader artifact (exe-relative then cwd-relative candidates).
+static std::string find_shader_artifact(const char* name) {
+    const std::string candidates[] = {
+        "shaders/vk_native_spv16/",
+        "bin/shaders/vk_native_spv16/",
+        "../bin/shaders/vk_native_spv16/",
+        "bin/Debug/shaders/vk_native_spv16/",
+        "../bin/Debug/shaders/vk_native_spv16/",
+        "build/bin/shaders/vk_native_spv16/",
+        "build/bin/Debug/shaders/vk_native_spv16/",
+    };
+    for (auto& c : candidates) {
+        std::string p = c + name;
+        if (std::filesystem::exists(p)) { return p; }
+    }
+    return std::string("shaders/vk_native_spv16/") + name;
+}
+
+// Bindless variant of find_shader_artifact (SPIR-V 1.5 directory).
+static std::string find_shader_artifact_bindless(const char* name) {
+    const std::string candidates[] = {
+        "shaders/vk_bindless_spv15/",
+        "bin/shaders/vk_bindless_spv15/",
+        "../bin/shaders/vk_bindless_spv15/",
+        "bin/Debug/shaders/vk_bindless_spv15/",
+        "../bin/Debug/shaders/vk_bindless_spv15/",
+        "build/bin/shaders/vk_bindless_spv15/",
+        "build/bin/Debug/shaders/vk_bindless_spv15/",
+    };
+    for (auto& c : candidates) {
+        std::string p = c + name;
+        if (std::filesystem::exists(p)) { return p; }
+    }
+    return std::string("shaders/vk_bindless_spv15/") + name;
+}
+
+static std::vector<uint8_t> read_file(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    std::vector<uint8_t> out;
+    if (!f) { return out; }
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (sz > 0) {
+        out.resize(static_cast<size_t>(sz));
+        if (std::fread(out.data(), 1, out.size(), f) != out.size()) { out.clear(); }
+    }
+    std::fclose(f);
+    return out;
+}
+
+// Asserts that some struct in the artifact has exactly the expected member
+// offsets and size (matched by signature — Slang emits no struct names).
+static bool manifest_matches(const std::vector<uint8_t>& spv,
+                             const std::vector<uint32_t>& expected_offsets,
+                             uint32_t expected_size,
+                             const char* label) {
+    spirv_layout::Module m;
+    if (!spirv_layout::parse(spv, m)) {
+        CHECK(false, "SPIR-V parse failed");
+        return false;
+    }
+    bool found = false;
+    for (uint32_t id = 0; id < m.types.size(); ++id) {
+        if (m.types[id].kind != spirv_layout::Kind::Struct) { continue; }
+        const auto& offs = m.member_offsets[id];
+        std::vector<uint32_t> got(offs.begin(), offs.end());
+        got.resize(m.types[id].members.size(), 0);
+        if (got == expected_offsets) {
+            CHECK(spirv_layout::type_size(m, id) == expected_size,
+                  "shader struct size matches the manifest");
+            found = true;
+        }
+    }
+    CHECK(found, label ? "shader struct layout matches the C++ manifest" : "");
+    return found;
+}
+
+// Explicit array member check: AbiRoot member 6 (arr) must be a float[3]
+// with array stride 4 (the C++ float arr[3] strides 4).
+static void check_abi_root_array(const std::vector<uint8_t>& spv) {
+    spirv_layout::Module m;
+    if (!spirv_layout::parse(spv, m)) {
+        CHECK(false, "SPIR-V parse failed (array check)");
+        return;
+    }
+    bool checked = false;
+    for (uint32_t id = 0; id < m.types.size() && !checked; ++id) {
+        const auto& t = m.types[id];
+        if (t.kind != spirv_layout::Kind::Struct) { continue; }
+        const auto& offs = m.member_offsets[id];
+        std::vector<uint32_t> got(offs.begin(), offs.end());
+        got.resize(t.members.size(), 0);
+        if (got != std::vector<uint32_t>{0, 4, 8, 16, 24, 32, 56, 68, 72, 76}) { continue; }
+        // AbiRoot matched: member 6 must be an array of 3 floats, stride 4.
+        // Slang wraps fixed-array struct members in a single-member struct,
+        // so unwrap any such wrapper before the kind check.
+        uint32_t arr_id = t.members.size() > 6 ? t.members[6] : 0;
+        while (arr_id < m.types.size() &&
+               m.types[arr_id].kind == spirv_layout::Kind::Struct &&
+               m.types[arr_id].members.size() == 1) {
+            arr_id = m.types[arr_id].members[0];
+        }
+        if (arr_id < m.types.size() && m.types[arr_id].kind == spirv_layout::Kind::Array) {
+            const auto& at = m.types[arr_id];
+            uint32_t elem = at.elem_type_id;
+            uint32_t len  = at.length_id < m.constants.size() ? m.constants[at.length_id] : 0;
+            CHECK(m.types[elem].kind == spirv_layout::Kind::Float && m.types[elem].width == 32,
+                  "AbiRoot.arr element type is float");
+            CHECK(len == 3, "AbiRoot.arr count is 3");
+            uint32_t stride = arr_id < m.array_strides.size() ? m.array_strides[arr_id] : 0;
+            CHECK(stride == 4, "AbiRoot.arr stride is 4");
+            checked = true;
+        }
+    }
+    CHECK(checked, "AbiRoot array member found and checked");
+}
+
+// Artifact identity verification (ABI): the SPIR-V header version must match
+// the profile directory (vk_native_spv16 -> 1.6, vk_bindless_spv15 -> 1.5)
+// and the artifact's entry points must be the expected set — the artifact-key
+// scheme: source (file name) + profile + SPIR-V version (directory) + entry
+// points (extracted here) + profile version (IZ_PROFILE, compile-time).
+static uint32_t spirv_header_version(const std::vector<uint8_t>& spv) {
+    if (spv.size() < 8) { return 0; }
+    return uint32_t(spv[4]) | (uint32_t(spv[5]) << 8) |
+           (uint32_t(spv[6]) << 16) | (uint32_t(spv[7]) << 24);
+}
+
+static std::vector<std::string> spirv_entry_points(const std::vector<uint8_t>& spv) {
+    std::vector<std::string> out;
+    if (spv.size() < 20) { return out; }
+    auto rd = [&](size_t off) -> uint32_t {
+        return uint32_t(spv[off]) | (uint32_t(spv[off + 1]) << 8) |
+               (uint32_t(spv[off + 2]) << 16) | (uint32_t(spv[off + 3]) << 24);
+    };
+    size_t i = 20;
+    while (i + 4 <= spv.size()) {
+        uint32_t word = rd(i);
+        uint32_t op   = word & 0xFFFFu;
+        uint32_t n    = word >> 16;
+        if (n == 0 || i + 4 * n > spv.size()) { return out; }
+        if (op == 15) {  // OpEntryPoint <execModel> <entryId> <name...>
+            std::string name;
+            bool done = false;
+            for (uint32_t k = 2; k < n && !done; ++k) {
+                uint32_t w = rd(i + 4 + 4 * k);
+                for (int b = 0; b < 4; ++b) {
+                    char c = char((w >> (8 * b)) & 0xFF);
+                    if (c == '\0') { done = true; break; }
+                    name.push_back(c);
+                }
+            }
+            out.push_back(name);
+        }
+        i += 4 * n;
+    }
+    return out;
+}
+
+static void check_artifact_identity(const std::vector<uint8_t>& spv,
+                                    uint32_t expected_spv_version,
+                                    const std::vector<std::string>& expected_entries,
+                                    const char* label) {
+    CHECK(spirv_header_version(spv) == expected_spv_version,
+          "artifact SPIR-V version matches the profile directory");
+    auto entries = spirv_entry_points(spv);
+    bool same = entries.size() == expected_entries.size();
+    for (size_t k = 0; same && k < entries.size(); ++k) {
+        same = entries[k] == expected_entries[k];
+    }
+    CHECK(same, "artifact entry points match the expected set");
+}
+
+static void test_shader_layout_manifest() {
+    printf("--- Test: extracted shader layout manifest ---\n");
+    auto abi = read_file(find_shader_artifact("abi_test.spv"));
+    CHECK(!abi.empty(), "abi_test.spv artifact present");
+    if (!abi.empty()) {
+        check_artifact_identity(abi, 0x00010600u, {"main_cs"}, "abi_test native");
+        manifest_matches(abi, {0, 4, 8, 16, 24, 32, 56, 68, 72, 76}, 80, "AbiRoot");
+        check_abi_root_array(abi);
+        manifest_matches(abi, {0, 4, 8}, 12, "AbiInner");
+        manifest_matches(abi, {0, 16}, 24, "AbiNested");
+        manifest_matches(abi, {0, 8}, 16, "AbiArgData");
+    }
+    // Bindless artifacts must carry the 1.5 header (version encoded in the
+    // directory is real, not cosmetic).
+    auto abi_b = read_file(find_shader_artifact_bindless("abi_test.spv"));
+    CHECK(!abi_b.empty(), "bindless abi_test.spv artifact present");
+    if (!abi_b.empty()) {
+        check_artifact_identity(abi_b, 0x00010500u, {"main_cs"}, "abi_test bindless");
+    }
+
+    auto i816 = read_file(find_shader_artifact("abi_int8_16.spv"));
+    CHECK(!i816.empty(), "abi_int8_16.spv artifact present");
+    if (!i816.empty()) {
+        manifest_matches(i816, {0, 2, 8}, 12, "Int8_16Root");
+        manifest_matches(i816, {0, 8}, 16, "Int8_16ArgData");
+    }
 }
 
 int main() {
@@ -675,6 +1036,7 @@ int main() {
     test_span();
     test_profile_report();
     test_abi_manifest();
+    test_shader_layout_manifest();
 
     printf("\n=================\n");
     if (g_failures == 0) {

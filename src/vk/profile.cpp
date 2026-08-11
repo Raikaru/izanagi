@@ -22,9 +22,13 @@ VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl* d) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &vulkan13,
     };
+    VkPhysicalDeviceVulkan11Features vulkan11{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &vulkan12,
+    };
     VkPhysicalDeviceFeatures2 features2{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = &vulkan12,
+        .pNext = &vulkan11,
     };
     vkGetPhysicalDeviceFeatures2(d->physical_device, &features2);
 
@@ -63,6 +67,11 @@ VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl* d) {
 
     f.draw_indirect_count = vulkan12.drawIndirectCount == VK_TRUE;
     f.timeline_semaphore  = vulkan12.timelineSemaphore == VK_TRUE;
+
+    f.shader_int8                 = vulkan12.shaderInt8 == VK_TRUE;
+    f.shader_int16                = features2.features.shaderInt16 == VK_TRUE;
+    f.storage_buffer_8bit_access  = vulkan12.storageBuffer8BitAccess == VK_TRUE;
+    f.storage_buffer_16bit_access = vulkan11.storageBuffer16BitAccess == VK_TRUE;
 
     f.dynamic_rendering = vulkan13.dynamicRendering == VK_TRUE;
     f.synchronization2  = vulkan13.synchronization2 == VK_TRUE;
