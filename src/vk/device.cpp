@@ -702,10 +702,13 @@ void destroy_device(Device dev) {
     }
 
     if (d->vma != VK_NULL_HANDLE) { vmaDestroyAllocator(d->vma); }
+    // Device before messenger: vkDestroyDevice's own lifetime VUIDs still
+    // reach the debug messenger (canonical Khronos teardown order; the
+    // messenger is instance-level and must die before vkDestroyInstance).
+    if (d->device != VK_NULL_HANDLE) { vkDestroyDevice(d->device, nullptr); }
     if (d->debug_messenger != VK_NULL_HANDLE && vkDestroyDebugUtilsMessengerEXT) {
         vkDestroyDebugUtilsMessengerEXT(d->instance, d->debug_messenger, nullptr);
     }
-    if (d->device != VK_NULL_HANDLE) { vkDestroyDevice(d->device, nullptr); }
     if (d->surface.surface != VK_NULL_HANDLE) {
         vkDestroySurfaceKHR(d->instance, d->surface.surface, nullptr);
     }
