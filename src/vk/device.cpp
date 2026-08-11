@@ -5,6 +5,7 @@
 #include "internal.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace gpu {
@@ -19,15 +20,16 @@ namespace gpu {
 #endif
 #if defined(IZ_VK_PROFILE_BINDLESS)
 #    define IZ_REQUIRE_HEAP_TRIO 0
-#    define IZ_REQUIRE_KHR_RENDERING 4   // dyn. rendering + sync2 + copy-commands2 (KHR) + ext. dyn. state (EXT)
 #else
 #    define IZ_REQUIRE_HEAP_TRIO 1
-#    define IZ_REQUIRE_KHR_RENDERING 0
 #endif
-// Sized to the max possible count (+1 keeps the array well-formed even when a
-// configuration requires nothing, e.g. bindless + headless); the count is the
-// macro expression, so the extension loop only checks what is required.
-static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + IZ_REQUIRE_KHR_RENDERING + 1] = {
+// Candidate extension list, ordered [required prefix ..., optional ...].
+// Under bindless the REQUIRED prefix is swapchain + (api < 1.3 ? dynamic
+// rendering + sync2 : 0); copy_commands2 and extended_dynamic_state are
+// OPTIONAL — their presence selects the modern path, their absence selects
+// the private fallbacks (legacy copy / static graphics state). 1.3+ devices
+// never require the promoted extension names.
+static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + 4 + 1] = {
 #if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 #endif
@@ -38,19 +40,44 @@ static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_H
     VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
     VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
 #endif
-    // Bindless needs dynamic rendering + synchronization2: on 1.3+ devices
-    // these are cores (enabling the KHR names is a legal no-op); on 1.2
-    // devices the KHR extensions provide the same entry points, so the same
-    // code runs on both.
 #if defined(IZ_VK_PROFILE_BINDLESS)
     VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
     VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-    VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME,
-    VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+    VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME,       // optional
+    VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, // optional
 #endif
 };
-static constexpr size_t kRequiredDeviceExtensionsCount =
-    IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + IZ_REQUIRE_KHR_RENDERING;
+// Number of extensions to ENABLE at device creation: the required prefix
+// plus the optional families when present on the device. On 1.3+ the
+// promoted KHR names are legal no-ops but still needed so the extension
+// entry points (used by the bindless command aliases) resolve in volk.
+// enabled extensions = required prefix + optional families present on the
+// device. The optional entries sit at fixed offsets after the required
+// prefix; count them only when the device exports them (their absence must
+// not enable an invalid extension name).
+static size_t enabled_extension_count(DeviceImpl* d) {
+    size_t n = IZ_REQUIRE_SWAPCHAIN;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    n += 2;                                        // dynamic rendering + sync2 (alias entry points need them)
+    if (d->has_copy2_ext)  { n += 1; }
+    if (d->has_extdyn_ext) { n += 1; }
+#else
+    n += IZ_REQUIRE_HEAP_TRIO * 3;
+#endif
+    return n;
+}
+
+// Per-candidate required count: the required prefix of kRequiredDeviceExtensions.
+static size_t required_extension_count(uint32_t device_api_version) {
+    size_t n = IZ_REQUIRE_SWAPCHAIN;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    if (device_api_version < VK_API_VERSION_1_3) { n += 2; }   // dyn rendering + sync2
+    // copy_commands2 / extended_dynamic_state: never required
+#else
+    n += IZ_REQUIRE_HEAP_TRIO * 3;
+#endif
+    return n;
+}
 
 // --- Logging -------------------------------------------------------------------------
 static void null_log_callback(LogLevel, Span<const char>, uint32_t, Span<const char>, void*) {}
@@ -268,7 +295,8 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         vkEnumerateDeviceExtensionProperties(devices[i], nullptr, &ext_count, exts.data());
 
         bool all_supported = true;
-        for (size_t req = 0; req < kRequiredDeviceExtensionsCount; ++req) {
+        const size_t required_count = required_extension_count(props.apiVersion);
+        for (size_t req = 0; req < required_count; ++req) {
             bool found = false;
             for (uint32_t e = 0; e < ext_count; ++e) {
                 if (strcmp(exts[e].extensionName, kRequiredDeviceExtensions[req]) == 0) {
@@ -313,6 +341,51 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
     return VK_SUCCESS;
 }
 
+// Captures effective API version + extension presence + derived dispatch on
+// the SELECTED device. Must run BEFORE logical-device feature routing, VMA
+// creation, and pipeline-cache identity construction.
+void capture_device_capabilities(DeviceImpl* d) {
+    uint32_t loader_version = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion != nullptr) { vkEnumerateInstanceVersion(&loader_version); }
+    d->instance_api_version = loader_version;
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(d->physical_device, &props);
+    d->device_api_version = props.apiVersion;
+
+    uint32_t requested = VK_API_VERSION_1_4;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    requested = VK_API_VERSION_1_2;
+#endif
+    uint32_t effective = props.apiVersion;
+    if (loader_version < effective) { effective = loader_version; }
+    if (requested < effective) { effective = requested; }
+    d->dispatch.effective_api_version = effective;
+
+    // Extension presence on the selected device.
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(d->physical_device, nullptr, &count, nullptr);
+    Vector<VkExtensionProperties> exts(d->allocator, {}, count);
+    vkEnumerateDeviceExtensionProperties(d->physical_device, nullptr, &count, exts.data());
+    auto has_ext = [&](const char* name) -> bool {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (strcmp(exts[i].extensionName, name) == 0) { return true; }
+        }
+        return false;
+    };
+    d->has_copy2_ext  = has_ext(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
+    d->has_extdyn_ext = has_ext(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+
+    d->dispatch = derive_dispatch_capabilities(
+        effective,
+        has_ext(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME),
+        has_ext(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME),
+        d->has_copy2_ext,
+        d->has_extdyn_ext,
+        atomic_load(&d->force_legacy_copy) != 0,
+        atomic_load(&d->force_static_state) != 0);
+}
+
 // --- Logical device creation ---------------------------------------------------------------
 static VkResult create_logical_device(DeviceImpl* d) {
     float queue_priority = 1.0f;
@@ -344,23 +417,62 @@ static VkResult create_logical_device(DeviceImpl* d) {
     };
 #endif
 #if defined(IZ_VK_PROFILE_BINDLESS)
-    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features{
+    // 1.2 route: the promoted families are enabled through their EXTENSION
+    // feature structs (VkPhysicalDeviceDynamicRenderingFeaturesKHR /
+    // VkPhysicalDeviceSynchronization2FeaturesKHR /
+    // VkPhysicalDeviceExtendedDynamicStateFeaturesEXT). 1.3+ devices use the
+    // core aggregate instead — never both in one chain.
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT ext_dyn_state_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
         .pNext = nullptr,
     };
-#endif
+    VkPhysicalDeviceSynchronization2FeaturesKHR sync2_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+        .pNext = nullptr,
+    };
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR dyn_rendering_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+        .pNext = nullptr,
+    };
     VkPhysicalDeviceVulkan13Features vulkan13_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-#if defined(IZ_VK_PROFILE_BINDLESS)
-        .pNext = &extended_dynamic_state_features,
+        .pNext = nullptr,
+    };
+    // Pointers to the booleans that gate dynamic rendering / sync2 / ext
+    // dynamic state for the selected route (used for enable + verification).
+    VkBool32* dyn_rendering_out = nullptr;
+    VkBool32* sync2_out         = nullptr;
+    VkBool32* ext_dyn_state_out = nullptr;
+    void*     render_features_chain = nullptr;
+    if (d->dispatch.effective_api_version >= VK_API_VERSION_1_3) {
+        render_features_chain = &vulkan13_features;
+        dyn_rendering_out     = &vulkan13_features.dynamicRendering;
+        sync2_out             = &vulkan13_features.synchronization2;
+        ext_dyn_state_out     = &vulkan13_features.extendedDynamicState;
+    } else {
+        ext_dyn_state_features.pNext = nullptr;
+        sync2_features.pNext         = &ext_dyn_state_features;
+        dyn_rendering_features.pNext = &sync2_features;
+        render_features_chain        = &dyn_rendering_features;
+        dyn_rendering_out            = &dyn_rendering_features.dynamicRendering;
+        sync2_out                    = &sync2_features.synchronization2;
+        ext_dyn_state_out = d->dispatch.extended_dynamic_state ? &ext_dyn_state_features.extendedDynamicState
+                                                               : nullptr;
+    }
+    VkPhysicalDeviceVulkan12Features vulkan12_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = render_features_chain,
+    };
 #else
+    VkPhysicalDeviceVulkan13Features vulkan13_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .pNext = &vulkan14_features,
-#endif
     };
     VkPhysicalDeviceVulkan12Features vulkan12_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &vulkan13_features,
     };
+#endif
     VkPhysicalDeviceVulkan11Features vulkan11_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext = &vulkan12_features,
@@ -444,14 +556,17 @@ static VkResult create_logical_device(DeviceImpl* d) {
     vulkan12_features.descriptorBindingUpdateUnusedWhilePending = VK_FALSE;
 #endif
 
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // Required on the bindless route (either core-1.3 or the KHR/EXT structs).
+    *dyn_rendering_out = VK_TRUE;
+    *sync2_out         = VK_TRUE;
+    if (ext_dyn_state_out != nullptr) { *ext_dyn_state_out = VK_TRUE; }
+    d->use_synchronization2 = *sync2_out == VK_TRUE;
+#else
     vulkan13_features.dynamicRendering = VK_TRUE;
     vulkan13_features.synchronization2 = VK_TRUE;
-#if !defined(IZ_VK_PROFILE_BINDLESS)
     vulkan13_features.maintenance4     = VK_TRUE;
-#endif
     d->use_synchronization2 = vulkan13_features.synchronization2 == VK_TRUE;
-#if defined(IZ_VK_PROFILE_BINDLESS)
-    extended_dynamic_state_features.extendedDynamicState = VK_TRUE;
 #endif
     // Optional: lets the compiler worker probe the cache with
     // FAIL_ON_PIPELINE_COMPILE_REQUIRED instead of compiling blind.
@@ -477,7 +592,7 @@ static VkResult create_logical_device(DeviceImpl* d) {
         .pQueueCreateInfos       = &queue_create_info,
         .enabledLayerCount       = 0,
         .ppEnabledLayerNames     = nullptr,
-        .enabledExtensionCount   = kRequiredDeviceExtensionsCount,
+        .enabledExtensionCount   = static_cast<uint32_t>(enabled_extension_count(d)),
         .ppEnabledExtensionNames = kRequiredDeviceExtensions,
         .pEnabledFeatures        = nullptr, // Using pNext chain instead
     };
@@ -489,6 +604,10 @@ static VkResult create_logical_device(DeviceImpl* d) {
 
     // Verify critical features were enabled
 #if defined(IZ_VK_PROFILE_BINDLESS)
+    if (!*dyn_rendering_out || !*sync2_out) {
+        IZ_LOG(d, LogLevel::Error, "bindless profile: dynamic rendering / synchronization2 not enabled");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
     if (!vulkan12_features.bufferDeviceAddress || !vulkan12_features.timelineSemaphore ||
         !vulkan12_features.scalarBlockLayout || !vulkan12_features.drawIndirectCount ||
         !vulkan12_features.descriptorIndexing || !vulkan12_features.runtimeDescriptorArray ||
@@ -517,6 +636,27 @@ static VkResult create_logical_device(DeviceImpl* d) {
     }
 #endif
 
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    // Function-pointer validation for the selected dispatch path: every
+    // command the path needs must resolve (the names below compile to the
+    // KHR/EXT entry points via the alias block under bindless).
+    if (vkQueueSubmit2 == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "bindless: vkQueueSubmit2 (synchronization2) entry point missing");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (vkCmdPipelineBarrier2 == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "bindless: vkCmdPipelineBarrier2 (synchronization2) entry point missing");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (!d->dispatch.use_legacy_copy_commands && vkCmdCopyBuffer2 == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "bindless: copy-commands2 entry points missing but modern path selected");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (!d->dispatch.use_static_graphics_state && vkCmdSetDepthTestEnable == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "bindless: extended-dynamic-state entry points missing but dynamic path selected");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+#endif
     return VK_SUCCESS;
 }
 
@@ -920,6 +1060,14 @@ Device create_device(const DeviceDesc& desc) {
         state->~ThreadLocalState();
     });
 
+    // White-box force overrides (env vars; also settable via test hooks).
+    if (std::getenv("IZANAGI_FORCE_LEGACY_COPY_COMMANDS") != nullptr) {
+        d->force_legacy_copy = 1;
+    }
+    if (std::getenv("IZANAGI_FORCE_STATIC_GRAPHICS_STATE") != nullptr) {
+        d->force_static_state = 1;
+    }
+
     VkResult result = create_instance(d, desc);
     if (result != VK_SUCCESS) {
         log_vk_impl(d, result, "Failed to create Vulkan instance", __LINE__, "device.cpp"_sv);
@@ -953,6 +1101,11 @@ Device create_device(const DeviceDesc& desc) {
         log_vk_impl(d, result, "Failed to select physical device", __LINE__, "device.cpp"_sv);
         goto fail;
     }
+
+    // Effective API version + dispatch capabilities BEFORE any feature
+    // routing, VMA creation, or cache-identity construction.
+    capture_device_capabilities(d);
+
 #if defined(IZ_VK_PROFILE_BINDLESS)
     // Capability gate: the bindless profile is decided by exact feature bits
     // and limits, never by version or generation. Unsupported devices fail
@@ -1044,7 +1197,6 @@ Device create_device(const DeviceDesc& desc) {
         d->cache_identity.backend   = Backend::Vulkan;
         d->cache_identity.profile   = device_backend_profile();
         d->cache_identity.vendor_id = props2.properties.vendorID;
-        d->device_api_version       = props2.properties.apiVersion;
         d->cache_identity.device_id = props2.properties.deviceID;
         memcpy(d->cache_identity.driver_uuid, id_props.driverUUID,
                sizeof(d->cache_identity.driver_uuid));

@@ -120,6 +120,7 @@ add_library(izanagi STATIC
     src/common/containers.cpp
     src/common/format_info.cpp
     src/common/platform_utils.cpp
+    src/common/dispatch_capabilities.cpp
     src/common/profile_report.cpp
     src/vk/volk_usage.cpp
     src/vk/vma_usage.cpp
@@ -277,6 +278,7 @@ if(IZANAGI_BUILD_TESTS)
         tests/common_tests.cpp
         src/common/containers.cpp
         src/common/platform_utils.cpp
+        src/common/dispatch_capabilities.cpp
         src/common/profile_report.cpp
     )
     target_include_directories(izanagi_common_tests PRIVATE

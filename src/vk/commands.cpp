@@ -718,6 +718,34 @@ bool debug_validation_active(DeviceImpl* d) {
     return d->enable_validation && d->debug_messenger != VK_NULL_HANDLE;
 }
 
+void debug_force_legacy_copy(DeviceImpl* d, bool force) {
+    d->force_legacy_copy = force ? 1 : 0;
+    capture_device_capabilities(d);
+}
+
+void debug_force_static_state(DeviceImpl* d, bool force) {
+    d->force_static_state = force ? 1 : 0;
+    capture_device_capabilities(d);
+}
+
+void debug_derive_dispatch(DeviceImpl* d) {
+    capture_device_capabilities(d);
+}
+
+int64_t debug_stat(DeviceImpl* d, int which) {
+    switch (which) {
+        case 0: return atomic_load(&d->stat_copy2_calls);
+        case 1: return atomic_load(&d->stat_legacy_copy_calls);
+        case 2: return atomic_load(&d->stat_ext_dyn_state_calls);
+        case 3: return atomic_load(&d->stat_static_variant_lookups);
+        case 4: return atomic_load(&d->stat_static_variant_hits);
+        case 5: return atomic_load(&d->stat_static_variant_misses);
+        case 6: return atomic_load(&d->stat_static_variant_pending);
+        case 7: return atomic_load(&d->stat_static_variant_compilations);
+        default: return 0;
+    }
+}
+
 void debug_force_legacy_barriers(DeviceImpl* d, bool force) {
     d->force_legacy_barriers = force ? 1 : 0;
 }

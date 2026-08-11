@@ -13,14 +13,33 @@ VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl* d) {
     VulkanProfileFeatures f;
 
     // Descriptor-indexing booleans come consistently from the Vulkan 1.2
-    // core struct (the same struct the native backend enables features on).
+    // core struct. Dynamic rendering / synchronization2 come from the 1.3
+    // aggregate on 1.3+ devices or from the KHR extension structs on 1.2
+    // devices — never a 1.3 struct on a 1.2 device.
+    const bool core13 = d->dispatch.effective_api_version >= VK_API_VERSION_1_3;
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR dyn_rendering{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+        .pNext = nullptr,
+    };
+    VkPhysicalDeviceSynchronization2FeaturesKHR sync2{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+        .pNext = nullptr,
+    };
     VkPhysicalDeviceVulkan13Features vulkan13{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .pNext = nullptr,
     };
+    void* render_chain = nullptr;
+    if (core13) {
+        render_chain = &vulkan13;
+    } else {
+        sync2.pNext        = nullptr;
+        dyn_rendering.pNext = &sync2;
+        render_chain       = &dyn_rendering;
+    }
     VkPhysicalDeviceVulkan12Features vulkan12{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-        .pNext = &vulkan13,
+        .pNext = render_chain,
     };
     VkPhysicalDeviceVulkan11Features vulkan11{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -74,8 +93,8 @@ VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl* d) {
     f.storage_buffer_8bit_access  = vulkan12.storageBuffer8BitAccess == VK_TRUE;
     f.storage_buffer_16bit_access = vulkan11.storageBuffer16BitAccess == VK_TRUE;
 
-    f.dynamic_rendering = vulkan13.dynamicRendering == VK_TRUE;
-    f.synchronization2  = vulkan13.synchronization2 == VK_TRUE;
+    f.dynamic_rendering = (core13 ? vulkan13.dynamicRendering : dyn_rendering.dynamicRendering) == VK_TRUE;
+    f.synchronization2  = (core13 ? vulkan13.synchronization2 : sync2.synchronization2) == VK_TRUE;
 
     // Per-type ceilings: the update-after-bind variants (min of the per-stage
     // and per-set limits for each type). The shared combined budget is

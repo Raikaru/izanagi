@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/containers.h"
+#include "common/dispatch_capabilities.h"
 #include "common/profile_report.h"
 
 using namespace gpu;
@@ -680,6 +681,78 @@ static void test_abi_manifest() {
           "push-constant root shapes are 8/16 bytes");
 }
 
+// --- Dispatch capability matrix (mock, no device) --------------------------------
+// The Vulkan 1.2 route's selection logic: required = dynamic rendering + sync2
+// (1.3 cores or KHR extensions); copy_commands2 + extended_dynamic_state are
+// optional with private fallbacks; force overrides choose the fallback even
+// when the modern path exists; 1.3+ never needs the promoted names.
+static void test_dispatch_capabilities() {
+    printf("--- Test: dispatch capability matrix ---\n");
+    const uint32_t v12 = (1u << 22) | (2u << 12);
+    const uint32_t v13 = (1u << 22) | (3u << 12);
+    const uint32_t v14 = (1u << 22) | (4u << 12);
+
+    // 1.3+ core path: all families core, no promoted names required, no fallback.
+    {
+        auto c = derive_dispatch_capabilities(v14, false, false, false, false, false, false);
+        CHECK(c.dynamic_rendering && c.synchronization2 && c.copy_commands2 && c.extended_dynamic_state,
+              "1.4 core path provides all families");
+        CHECK(c.dynamic_rendering_is_core && c.synchronization2_is_core &&
+                  c.copy_commands2_is_core && c.extended_dynamic_state_is_core,
+              "1.4 core path marks every family core");
+        CHECK(!c.use_legacy_copy_commands && !c.use_static_graphics_state,
+              "1.4 core path needs no fallbacks");
+    }
+    // 1.2 with both optional families.
+    {
+        auto c = derive_dispatch_capabilities(v12, true, true, true, true, false, false);
+        CHECK(c.dynamic_rendering && c.synchronization2 && c.copy_commands2 && c.extended_dynamic_state,
+              "1.2 + all four extensions provides every family");
+        CHECK(!c.dynamic_rendering_is_core, "1.2 families are not core");
+        CHECK(!c.use_legacy_copy_commands && !c.use_static_graphics_state,
+              "no fallbacks when all extensions are present");
+    }
+    // 1.2 with only dynamic rendering + sync2 (the dzn case): copy + static
+    // state fallbacks selected, device is NOT rejected for the missing pairs.
+    {
+        auto c = derive_dispatch_capabilities(v12, true, true, false, false, false, false);
+        CHECK(c.dynamic_rendering && c.synchronization2, "required families present");
+        CHECK(!c.copy_commands2 && !c.extended_dynamic_state, "optional families absent");
+        CHECK(c.use_legacy_copy_commands, "legacy copy selected");
+        CHECK(c.use_static_graphics_state, "static graphics state selected");
+    }
+    // 1.2 with copy2 but no extended dynamic state.
+    {
+        auto c = derive_dispatch_capabilities(v12, true, true, true, false, false, false);
+        CHECK(!c.use_legacy_copy_commands, "copy2 present -> modern copy path");
+        CHECK(c.use_static_graphics_state, "no extended dynamic state -> static variants");
+    }
+    // 1.2 missing dynamic rendering or sync2: NOT selectable (the evaluator
+    // gate rejects separately) — but the derivation still reports the absence.
+    {
+        auto c = derive_dispatch_capabilities(v12, false, true, true, true, false, false);
+        CHECK(!c.dynamic_rendering, "dynamic rendering absent");
+        CHECK(!c.synchronization2_is_core && !c.dynamic_rendering_is_core, "not core on 1.2");
+    }
+    // Force overrides win over an available modern path (white-box testing).
+    {
+        auto c = derive_dispatch_capabilities(v14, false, false, false, false, true, true);
+        CHECK(c.use_legacy_copy_commands && c.use_static_graphics_state,
+              "force overrides select the fallbacks on a modern device");
+        auto c2 = derive_dispatch_capabilities(v14, false, false, false, false, true, false);
+        CHECK(c2.use_legacy_copy_commands && !c2.use_static_graphics_state,
+              "force flags are independent");
+    }
+    // 1.3 core path with no promoted names.
+    {
+        auto c = derive_dispatch_capabilities(v13, false, false, false, false, false, false);
+        CHECK(c.dynamic_rendering && c.synchronization2 && c.copy_commands2 && c.extended_dynamic_state,
+              "1.3 cores provide all families without any extension name");
+        CHECK(c.dynamic_rendering_is_core, "1.3 families are core");
+        CHECK(!c.use_legacy_copy_commands && !c.use_static_graphics_state, "no fallbacks on 1.3");
+    }
+}
+
 // --- Extracted shader-layout manifest (ABI §11.1) ------------------------------
 // Parses the COMPILED .spv artifact and extracts struct member offsets, sizes,
 // and array strides (OpMemberDecorate Offset, OpDecorate ArrayStride, type
@@ -1052,6 +1125,7 @@ int main() {
     test_enum_ops();
     test_span();
     test_profile_report();
+    test_dispatch_capabilities();
     test_abi_manifest();
     test_shader_layout_manifest();
 

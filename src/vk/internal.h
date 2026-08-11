@@ -257,6 +257,41 @@ struct GpuPtrMap {
     Handle<Buffer> buffer;
 };
 
+// --- Vulkan 1.2 dispatch capabilities ------------------------------------------------
+// Which promoted-extension families a device provides and which private
+// fallbacks must be selected. Derived by the pure function below from the
+// effective API version + exported extension names + force-test overrides —
+// never from vendor IDs. effective_api_version is min(loader instance,
+// application-requested, physical-device).
+struct VulkanDispatchCapabilities {
+    uint32_t effective_api_version = 0;
+
+    bool dynamic_rendering        = false;
+    bool synchronization2         = false;
+    bool copy_commands2           = false;
+    bool extended_dynamic_state   = false;
+
+    bool dynamic_rendering_is_core      = false;
+    bool synchronization2_is_core       = false;
+    bool copy_commands2_is_core         = false;
+    bool extended_dynamic_state_is_core = false;
+
+    bool use_legacy_copy_commands   = false;   // no copy_commands2 (or forced)
+    bool use_static_graphics_state  = false;   // no extended_dynamic_state (or forced)
+};
+
+// Pure: injectable for unit tests (the mock capability matrix). is_core is
+// derived from effective_api_version >= 1.3. A family is "available" when
+// core OR its extension is exported. The fallback flags win over availability
+// when a force-test override is set.
+VulkanDispatchCapabilities derive_dispatch_capabilities(uint32_t effective_api_version,
+                                                        bool has_dynamic_rendering_ext,
+                                                        bool has_sync2_ext,
+                                                        bool has_copy2_ext,
+                                                        bool has_extended_dynamic_state_ext,
+                                                        bool force_legacy_copy,
+                                                        bool force_static_state);
+
 // --- DeviceImpl ----------------------------------------------------------------------
 // Cast between Handle<A> and Handle<B> when A and B are different tags
 // for the same underlying slot. Safe: the uint64_t encoding is identical.
@@ -288,6 +323,25 @@ struct DeviceImpl {
     bool                      use_synchronization2 = true;
     int64_t                   force_legacy_barriers = 0;
     uint32_t                  device_api_version = VK_API_VERSION_1_4;
+    uint32_t                  instance_api_version = VK_API_VERSION_1_4;
+
+    // Capability-driven dispatch (bindless 1.2 route).
+    VulkanDispatchCapabilities dispatch;
+    bool has_copy2_ext   = false;
+    bool has_extdyn_ext  = false;
+    int64_t force_legacy_copy  = 0;   // IZANAGI_FORCE_LEGACY_COPY_COMMANDS / test hook
+    int64_t force_static_state = 0;   // IZANAGI_FORCE_STATIC_GRAPHICS_STATE / test hook
+
+    // Path counters (atomic, best-effort; white-box tests verify via the
+    // selected path, not only by output).
+    int64_t stat_copy2_calls          = 0;
+    int64_t stat_legacy_copy_calls    = 0;
+    int64_t stat_ext_dyn_state_calls  = 0;
+    int64_t stat_static_variant_lookups = 0;
+    int64_t stat_static_variant_hits    = 0;
+    int64_t stat_static_variant_misses  = 0;
+    int64_t stat_static_variant_pending = 0;
+    int64_t stat_static_variant_compilations = 0;
 
     // Debug
     bool                      has_debug_markers   = false;
@@ -498,6 +552,11 @@ uint64_t   debug_queue_timeline(DeviceImpl* d);         // last successfully sub
 int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse resets
 bool       debug_validation_active(DeviceImpl* d);      // validation layer actually attached
 void       debug_force_legacy_barriers(DeviceImpl* d, bool force);  // test hook
+void       debug_force_legacy_copy(DeviceImpl* d, bool force);       // test hook
+void       debug_force_static_state(DeviceImpl* d, bool force);      // test hook
+void       debug_derive_dispatch(DeviceImpl* d);                     // re-derive after force toggles
+void       capture_device_capabilities(DeviceImpl* d);                // version+ext+dispatch (device.cpp)
+int64_t    debug_stat(DeviceImpl* d, int which);                     // 0=copy2,1=legacy-copy,2=extdyn,3..7=static variants
 bool       debug_bindless_null_slot_written(DeviceImpl* d);   // slot-0 dummy present
 uint32_t   debug_legacy_stage_mask(StageFlags stage);        // legacy barrier stage bits
 
