@@ -25,9 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (Clang Debug, headless)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-             -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_EXAMPLES=OFF
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_EXAMPLES=OFF
       - name: Build
         run: cmake --build build
       - name: Test (common tests run for real; GPU tests skip)
@@ -40,8 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (GCC Release, headless)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-             -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_EXAMPLES=OFF
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_EXAMPLES=OFF
       - name: Build
         run: cmake --build build
       - name: Build common tests (compile + run)
@@ -54,9 +56,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (AppleClang, headless, no slangc needed)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-             -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_TESTS=OFF \
-             -DIZANAGI_BUILD_EXAMPLES=OFF
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_TESTS=OFF
+          -DIZANAGI_BUILD_EXAMPLES=OFF
       - name: Build
         run: cmake --build build
 

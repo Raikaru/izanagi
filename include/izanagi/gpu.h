@@ -47,17 +47,14 @@ inline constexpr uint32_t kMaxSamplers        = 4096;
 inline constexpr uint32_t kMaxFramesInFlight  = 2;
 
 // --- Span ---------------------------------------------------------------------
+// Cross-const conversion trait: Span<U> is convertible to Span<T> when
+// T is `const U`. (Member variable-template partial specializations are not
+// portable across compilers; use free helpers + std traits instead.)
+template <class T, class U>
+inline constexpr bool span_is_const_of = std::is_same_v<T, const U>;
+
 template <class T>
 class Span {
-    template <class U>
-    static constexpr bool is_const = false;
-    template <class U>
-    static constexpr bool is_const<const U> = true;
-    template <class U, class V>
-    static constexpr bool is_const_of = false;
-    template <class U>
-    static constexpr bool is_const_of<U, const U> = true;
-
    public:
     constexpr Span() noexcept = default;
     constexpr Span(T* ptr, size_t len) noexcept : m_ptr{ptr}, m_len{len} {}
@@ -65,11 +62,11 @@ class Span {
         m_ptr{begin}, m_len{static_cast<size_t>(end - begin)} {}
     template <size_t N>
     constexpr Span(T (&a)[N]) noexcept : Span(a, N) {}
-    constexpr Span(std::initializer_list<T> v) noexcept IZ_REQUIRES(is_const<T>) :
+    constexpr Span(std::initializer_list<T> v) noexcept IZ_REQUIRES(std::is_const_v<T>) :
         Span(v.begin(), v.size()) {}
-    constexpr Span(const T& v) noexcept IZ_REQUIRES(is_const<T>) : Span(&v, 1) {}
+    constexpr Span(const T& v) noexcept IZ_REQUIRES(std::is_const_v<T>) : Span(&v, 1) {}
     template <typename U>
-    constexpr Span(const Span<U>& src) noexcept IZ_REQUIRES((is_const_of<U, T>)) :
+    constexpr Span(const Span<U>& src) noexcept IZ_REQUIRES((span_is_const_of<T, U>)) :
         Span(src.data(), src.size()) {}
     constexpr Span(const Span<T>& src) noexcept = default;
     Span& operator=(const Span<T>& src)         = default;
