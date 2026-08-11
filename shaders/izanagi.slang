@@ -2,13 +2,14 @@
 // Provides root-argument convention and descriptor-heap access helpers.
 //
 // TextureView/SamplerId encoding (must match include/izanagi/gpu.h):
-//   uint64 handle: low 32 bits = heap index, high 32 bits = 0.
-//   Unpack with uint2(uint(v), uint(v >> 32)) for .Handle(uint2).
+//   uint64 handle: low 32 bits = descriptor index, upper bits = CPU-side
+//   generation/type metadata (masked here; the driver only sees the index).
+//   Unpack with uint2(uint(v), 0) for .Handle(uint2).
 
 // Unpack a uint64 heap handle into the uint2 form Slang's .Handle() expects.
 public uint2 unpack_heap_handle(uint64_t v)
 {
-    return uint2(uint(v), uint(v >> 32));
+    return uint2(uint(v), 0);
 }
 
 // Typed accessor for a sampled texture from the resource heap.

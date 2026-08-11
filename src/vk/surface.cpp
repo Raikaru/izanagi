@@ -210,6 +210,8 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
             .mip_count          = 1,
             .dimensions         = {config.width, config.height, 1},
         }));
+        d->texture_pool[handle_cast<TextureImpl>(s.swapchain_images[i])].attachment_views =
+            Vector<TextureImpl::AttachmentView>(d->allocator);
     }
 
     // Frame semaphore (timeline for frame pacing)

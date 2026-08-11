@@ -215,6 +215,7 @@ void process_retire_batch(DeviceImpl* d, RetireBatch* batch) {
                 d->buffer_pool.erase(Handle<Buffer>{.h = item.a});
                 break;
             case RetireKind::Texture:
+                remove_uninitialized_texture(d, Handle<Texture>{.h = item.a});
                 release_texture_ref(d, Handle<Texture>{.h = item.a});
                 break;
             case RetireKind::PipelineRef:
@@ -262,6 +263,7 @@ Submission queue_submit(Queue                     q,
         Span<VkImageMemoryBarrier2> image_barriers{};
         for (auto tex : texture_list) {
             auto& image    = d->texture_pool[handle_cast<TextureImpl>(tex)];
+            image.init_state = TextureInitState::TransitionQueued;
             image_barriers = concat(
                 arena, image_barriers,
                 VkImageMemoryBarrier2{
@@ -392,6 +394,13 @@ Submission queue_submit(Queue                     q,
     if (atomic_load(&d->force_submit_failure)) {
         atomic_fetch_add(&d->stat_failed_submits, 1);
         mutex_unlock(&q->submit_lock);
+        // A failed submit never performed the transitions: restore them.
+        mutex_lock(&d->texture_init_lock);
+        for (Handle<Texture> tex : texture_list) {
+            d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::NeedsTransition;
+            d->uninitialized_textures.push_back(tex);
+        }
+        mutex_unlock(&d->texture_init_lock);
         return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
     }
 
@@ -410,6 +419,12 @@ Submission queue_submit(Queue                     q,
     if (arena->overflowed()) {
         atomic_fetch_add(&d->stat_failed_submits, 1);
         mutex_unlock(&q->submit_lock);
+        mutex_lock(&d->texture_init_lock);
+        for (Handle<Texture> tex : texture_list) {
+            d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::NeedsTransition;
+            d->uninitialized_textures.push_back(tex);
+        }
+        mutex_unlock(&d->texture_init_lock);
         IZ_LOG(d, LogLevel::Error, "queue_submit: scratch arena overflow, submission aborted");
         return Submission{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
     }
@@ -431,12 +446,23 @@ Submission queue_submit(Queue                     q,
         atomic_fetch_add(&d->stat_failed_submits, 1);
         log_vk_impl(d, result, "queue_submit: vkQueueSubmit2 failed", __LINE__, "commands.cpp"_sv);
         mutex_unlock(&q->submit_lock);
+        mutex_lock(&d->texture_init_lock);
+        for (Handle<Texture> tex : texture_list) {
+            d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::NeedsTransition;
+            d->uninitialized_textures.push_back(tex);
+        }
+        mutex_unlock(&d->texture_init_lock);
         Submission s{.queue = q, .value = submit_value, .status = SubmitStatus::Error};
         if (result == VK_ERROR_DEVICE_LOST) { s.status = SubmitStatus::DeviceLost; }
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
             s.status = SubmitStatus::OutOfMemory;
         }
         return s;
+    }
+
+    // Success: the transitions were recorded and submitted.
+    for (Handle<Texture> tex : texture_list) {
+        d->texture_pool[handle_cast<TextureImpl>(tex)].init_state = TextureInitState::Initialized;
     }
 
     // Success: publish the logical timeline, retire command pools, and
@@ -722,6 +748,8 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     vkCmdSetDepthWriteEnable(cmd->buffer, bool(desc.depth_mode & DepthFlags::Write));
     vkCmdSetDepthTestEnable(cmd->buffer, bool(desc.depth_mode & DepthFlags::Read));
     vkCmdSetDepthCompareOp(cmd->buffer, bridge(desc.depth_test));
+    vkCmdSetDepthBias(cmd->buffer, desc.depth_bias, desc.depth_bias_clamp,
+                      desc.depth_bias_slope_factor);
 
     vkCmdSetStencilTestEnable(cmd->buffer, true);
     vkCmdSetStencilOp(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT,
@@ -807,6 +835,49 @@ void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensi
 
 // --- Render pass ----------------------------------------------------------------------
 
+// Returns (creating on first use) a native image view for the attachment
+// subresource (texture, mip, layer). Views are cached per texture and
+// destroyed with it; the caller must have retained the texture.
+static VkImageView get_attachment_view(DeviceImpl* d, Handle<Texture> tex, uint16_t mip, uint16_t layer) {
+    auto& t = d->texture_pool[handle_cast<TextureImpl>(tex)];
+    mutex_lock(&d->attachment_view_lock);
+    for (auto& av : t.attachment_views) {
+        if (av.mip == mip && av.layer == layer) {
+            mutex_unlock(&d->attachment_view_lock);
+            return av.view;
+        }
+    }
+    // Cube faces use per-face 2D views (a cube view requires 6 layers).
+    const bool is_cube = (t.vk_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                          t.vk_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
+    const VkImageViewCreateInfo view_info{
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext    = nullptr,
+        .flags    = 0,
+        .image    = t.vk_image,
+        .viewType = is_cube ? VK_IMAGE_VIEW_TYPE_2D : t.vk_type,
+        .format   = bridge(t.format),
+        .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+        .subresourceRange = {
+            .aspectMask     = aspects_for_format(t.format),
+            .baseMipLevel   = mip,
+            .levelCount     = 1,
+            .baseArrayLayer = layer,
+            .layerCount     = 1,
+        },
+    };
+    VkImageView view = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateImageView(d->device, &view_info, nullptr, &view),
+                "get_attachment_view failed")) {
+        mutex_unlock(&d->attachment_view_lock);
+        return VK_NULL_HANDLE;
+    }
+    t.attachment_views.push_back(TextureImpl::AttachmentView{mip, layer, view});
+    mutex_unlock(&d->attachment_view_lock);
+    return view;
+}
+
 void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     auto* d = cmd->device;
     // Retain every texture named by the pass so freeing the user handle
@@ -825,7 +896,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         VkRenderingAttachmentInfo info{
             .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext              = nullptr,
-            .imageView          = d->texture_pool[handle_cast<TextureImpl>(attachment.texture)].default_image_view,
+            .imageView          = get_attachment_view(d, attachment.texture, attachment.mip, attachment.layer),
             .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
             .resolveMode        = VK_RESOLVE_MODE_NONE,
             .resolveImageView   = VK_NULL_HANDLE,
@@ -841,7 +912,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
             // MSAA color resolve (sample_count 1 target); depth/stencil
             // attachments never resolve.
             info.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
-            info.resolveImageView   = d->texture_pool[handle_cast<TextureImpl>(attachment.resolve_texture)].default_image_view;
+            info.resolveImageView   = get_attachment_view(d, attachment.resolve_texture, attachment.mip, attachment.layer);
             info.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
         color_attachments = concat(arena, color_attachments, info);
@@ -853,7 +924,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         depth_attachment = VkRenderingAttachmentInfo{
             .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext              = nullptr,
-            .imageView          = d->texture_pool[handle_cast<TextureImpl>(desc.depth_attachment.texture)].default_image_view,
+            .imageView          = get_attachment_view(d, desc.depth_attachment.texture, desc.depth_attachment.mip, desc.depth_attachment.layer),
             .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
             .resolveMode        = VK_RESOLVE_MODE_NONE,
             .resolveImageView   = VK_NULL_HANDLE,
@@ -871,7 +942,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         stencil_attachment = VkRenderingAttachmentInfo{
             .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext              = nullptr,
-            .imageView          = d->texture_pool[handle_cast<TextureImpl>(desc.stencil_attachment.texture)].default_image_view,
+            .imageView          = get_attachment_view(d, desc.stencil_attachment.texture, desc.stencil_attachment.mip, desc.stencil_attachment.layer),
             .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
             .resolveMode        = VK_RESOLVE_MODE_NONE,
             .resolveImageView   = VK_NULL_HANDLE,

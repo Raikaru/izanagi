@@ -55,6 +55,9 @@ struct BufferAndOffset {
     VmaAllocation alloc;
 };
 
+// Texture layout initialization state (stored per texture record).
+enum class TextureInitState : uint8_t { NeedsTransition, TransitionQueued, Initialized };
+
 struct TextureImpl {
     VkImage        vk_image           = VK_NULL_HANDLE;
     VkImageView    default_image_view = VK_NULL_HANDLE;
@@ -67,6 +70,18 @@ struct TextureImpl {
     // 1 per public handle + 1 per command-buffer/in-flight retention;
     // the pool slot (and native image) is destroyed at zero.
     int64_t        refs               = 1;   // atomic via platform helpers
+    // Image layout initialization: NeedsTransition until the first successful
+    // submission performs the UNDEFINED->GENERAL transition. Stored on the
+    // record so freeing a texture never leaves a stale entry in a global list.
+    TextureInitState init_state = TextureInitState::NeedsTransition;
+    // Lazily created attachment views (per mip/layer); destroyed with the
+    // texture. Guarded by DeviceImpl::attachment_view_lock.
+    struct AttachmentView {
+        uint16_t   mip;
+        uint16_t   layer;
+        VkImageView view;
+    };
+    Vector<AttachmentView> attachment_views;
 };
 
 struct DepthStencilState {
@@ -318,9 +333,19 @@ struct DeviceImpl {
     TwoLevelBitset sampled_bitset;
     TwoLevelBitset storage_bitset;
     TwoLevelBitset sampler_bitset;
+    // Per-slot CPU generations (stale-handle detection in view/sampler frees)
+    Vector<uint16_t> sampled_gen;
+    Vector<uint16_t> storage_gen;
+    Vector<uint16_t> sampler_gen;
 
     // Memory limits (for host flush/invalidate range alignment)
     VkDeviceSize non_coherent_atom_size = 1;
+    VkDeviceSize min_uniform_alignment  = 1;
+    VkDeviceSize min_storage_alignment  = 1;
+
+    // Guards the per-texture attachment-view caches (created lazily in
+    // cmd_begin_render_pass).
+    mutex attachment_view_lock = IZ_MUTEX_INIT;
 
     // Uninitialized textures (need UNDEFINED->GENERAL transition)
     mutex                  texture_init_lock = IZ_MUTEX_INIT;
@@ -396,6 +421,7 @@ void write_sampled_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCre
 void write_storage_descriptor(DeviceImpl* d, uint32_t slot, const VkImageViewCreateInfo& view_info);
 void write_sampler_descriptor(DeviceImpl* d, uint32_t slot, const VkSamplerCreateInfo& sampler_info);
 void release_texture_ref(DeviceImpl* d, Handle<Texture> tex);
+void remove_uninitialized_texture(DeviceImpl* d, Handle<Texture> tex);
 
 // White-box test hooks (not part of the public API)
 uint32_t   debug_live_pipelines(DeviceImpl* d);         // records in the dedup map

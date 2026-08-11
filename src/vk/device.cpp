@@ -547,6 +547,15 @@ static VkResult create_descriptor_heap(DeviceImpl* d) {
     d->sampled_bitset = TwoLevelBitset(d->allocator, d->heap.sampled_capacity);
     d->storage_bitset = TwoLevelBitset(d->allocator, d->heap.storage_capacity);
     d->sampler_bitset = TwoLevelBitset(d->allocator, d->heap.sampler_capacity);
+    // Reserve descriptor index zero as the null descriptor: 0 is never a
+    // valid view/sampler handle.
+    d->sampled_bitset.set_leading_zero();
+    d->storage_bitset.set_leading_zero();
+    d->sampler_bitset.set_leading_zero();
+    // Per-slot CPU generations for stale-handle detection
+    d->sampled_gen = Vector<uint16_t>(d->allocator, 0, d->heap.sampled_capacity);
+    d->storage_gen = Vector<uint16_t>(d->allocator, 0, d->heap.storage_capacity);
+    d->sampler_gen = Vector<uint16_t>(d->allocator, 0, d->heap.sampler_capacity);
 
     return VK_SUCCESS;
 }
@@ -666,6 +675,8 @@ Device create_device(const DeviceDesc& desc) {
         memcpy(d->cache_identity.driver_uuid, id_props.driverUUID,
                sizeof(d->cache_identity.driver_uuid));
         d->non_coherent_atom_size = props2.properties.limits.nonCoherentAtomSize;
+        d->min_uniform_alignment  = props2.properties.limits.minUniformBufferOffsetAlignment;
+        d->min_storage_alignment  = props2.properties.limits.minStorageBufferOffsetAlignment;
 
         d->cache_callbacks = desc.pipeline_cache_callbacks;
         if (d->cache_callbacks.load || d->cache_callbacks.store) {
@@ -705,6 +716,10 @@ Device create_device(const DeviceDesc& desc) {
         if (t->default_image_view != VK_NULL_HANDLE) {
             vkDestroyImageView(dd->device, t->default_image_view, nullptr);
         }
+        for (auto& av : t->attachment_views) {
+            vkDestroyImageView(dd->device, av.view, nullptr);
+        }
+        t->attachment_views.clear();
         if (!t->is_swapchain_image) {
             if (t->vk_allocation != VK_NULL_HANDLE) {
                 vmaDestroyImage(dd->vma, t->vk_image, t->vk_allocation);
@@ -849,6 +864,18 @@ void destroy_device(Device dev) {
 
 Backend device_backend() {
     return Backend::Vulkan;
+}
+
+DeviceLimits device_limits(Device dev) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    return DeviceLimits{
+        .max_sampled_textures = d->heap.sampled_capacity,
+        .max_storage_textures = d->heap.storage_capacity,
+        .max_samplers         = d->heap.sampler_capacity,
+        .min_uniform_alignment = d->min_uniform_alignment,
+        .min_storage_alignment = d->min_storage_alignment,
+        .non_coherent_atom_size = d->non_coherent_atom_size,
+    };
 }
 
 bool device_supports_dual_source_blend(Device dev) {

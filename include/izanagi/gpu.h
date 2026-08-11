@@ -480,9 +480,12 @@ struct RasterDesc {
 // Color attachments may set resolve_texture (a sample_count 1 texture of the
 // same format/size) to have the MSAA result resolved into it at pass end.
 // Depth/stencil attachments do not support resolve; any resolve_texture set
-// on them is ignored.
+// on them is ignored. mip/layer select the attachment subresource (no public
+// image views; the backend caches native views internally).
 struct RenderAttachment {
     Handle<Texture> texture = {0};
+    uint16_t        mip     = 0;
+    uint16_t        layer   = 0;
     LoadOp          load_op;
     StoreOp         store_op;
     Color           clear_color;
@@ -512,10 +515,6 @@ struct TextureViewDesc {
     uint16_t        base_layer  = 0;
     uint16_t        layer_count = 1;
 };
-struct TextureSizeAlign {
-    size_t size;
-    size_t align;
-};
 struct SpecializationConstant {
     uint32_t constant_id;
     union {
@@ -533,6 +532,15 @@ struct SurfaceCapabilities {
     UsageFlags              usages;
     Span<const Format>      formats;
     Span<const PresentMode> present_modes;
+};
+// Actual device limits (clamped backend capacities + driver alignment limits).
+struct DeviceLimits {
+    uint32_t max_sampled_textures;
+    uint32_t max_storage_textures;
+    uint32_t max_samplers;
+    uint64_t min_uniform_alignment;
+    uint64_t min_storage_alignment;
+    uint64_t non_coherent_atom_size;
 };
 struct SurfaceConfiguration {
     Format      format;
@@ -596,6 +604,7 @@ struct alignas(8) DrawIndexedIndirectGpuArgs {
 Device  create_device(const DeviceDesc&);
 void    destroy_device(Device);
 Backend device_backend();
+DeviceLimits device_limits(Device);
 void    device_wait_for_idle(Device);
 // True when dual-source blending (Factor::Src1*/OneMinusSrc1*) is supported
 // on this device. Pipeline creation with Src1 factors fails (returns null)
@@ -624,8 +633,9 @@ bool   flush_host_memory(Device, GpuPtr, size_t size);
 bool   invalidate_host_memory(Device, GpuPtr, size_t size);
 
 // Textures + global heap
-TextureSizeAlign get_texture_size_align(Device, const TextureDesc&);
-Handle<Texture>  create_texture(Device, const TextureDesc&, GpuPtr placement = 0);
+// Textures allocate their own GPU memory (VMA); there is no buffer-backed
+// placement token — a shader-visible GpuPtr is not a texture-memory token.
+Handle<Texture>  create_texture(Device, const TextureDesc&);
 void             free(Device, Handle<Texture>);
 TextureView      create_texture_view(Device, const TextureViewDesc&);
 TextureView      create_rw_texture_view(Device, const TextureViewDesc&);

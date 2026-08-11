@@ -376,7 +376,7 @@ static void test_heap_slot_recycling() {
             .format  = Format::RGBA8Unorm,
         };
         TextureView view = create_texture_view(d, view_desc);
-        CHECK(view != ~0ull, "create_texture_view failed");
+        CHECK(view != 0, "create_texture_view failed");
         uint32_t slot = static_cast<uint32_t>(view);
 
         free_texture_view(d, view);
@@ -789,77 +789,6 @@ static void test_draw_indirect() {
     free(d, count_buf);
     free(d, pipeline);
     free(d, color_tex);
-    destroy_device(d);
-    printf("  PASS\n");
-}
-
-// --- Test 10: get_texture_size_align + placed texture creation ----------------------------
-static void test_texture_size_align_placement() {
-    printf("--- Test: size/align placement ---\n");
-    DeviceDesc desc{
-        .log_callback = test_log_callback,
-        .log_level    = LogLevel::Warning,
-    };
-    Device d = create_device(desc);
-    CHECK(d != nullptr, "create_device returned null");
-
-    constexpr uint32_t kSize  = 128;
-    constexpr uint32_t kBytes = kSize * kSize * 4;
-
-    TextureDesc tex_desc{
-        .type       = TextureType::Tex2D,
-        .dimensions = {kSize, kSize, 1},
-        .format     = Format::RGBA8Unorm,
-        .usage      = UsageFlags::Sampled | UsageFlags::TransferSrc | UsageFlags::TransferDst,
-    };
-    TextureSizeAlign sa = get_texture_size_align(d, tex_desc);
-    CHECK(sa.size > 0, "get_texture_size_align returned size 0");
-    if (sa.size == 0) {
-        destroy_device(d);
-        return;
-    }
-
-    GpuPtr mem = malloc(d, sa.size, sa.align, Memory::Gpu);
-    CHECK(mem != 0, "malloc (placed) failed");
-    Handle<Texture> tex = create_texture(d, tex_desc, mem);
-    CHECK(tex.h != 0, "create_texture (placed) failed");
-    if (tex.h == 0) {
-        free(d, mem);
-        destroy_device(d);
-        return;
-    }
-
-    // Gradient upload + readback (same sequence as test_texture_copy)
-    GpuPtr staging  = malloc(d, kBytes, Memory::Default);
-    GpuPtr readback = malloc(d, kBytes, Memory::Readback);
-    CHECK(staging != 0 && readback != 0, "malloc failed");
-    auto* st = reinterpret_cast<uint8_t*>(get_host_pointer(d, staging));
-    for (uint32_t y = 0; y < kSize; ++y) {
-        for (uint32_t x = 0; x < kSize; ++x) {
-            uint32_t idx = (y * kSize + x) * 4;
-            st[idx + 0] = static_cast<uint8_t>(x);
-            st[idx + 1] = static_cast<uint8_t>(y);
-            st[idx + 2] = static_cast<uint8_t>(x ^ y);
-            st[idx + 3] = 0xFF;
-        }
-    }
-
-    Queue q = get_queue(d);
-    CommandBuffer cmd = queue_start_command_recording(q);
-    cmd_copy_to_texture(cmd, staging, tex, BufferTextureCopyInfo{.image_extent = {kSize, kSize, 1}});
-    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
-    cmd_copy_from_texture(cmd, tex, readback, BufferTextureCopyInfo{.image_extent = {kSize, kSize, 1}});
-    cmd_finalize(cmd);
-    queue_submit(q, {&cmd, 1});
-    device_wait_for_idle(d);
-
-    auto* rb = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
-    CHECK(memcmp(rb, st, kBytes) == 0, "placed texture upload/readback mismatch");
-
-    free(d, tex);
-    free(d, mem);
-    free(d, staging);
-    free(d, readback);
     destroy_device(d);
     printf("  PASS\n");
 }
@@ -2283,6 +2212,81 @@ static void test_memory_alignment_and_bounds() {
     printf("  PASS\n");
 }
 
+// --- Test 28: Descriptor handles, device limits, depth bias --------------------------------
+static void test_descriptor_handles_and_limits() {
+    printf("--- Test: descriptor handles + limits ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+
+    DeviceLimits lim = device_limits(d);
+    CHECK(lim.max_sampled_textures > 0 && lim.max_storage_textures > 0 && lim.max_samplers > 0,
+          "device limits nonzero");
+    CHECK(lim.non_coherent_atom_size >= 1, "non-coherent atom size valid");
+    CHECK(lim.min_uniform_alignment >= 1 && lim.min_storage_alignment >= 1, "alignments valid");
+
+    TextureDesc tex_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {16, 16, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::Sampled,
+    };
+    Handle<Texture> tex = create_texture(d, tex_desc);
+    CHECK(tex.h != 0, "create_texture failed");
+    if (tex.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    TextureView v1 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    TextureView v2 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    CHECK(v1 != 0 && v2 != 0, "valid views are nonzero (never the null descriptor)");
+    CHECK(v1 != v2, "distinct views carry distinct handles");
+    CHECK((v1 & 0xFFFFFFFFull) != 0 && (v2 & 0xFFFFFFFFull) != 0, "descriptor index 0 is reserved");
+    CHECK(((v1 >> 48) & 0xFF) == 1, "sampled-view type metadata");
+    SamplerId sampler = create_sampler(d, SamplerDesc{});
+    CHECK(sampler != 0, "sampler nonzero");
+    CHECK(((sampler >> 48) & 0xFF) == 3, "sampler type metadata");
+
+    Queue q = get_queue(d);   // needed for deferred slot retirement below
+
+    // Recycling bumps the generation; a stale handle is rejected on free.
+    free_texture_view(d, v1);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+    for (int i = 0; i < 100; ++i) { queue_process_events(q); sleep_ms(5); }
+    TextureView v3 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    CHECK((v3 & 0xFFFFFFFFull) == (v1 & 0xFFFFFFFFull), "slot is recycled");
+    CHECK(((v3 >> 32) & 0xFFFF) != ((v1 >> 32) & 0xFFFF), "generation bumped on reuse");
+    free_texture_view(d, v1);   // stale: rejected (logged), slot stays live
+    free_texture_view(d, v3);
+    // Wrong descriptor type: rejected (sampled handle passed to free_sampler)
+    TextureView v4 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
+    free_sampler(d, v4);   // type mismatch -> no-op; slot intentionally leaked to device teardown
+    free_sampler(d, sampler);
+    free(d, tex);
+
+    // Depth bias is applied via dynamic state (no longer silently ignored).
+    DepthStencilDesc dsd{.depth_bias = 1.0f};
+    Handle<DepthStencilState> ds = create_depth_stencil_state(d, dsd);
+    CHECK(ds.h != 0, "depth stencil state creation");
+    cmd = queue_start_command_recording(q);
+    cmd_set_depth_stencil_state(cmd, ds);
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "depth-bias state submit");
+    CHECK(wait_submission(s), "depth-bias state submission completes");
+    free_depth_stencil_state(d, ds);
+
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
 int main() {
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
@@ -2307,7 +2311,6 @@ int main() {
     test_dispatch_indirect();
     test_spec_constants();
     test_draw_indirect();
-    test_texture_size_align_placement();
     test_mip_and_cube();
     test_bc1_roundtrip();
     test_msaa_resolve();
@@ -2324,6 +2327,7 @@ int main() {
     test_free_after();
     test_texture_cb_retention();
     test_memory_alignment_and_bounds();
+    test_descriptor_handles_and_limits();
     test_dual_source_blend();
 
     printf("\n=================\n");
