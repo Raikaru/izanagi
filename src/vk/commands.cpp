@@ -523,6 +523,7 @@ Submission queue_submit(Queue                     q,
             Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
             if (h.h != 0) { release_texture_ref(d, h); }   // the preparation ref
         }
+        mutex_lock(&q->record_lock);   // pool accounting is record_lock-guarded
         if (internal_cmd != nullptr && internal_cmd->pool != nullptr &&
             internal_cmd->pool->outstanding > 0) {
             internal_cmd->pool->outstanding--;   // never submitted: release the checkout
@@ -530,6 +531,10 @@ Submission queue_submit(Queue                     q,
         for (uint32_t i = 0; i < command_buffers.size(); ++i) {
             auto* cb = command_buffers[i];
             if (cb->pool != nullptr && cb->pool->outstanding > 0) { cb->pool->outstanding--; }
+        }
+        mutex_unlock(&q->record_lock);
+        for (uint32_t i = 0; i < command_buffers.size(); ++i) {
+            auto* cb = command_buffers[i];
             for (PipelineRecord* rec : cb->retained_pipelines) { release_pipeline_ref(d, rec); }
             cb->retained_pipelines.clear();
             for (TextureImpl* rec : cb->retained_textures) {
@@ -612,8 +617,10 @@ Submission queue_submit(Queue                     q,
     }
     auto commit_cb = [&](CommandBufferImpl* cb) {
         if (cb->pool != nullptr && cb->pool->outstanding > 0) {
+            mutex_lock(&q->record_lock);   // pool accounting is record_lock-guarded
             cb->pool->outstanding--;
             if (cb->pool->retire_value < submit_value) { cb->pool->retire_value = submit_value; }
+            mutex_unlock(&q->record_lock);
         }
         for (PipelineRecord* rec : cb->retained_pipelines) {
             retire_batch->items.push_back(
