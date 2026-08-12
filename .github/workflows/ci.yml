@@ -100,9 +100,10 @@ jobs:
       - name: Probe (capability report; non-authoritative)
         run: |
           set -euo pipefail
-          icd="/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
-          if [ ! -f "$icd" ]; then
-            echo "ERROR: Lavapipe ICD not found at $icd (mesa-vulkan-drivers install?)" >&2
+          icd=$(find /usr/share/vulkan/icd.d /usr/lib/x86_64-linux-gnu -name 'lvp_icd*.json' 2>/dev/null | head -n 1)
+          if [ -z "$icd" ]; then
+            echo "ERROR: Lavapipe ICD not found (mesa-vulkan-drivers install?). Available ICDs:" >&2
+            ls -l /usr/share/vulkan/icd.d/ 2>&1 >&2 || true
             exit 1
           fi
           # Pin the Lavapipe ICD so the probe and the suite use Lavapipe, not
