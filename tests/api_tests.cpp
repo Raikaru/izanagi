@@ -14,6 +14,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include "izanagi/gpu.h"
@@ -97,6 +99,23 @@ static std::string find_shader_path(const char* name) {
     DWORD len = GetModuleFileNameA(nullptr, exe_path, sizeof(exe_path));
     if (len > 0 && len < sizeof(exe_path)) {
         char* slash = strrchr(exe_path, '\\');
+        if (slash) {
+            *(slash + 1) = '\0';
+            std::string path = std::string(exe_path) + profile_dir + name;
+            if (std::filesystem::exists(path)) { return path; }
+            path = std::string(exe_path) + "shaders/" + name;
+            if (std::filesystem::exists(path)) { return path; }
+        }
+    }
+#else
+    // Linux: resolve relative to the executable directory (readlink
+    // /proc/self/exe), so tests run from any CWD — the CWD-relative
+    // candidates below are a fallback, not the primary path.
+    char exe_path[2048];
+    const ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (n > 0) {
+        exe_path[n] = '\0';
+        char* slash = strrchr(exe_path, '/');
         if (slash) {
             *(slash + 1) = '\0';
             std::string path = std::string(exe_path) + profile_dir + name;
