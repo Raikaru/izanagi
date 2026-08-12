@@ -1,0 +1,35 @@
+{
+  "backend": "VulkanBindless",
+  "profile": "IZANAGI_VK_BINDLESS_1",
+  "profile_supported": true,
+  "platform": "Linux",
+  "device_name": "Microsoft Direct3D12 (NVIDIA GeForce RTX 4080 Laptop GPU)",
+  "api_version": "1.2.354",
+  "driver_version": 109060096,
+  "vendor_id": 4318,
+  "device_id": 10208,
+  "missing_features": [],
+  "descriptor_capacity": {
+    "sampled_textures": 65536,
+    "storage_textures": 65536,
+    "samplers": 4096
+  },
+  "pipeline_cache_control": false,
+  "bindless_profile": {
+    "supported": true,
+    "api_version": "1.2.354",
+    "real_gpu_pointers": true,
+    "dynamic_rendering": true,
+    "synchronization2": true,
+    "descriptor_set_snapshots": 1,
+    "shader_int8": false,
+    "shader_int16": true,
+    "storage_buffer_8bit_access": false,
+    "storage_buffer_16bit_access": true,
+    "sampled_image_capacity": 1024,
+    "storage_image_capacity": 1024,
+    "sampler_capacity": 256,
+    "combined_descriptor_budget": 1000000,
+    "missing_requirements": []
+  }
+}
