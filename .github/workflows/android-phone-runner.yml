@@ -27,8 +27,15 @@ jobs:
       BUILD_DIR: build-phone
       TURNIP_URL: https://github.com/lfdevs/mesa-for-android-container/releases/download/mesa-26.2.0-devel-20260709/mesa-for-android-container_26.2.0-devel-20260709_debian_trixie_arm64.tar.gz
       TURNIP_SHA256: 4ee525b4844fb189f3762ff75ef77f5b80eee8f6cdab2e5588731b5c9f8168bb
+      DEPS_DIR: /home/runner/.cache/izanagi-fetchcontent
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Prepare persistent dependency cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPS_DIR"
+          git config --global http.version HTTP/1.1
       - name: Install pinned Turnip driver
         shell: bash
         run: |
@@ -57,6 +64,7 @@ jobs:
       - name: Configure native ARM64 build
         run: >
           cmake -S . -B "$BUILD_DIR" -G Ninja
+          -DFETCHCONTENT_BASE_DIR="$DEPS_DIR"
           -DCMAKE_BUILD_TYPE=Release
           -DIZANAGI_BACKEND=VULKAN_NATIVE
           -DIZANAGI_VK_PROFILE=BINDLESS
