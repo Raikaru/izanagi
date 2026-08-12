@@ -35,23 +35,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$DEPS_DIR"
-          if [ ! -f "$DEPS_DIR/vulkanheaders-src/CMakeLists.txt" ]; then
+          if [ ! -f "$DEPS_DIR/vulkanheaders-src/.izanagi-complete" ]; then
             rm -rf "$DEPS_DIR/vulkanheaders-src"
             mkdir -p "$DEPS_DIR/vulkanheaders-src"
-            curl -L --fail --silent --show-error "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/vulkan-sdk-1.4.341.0" \
+            curl --http1.1 --retry 3 --connect-timeout 15 --max-time 180 -L --fail --silent --show-error "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/vulkan-sdk-1.4.341.0" \
               | tar -xzf - -C "$DEPS_DIR/vulkanheaders-src" --strip-components=1
+            touch "$DEPS_DIR/vulkanheaders-src/.izanagi-complete"
           fi
-          if [ ! -f "$DEPS_DIR/volk-src/CMakeLists.txt" ]; then
+          if [ ! -f "$DEPS_DIR/volk-src/.izanagi-complete" ]; then
             rm -rf "$DEPS_DIR/volk-src"
             mkdir -p "$DEPS_DIR/volk-src"
-            curl -L --fail --silent --show-error "https://codeload.github.com/zeux/volk/tar.gz/vulkan-sdk-1.4.341.0" \
+            curl --http1.1 --retry 3 --connect-timeout 15 --max-time 180 -L --fail --silent --show-error "https://codeload.github.com/zeux/volk/tar.gz/vulkan-sdk-1.4.341.0" \
               | tar -xzf - -C "$DEPS_DIR/volk-src" --strip-components=1
+            touch "$DEPS_DIR/volk-src/.izanagi-complete"
           fi
-          if [ ! -f "$DEPS_DIR/vma-src/CMakeLists.txt" ]; then
+          if [ ! -f "$DEPS_DIR/vma-src/.izanagi-complete" ]; then
             rm -rf "$DEPS_DIR/vma-src"
             mkdir -p "$DEPS_DIR/vma-src"
-            curl -L --fail --silent --show-error "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/tar.gz/v3.3.0" \
+            curl --http1.1 --retry 3 --connect-timeout 15 --max-time 180 -L --fail --silent --show-error "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/tar.gz/v3.3.0" \
               | tar -xzf - -C "$DEPS_DIR/vma-src" --strip-components=1
+            touch "$DEPS_DIR/vma-src/.izanagi-complete"
           fi
           echo "FETCHCONTENT_SOURCE_DIR_VULKANHEADERS=$DEPS_DIR/vulkanheaders-src" >> "$GITHUB_ENV"
           echo "FETCHCONTENT_SOURCE_DIR_VOLK=$DEPS_DIR/volk-src" >> "$GITHUB_ENV"
