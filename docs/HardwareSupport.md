@@ -34,9 +34,12 @@ semaphores, draw-indirect-count; 1M descriptor capacities), plus dynamic
 rendering + synchronization2 (KHR forms). Missing: `VK_KHR_copy_commands2`
 and `VK_EXT_extended_dynamic_state` — the dispatch route selects the private
 legacy-copy fallback and the private static graphics-state fallback, and the
-**full 42-test suite passes** (compute, copies, graphics draws with private
-static variants, variant Pending/recovery). The baked-state readback matrix
-(test 41) and the qualification bundle are the follow-up run on this rig.
+**full 43-test suite passes** (compute, copies, graphics draws with private
+static variants, variant Pending/recovery, and the baked-state readback
+matrix — cull, front-face, depth-compare, stencil-compare, viewport —
+verified through pixel readbacks). The stencil pipeline uses a single
+combined Depth24PlusStencil8 format (dzn has no standalone S8 image format
+and no separate depth/stencil DSV formats).
 Caveats: the experimental dzn driver traps the process on any malformed
 SPIR-V (the bad-shader failure-injection test is gated off on the
 limited-1.2 dispatch signature), and dzn's `WARNING: dzn is not a conformant
