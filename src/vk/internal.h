@@ -568,6 +568,9 @@ struct LogicalGraphicsState {
     // Viewport/scissor remain dynamic on the fallback path.
     Rect2D viewport{0, 0, 0, 0};
     Rect2D scissor{0, 0, 0, 0};
+    float  depth_bias        = 0.0f;
+    float  depth_bias_clamp  = 0.0f;
+    float  depth_bias_slope  = 0.0f;
 
     // dirty_static_state: a baked member changed since the last variant bind
     // (a new private variant is required on the fallback path).
@@ -663,7 +666,6 @@ bool       debug_validation_active(DeviceImpl* d);      // validation layer actu
 void       debug_force_legacy_barriers(DeviceImpl* d, bool force);  // test hook
 bool      debug_using_static_state(DeviceImpl* d);                    // white-box
 uint32_t  debug_effective_api_version(DeviceImpl* d);              // white-box
-bool      debug_limited_1_2(DeviceImpl* d);                        // white-box (dzn signature)
 void       debug_force_legacy_copy(DeviceImpl* d, bool force);       // test hook
 void       debug_force_static_state(DeviceImpl* d, bool force);      // test hook
 void       debug_derive_dispatch(DeviceImpl* d);                     // re-derive after force toggles

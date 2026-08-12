@@ -76,6 +76,22 @@ static void release_cb_variant(CommandBufferImpl* cb) {
     cb->bound_base_pipeline = nullptr;
 }
 
+// Re-asserts the core-dynamic stencil/bias state from the shadow after a
+// static-variant bind. Dynamic-state capture is bind-time on some drivers
+// (D3D12-based dzn keeps the pipeline-static stencil reference otherwise),
+// so the state that precedes the bind must be re-issued after it. The
+// viewport/scissor are not re-asserted here (they are issued through their
+// own commands and verified working; the default viewport's Y-flip is
+// begin_render_pass-internal and not representable in the shadow).
+static void reapply_core_dynamic_state(CommandBufferImpl* cb) {
+    const LogicalGraphicsState& gs = cb->graphics_state;
+    vkCmdSetDepthBias(cb->buffer, gs.depth_bias, gs.depth_bias_clamp, gs.depth_bias_slope);
+    vkCmdSetStencilReference(cb->buffer, VK_STENCIL_FACE_FRONT_BIT, gs.stencil_front.reference);
+    vkCmdSetStencilReference(cb->buffer, VK_STENCIL_FACE_BACK_BIT, gs.stencil_back.reference);
+    vkCmdSetStencilWriteMask(cb->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, gs.stencil_write_mask);
+    vkCmdSetStencilCompareMask(cb->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, gs.stencil_read_mask);
+}
+
 static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
     // Release references retained by recorded-but-never-submitted command
     // buffers (their commands are discarded; the GPU never executed them,
@@ -802,14 +818,6 @@ uint32_t debug_effective_api_version(DeviceImpl* d) {
     return d->dispatch.effective_api_version;
 }
 
-// True for the observable "limited 1.2" dispatch signature: 1.2 device with
-// neither copy-commands2 nor extended-dynamic-state (Mesa dzn). Behavior-
-// based; never vendor-ID-based.
-bool debug_limited_1_2(DeviceImpl* d) {
-    return d->dispatch.effective_api_version < VK_API_VERSION_1_3 &&
-           d->dispatch.use_legacy_copy_commands && d->dispatch.use_static_graphics_state;
-}
-
 int64_t debug_stat(DeviceImpl* d, int which) {
     switch (which) {
         case 0: return atomic_load(&d->stat_copy2_calls);
@@ -1332,6 +1340,7 @@ bool prepare_static_graphics(CommandBufferImpl* cb) {
     if (is_default_baked_state(cb->graphics_state)) {
         if (cb->bound_variant != nullptr) {
             vkCmdBindPipeline(cb->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, base->vk_pipeline);
+            reapply_core_dynamic_state(cb);
             cb->bound_variant = nullptr;
         }
         cb->graphics_state.dirty_static_state = false;
@@ -1354,6 +1363,7 @@ bool prepare_static_graphics(CommandBufferImpl* cb) {
         return false;
     }
     vkCmdBindPipeline(cb->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, v->vk_pipeline);
+    reapply_core_dynamic_state(cb);
     cb->bound_variant = v;
     cb->graphics_state.dirty_static_state = false;
     return true;
@@ -1370,7 +1380,12 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     gs.dirty_static_state     = true;
 
     // Core-dynamic (applied on every path): depth bias, stencil references,
-    // stencil write/compare masks.
+    // stencil write/compare masks. The values are shadowed so a variant bind
+    // at draw time can re-assert them (some drivers capture dynamic state at
+    // pipeline bind).
+    gs.depth_bias       = desc.depth_bias;
+    gs.depth_bias_clamp = desc.depth_bias_clamp;
+    gs.depth_bias_slope = desc.depth_bias_slope_factor;
     vkCmdSetDepthBias(cmd->buffer, desc.depth_bias, desc.depth_bias_clamp,
                       desc.depth_bias_slope_factor);
     vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT, desc.stencil_front.reference);
@@ -1551,6 +1566,15 @@ static VkImageView get_attachment_view(DeviceImpl* d, Handle<Texture> tex, uint1
 
 void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     auto* d = cmd->device;
+    // Vulkan requires pDepthAttachment and pStencilAttachment to reference
+    // the same image view when both are set (a combined depth/stencil
+    // format). Two distinct images cannot be expressed legally; lenient
+    // drivers ignore it, Turnip renders incorrectly. Fail the recording.
+    if (desc.depth_attachment.texture.h != 0 && desc.stencil_attachment.texture.h != 0 &&
+        desc.depth_attachment.texture.h != desc.stencil_attachment.texture.h) {
+        cmd_record_fail(cmd, "render pass: depth and stencil attachments must be the same texture");
+        return;
+    }
     // Retain every texture named by the pass so freeing the user handle
     // cannot destroy a native image the recorded commands reference.
     for (const auto& attachment : desc.color_attachments) {
@@ -1673,9 +1697,9 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         backend_set_depth_compare_op(d, buf, VK_COMPARE_OP_ALWAYS);
         backend_set_depth_bounds_test_enable(d, buf, false);
         backend_set_stencil_test_enable(d, buf, false);
-        vkCmdSetStencilOp(buf, VK_STENCIL_FACE_FRONT_AND_BACK,
-                          VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
-                          VK_COMPARE_OP_ALWAYS);
+        backend_set_stencil_op(d, buf, VK_STENCIL_FACE_FRONT_AND_BACK,
+                               VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
+                               VK_COMPARE_OP_ALWAYS);
         backend_set_viewport_with_count(d, buf, 1, &viewport);
         backend_set_scissor_with_count(d, buf, 1, &render_rect);
     }
