@@ -1,0 +1,58 @@
+name: Hardware qualification
+description: Report a device/driver as qualified or unqualified for the bindless profile, with evidence from tools/run_hardware_qualification.sh
+title: "Hardware qualification: [GPU/driver]"
+labels: [hardware-qualification]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run the qualification bundle first and attach its output directory
+        (capability.json + suite.log):
+        ```
+        ./tools/run_hardware_qualification.sh [--profile bindless|native]
+        ```
+        The bundle is probe-first and non-authoritative — this report records
+        what actually ran on this hardware.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Exact model (e.g. NVIDIA GeForce RTX 4080, AMD RX 5700 XT, Intel Iris Xe)
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: Driver / ICD
+      description: Driver version or ICD (e.g. 560.94, mesa 26.2.0 dzn, RADV 24.2, Lavapipe)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS / API version
+      description: e.g. Windows 11 / Vulkan 1.4, Ubuntu 24.04 / Vulkan 1.3
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - PASS (full suite green)
+        - SKIP (probe reported profile_supported:false)
+        - FAIL (suite failure / probe error)
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Paste capability.json (device, API version, missing_features) and, for FAIL, the failing test lines from suite.log
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Forced configurations used (--force-static / --force-legacy-copy), validation layer, reproduction steps

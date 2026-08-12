@@ -76,6 +76,70 @@ jobs:
           IZANAGI_TESTS_ALLOW_SKIP: 1
         run: ctest --test-dir build -C Release --output-on-failure
 
+
+  linux-lavapipe-bindless:
+    # Hardware-light validation: the full Bindless suite on Lavapipe (CPU
+    # Vulkan, no GPU needed). NON-AUTHORITATIVE: the capability probe runs
+    # first and the job SKIPS (never fails) when Lavapipe cannot run the
+    # profile — real-hardware qualification is the separate
+    # tools/run_hardware_qualification.sh bundle + issue template.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+      - name: Configure (Bindless, headless, Debug)
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_VK_PROFILE=BINDLESS
+          -DIZANAGI_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Probe (capability report; non-authoritative)
+        run: |
+          set -euo pipefail
+          icd="/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
+          if [ ! -f "$icd" ]; then
+            echo "ERROR: Lavapipe ICD not found at $icd (mesa-vulkan-drivers install?)" >&2
+            exit 1
+          fi
+          # Pin the Lavapipe ICD so the probe and the suite use Lavapipe, not
+          # whatever ICD the loader would otherwise pick on the runner.
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          set +e
+          ./build/bin/izanagi_capability_report > /tmp/lavapipe-cap.json 2>/tmp/lavapipe-cap.err
+          status=$?
+          set -e
+          cat /tmp/lavapipe-cap.json
+          if [ $status -ne 0 ]; then
+            if grep -q '"profile_supported": false' /tmp/lavapipe-cap.json; then
+              echo "Lavapipe cannot run the bindless profile — skipping (non-authoritative)."
+              exit 0
+            fi
+            echo "ERROR: capability probe failed ($status) without a profile_supported:false" >&2
+            echo "       decision — malformed JSON or tool crash. Probe stderr:" >&2
+            cat /tmp/lavapipe-cap.err >&2
+            exit 1
+          fi
+          if ! grep -q '"profile_supported": true' /tmp/lavapipe-cap.json; then
+            echo "ERROR: probe exited 0 without profile_supported:true (malformed JSON?)" >&2
+            exit 1
+          fi
+          echo "PROFILE_QUALIFIED=1" >> "$GITHUB_ENV"
+      - name: Test (full suite on Lavapipe)
+        if: env.PROFILE_QUALIFIED == '1'
+        env:
+          IZANAGI_TESTS_ALLOW_SKIP: 1
+        run: ctest --test-dir build --output-on-failure
+      - name: Archive capability evidence
+        if: always()
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
+        with:
+          name: lavapipe-capability
+          path: /tmp/lavapipe-cap.json
+
   android-arm64-cross-build:
     runs-on: ubuntu-latest
     steps:

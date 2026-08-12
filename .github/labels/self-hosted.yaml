@@ -1,0 +1,6 @@
+# Labels for the optional self-hosted hardware-qualification runners. The
+# workflow is NOT enabled in CI; it runs only on self-hosted runners that
+# opt in via the `izanagi-hardware` label (settings -> Actions -> Runners).
+- name: hardware-qualification
+  color: "d4c5f9"
+  description: Hardware/driver qualification report (bindless profile evidence)
