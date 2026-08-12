@@ -1737,11 +1737,17 @@ static void test_async_pipeline_pending_and_failed() {
     free(d, p2);
     poll_live_pipelines(impl, 0);
 
-    // Failed: garbage SPIR-V must fail deterministically on the worker.
-    uint32_t junk[8] = {0xDEADBEEFu, 1, 2, 3, 4, 5, 6, 7};
+    // Failed: a valid module with a MISSING entry point must fail
+    // deterministically on the worker. (Garbage SPIR-V also fails on native
+    // drivers, but Mesa's experimental dzn loader asserts on an invalid
+    // magic instead of returning an error — the missing-entry failure is
+    // driver-agnostic and exercises the same Failed contract.)
+    std::string failed_path = find_shader_path("memcpy_kernel.spv");
+    auto failed_spirv = load_spirv(failed_path.c_str(), &arena);
+    CHECK(failed_spirv.size() > 0, "Failed to load memcpy_kernel.spv for the failure path");
     ShaderSource bad{
-        .source = Span<const uint8_t>(reinterpret_cast<const uint8_t*>(junk), sizeof(junk)),
-        .entry_point = "compute_main"_sv,
+        .source      = failed_spirv,
+        .entry_point = "missing_entry"_sv,
     };
     Handle<Pipeline> bad_p = request_compute_pipeline(d, bad);
     CHECK(bad_p.h != 0, "request for an invalid shader must still return a handle");
