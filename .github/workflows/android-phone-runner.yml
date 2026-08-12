@@ -71,12 +71,20 @@ jobs:
           mkdir -p "$turnip_root"
           tar -xzf "$archive" -C "$turnip_root"
           test -r /dev/kgsl-3d0
+          loader_root="$DEPS_DIR/vkloader"
+          if [ ! -f "$loader_root/.izanagi-complete" ]; then
+            rm -rf "$loader_root"
+            mkdir -p "$loader_root"
+            (cd "$RUNNER_TEMP" && rm -f libvulkan1_*.deb && apt-get download libvulkan1 \
+              && dpkg-deb -x libvulkan1_*.deb "$loader_root" && rm -f libvulkan1_*.deb)
+            touch "$loader_root/.izanagi-complete"
+          fi
           icd="$turnip_root/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json"
           sed -i "s#/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so#$turnip_root/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so#" "$icd"
           echo "MESA_LOADER_DRIVER_OVERRIDE=kgsl" >> "$GITHUB_ENV"
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
           echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$turnip_root/usr/lib/aarch64-linux-gnu:$turnip_root/usr/lib/aarch64-linux-gnu/dri${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$loader_root/usr/lib/aarch64-linux-gnu:$turnip_root/usr/lib/aarch64-linux-gnu:$turnip_root/usr/lib/aarch64-linux-gnu/dri${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "LIBGL_DRIVERS_PATH=$turnip_root/usr/lib/aarch64-linux-gnu/dri" >> "$GITHUB_ENV"
       - name: Report phone runner toolchain
         run: |
