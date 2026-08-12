@@ -10,7 +10,7 @@ only a *testing* label, used to organize which devices were actually run.
 | Device | OS / driver | API | Profile | Result |
 |---|---|---|---|---|
 | NVIDIA GeForce RTX 4080 Laptop GPU | Windows 11, NVIDIA driver 610.88 | 1.4.341 | Native + Bindless | Full suite passes (both profiles) |
-| NVIDIA GeForce RTX 4080 via D3D12 (**dzn**) | WSL Ubuntu / mesa 26.2.0 dzn | 1.2.354 | Bindless | Full suite passes (42/42) |
+| NVIDIA GeForce RTX 4080 via D3D12 (**dzn**) | WSL Ubuntu / mesa 26.2.0 dzn | 1.2.354 | Bindless | Full suite passes (43/43, Debug + Release) |
 | Lavapipe (mesa, CPU) | CI runner (ubuntu-latest, headless) | 1.x (CPU) | Bindless | Probe job added; qualification pending first successful CI run (non-authoritative) |
 | Qualcomm Adreno 650 (Galaxy S20+ 5G) via Mesa **Turnip** | Debian arm64 (Termux/proot), mesa 26.2.0-devel Turnip/KGSL | 1.3.354 | Bindless | Full suite passes |
 
