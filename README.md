@@ -64,7 +64,11 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   description and compiles on a device-owned worker thread — never on the
   frame-critical thread. `get_pipeline_status`/`wait_pipeline` track
   Pending → Ready/Failed; `cmd_set_pipeline` returns false for non-Ready
-  pipelines so the application explicitly binds a fallback or skips. See
+  pipelines so the application explicitly binds a fallback or skips. On
+  devices without extended dynamic state the baked graphics state is compiled
+  into private static pipeline variants on the same worker (prewarm with
+  `request_graphics_state`/`wait_graphics_state`; a not-yet-compiled variant
+  fails the command buffer deterministically). See
   [docs/PipelineCompilation.md](docs/PipelineCompilation.md).
 - **Explicit GPU lifetime.** `queue_submit` returns a `Submission` token
   (timeline value published only on success); command pools, buffers,
@@ -157,12 +161,20 @@ include); consumers only need the include dir + the compiled lib.
 
 ## Platform status
 
-Windows (Vulkan Native, WIN32 WSI) is the certified baseline. Linux headless
-builds and the macOS build boundary are in place. Android now has an arm64 NDK
-cross-build plus phone-hosted Turnip/KGSL bindless conformance CI; Android
-support remains experimental and the stock Qualcomm Vulkan path is a clean
-capability-rejection path on the current phone. Metal and iOS remain in
-incremental phases. See [docs/PlatformSupport.md](docs/PlatformSupport.md) and
+Windows (Vulkan Native, WIN32 WSI) is the certified baseline: the full suite
+passes on both profiles, including the forced legacy-copy and forced
+static-graphics-state configurations. Linux: the bindless profile's full
+suite passes on the WSL dzn rig (mesa 26.2.0 dzn — D3D12-on-Vulkan, api 1.2,
+no copy-commands2, no extended dynamic state) exercising exactly the private
+fallbacks; headless builds + common tests run on CI, and a Lavapipe probe job
+(non-authoritative) is in CI. Android has an arm64 NDK cross-build plus
+phone-hosted Turnip/KGSL bindless conformance CI; support remains
+experimental and the stock Qualcomm Vulkan path is a clean capability-rejection
+path. RADV/NVK/ANV and Maxwell/Polaris/Skylake/GCN-class hardware are
+**unqualified** (no hardware; the
+`tools/run_hardware_qualification.sh` bundle + hardware-qualification issue
+template exist for volunteered reports). Metal and iOS remain in incremental
+phases. See [docs/PlatformSupport.md](docs/PlatformSupport.md) and
 [docs/Build.md](docs/Build.md) — a platform is never listed as supported merely
 because it compiles.
 

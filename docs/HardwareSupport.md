@@ -34,7 +34,8 @@ rendering + synchronization2 (KHR forms). Missing: `VK_KHR_copy_commands2`
 and `VK_EXT_extended_dynamic_state` — the dispatch route selects the private
 legacy-copy fallback and the private static graphics-state fallback, and the
 **full 42-test suite passes** (compute, copies, graphics draws with private
-static variants, variant Pending/recovery, baked-state readback matrices).
+static variants, variant Pending/recovery). The baked-state readback matrix
+(test 41) and the qualification bundle are the follow-up run on this rig.
 Caveats: the experimental dzn driver traps the process on any malformed
 SPIR-V (the bad-shader failure-injection test is gated off on the
 limited-1.2 dispatch signature), and dzn's `WARNING: dzn is not a conformant

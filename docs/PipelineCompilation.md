@@ -1,8 +1,11 @@
 # Pipeline compilation (async model)
 
 Izanagi compiles pipelines on a device-owned background thread. Requesting a
-pipeline never blocks on native compilation; binding a pipeline never triggers
-compilation.
+BASE pipeline never blocks on native compilation, and binding a base pipeline
+never triggers compilation. (Two exceptions are explicit: the blocking
+`create_*_pipeline` wrappers, and the static-graphics-state fallback below,
+where a DRAW may enqueue a private variant and `wait_graphics_state` may
+block.)
 
 ## Blocking vs non-blocking creation
 
