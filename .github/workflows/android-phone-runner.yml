@@ -1,0 +1,53 @@
+name: android-phone-runner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_gpu_tests:
+        description: "Also run the Vulkan API suite locally on the phone"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-phone-runner
+  cancel-in-progress: false
+
+jobs:
+  phone-native:
+    # This runner is Debian inside Termux/proot on the Android phone.
+    runs-on: [self-hosted, android-phone]
+    timeout-minutes: 60
+    env:
+      BUILD_DIR: build-phone
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Report phone runner toolchain
+        run: |
+          uname -a
+          cmake --version
+          ninja --version
+          clang --version
+      - name: Configure native ARM64 build
+        run: >
+          cmake -S . -B "$BUILD_DIR" -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DIZANAGI_WSI=HEADLESS
+          -DIZANAGI_BUILD_TESTS=ON
+          -DIZANAGI_BUILD_EXAMPLES=OFF
+          -DIZANAGI_BUILD_CAPABILITY_REPORT=OFF
+      - name: Build Izanagi and common tests
+        run: cmake --build "$BUILD_DIR" --parallel 2
+      - name: Run GPU-independent common tests
+        run: ./"$BUILD_DIR"/bin/izanagi_common_tests
+      - name: Run Vulkan API tests on phone (opt-in)
+        if: ${{ inputs.run_gpu_tests }}
+        run: ./"$BUILD_DIR"/bin/izanagi_tests
+      - name: Remove build outputs
+        if: ${{ always() }}
+        run: rm -rf "$BUILD_DIR"

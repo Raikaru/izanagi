@@ -42,6 +42,58 @@ cmake --build out/linux-native-debug
 ctest --test-dir out/linux-native-debug --output-on-failure
 ```
 
+## Android CI
+
+The normal CI workflow cross-compiles the library for `arm64-v8a` with the
+Android NDK (`android-26`), `IZANAGI_WSI=ANDROID`, and the bindless Vulkan
+profile. This is a compile check, not a support claim; Android physical-device
+conformance is still experimental.
+
+The manually triggered `android-wireless-device` workflow runs on a Linux
+self-hosted runner tagged `android-device`. The runner must have CMake 3.28 or
+newer, Ninja, Git, a JDK, and `adb` available, and must be able to reach the
+phone over the same LAN or VPN. On the phone, open **Developer options →
+Wireless debugging → Pair device with pairing code**, then provide all three
+values to the workflow:
+
+- `adb_pair_address`: the temporary pairing `IP address & Port`;
+- `adb_pairing_code`: the six-digit Wi-Fi pairing code;
+- `adb_device_address`: the debugging `IP address & Port` used by `adb connect`.
+The workflow always builds and runs the GPU-independent common tests on the
+device. The Vulkan API suite is opt-in (`run_gpu_tests`) and must only be used
+on a device whose Vulkan capabilities have been separately qualified.
+
+## Android phone as a GitHub runner
+
+The `android-phone-runner` workflow is for the phone itself acting as a
+GitHub Actions ARM64 runner. It runs inside a Debian userspace provided by
+Termux/proot and uses the labels `self-hosted`, `linux`, and `android-phone`.
+It is manually triggered so a personal phone never executes arbitrary pull
+request code automatically. This workflow does not use ADB pairing; its jobs
+already execute on the phone. The phone must remain awake, charging, online,
+and exempted from Samsung battery optimization for Termux.
+
+Register the runner with the ARM64 Linux runner package and a repository runner
+token generated in **Settings → Actions → Runners → New self-hosted runner**.
+
+When running the official ARM64 runner inside `proot`, set
+`DOTNET_GCHeapHardLimit=1C0000000` before `config.sh` and `run.sh`; otherwise
+CoreCLR may fail its default heap reservation with error `0x8007000E`.
+
+### Self-hosted runner security
+
+- Keep the phone workflow `workflow_dispatch`-only. Do not route
+  `pull_request` or unreviewed branch jobs to the phone.
+- Use the unique `android-phone` label and a repository-scoped runner group;
+  never use a generic self-hosted label by itself.
+- Do not place repository secrets, signing keys, personal SSH keys, or cloud
+  credentials on the phone. A job runs as the same unprivileged user that owns
+  the runner credentials.
+- Actions are pinned to immutable commit SHAs in the workflows. The phone job
+  removes its build directory after every run.
+- The runner process uses the unprivileged `runner` account inside Debian;
+  registration must never be performed as root.
+
 ## Consumer target
 
 `Izanagi::Izanagi` (and the existing `Izanagi::izanagi`) resolve to the selected backend implementation.

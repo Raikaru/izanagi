@@ -10,7 +10,7 @@ jobs:
     # targets VS 17 2022, so pin the image that still ships it.
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Configure
         run: cmake -S . -B build --preset dev-windows-msvc
       - name: Build
@@ -23,7 +23,7 @@ jobs:
   linux-common:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Configure (Clang Debug, headless)
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -39,7 +39,7 @@ jobs:
   linux-gcc-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Configure (GCC Release, headless)
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -54,7 +54,7 @@ jobs:
   macos-build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Configure (AppleClang, headless, no slangc needed)
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -66,7 +66,7 @@ jobs:
   windows-release:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Configure
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_CONFIGURATION_TYPES=Release
       - name: Build
@@ -75,3 +75,31 @@ jobs:
         env:
           IZANAGI_TESTS_ALLOW_SKIP: 1
         run: ctest --test-dir build -C Release --output-on-failure
+
+  android-arm64-cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+      - name: Install Android NDK r27c
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;27.2.12479018"
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?}}"
+          echo "ANDROID_NDK_HOME=$sdk_root/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Configure (Android arm64, bindless, no host tests)
+        shell: bash
+        run: >
+          cmake -S . -B build-android -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
+          -DIZANAGI_BACKEND=VULKAN_NATIVE -DIZANAGI_VK_PROFILE=BINDLESS
+          -DIZANAGI_WSI=ANDROID -DIZANAGI_BUILD_TESTS=OFF
+          -DIZANAGI_BUILD_EXAMPLES=OFF -DIZANAGI_BUILD_CAPABILITY_REPORT=OFF
+      - name: Build Android static library
+        run: cmake --build build-android --parallel
+      - name: Verify Android artifact
+        shell: bash
+        run: test -f build-android/lib/libizanagi.a

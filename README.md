@@ -158,10 +158,12 @@ include); consumers only need the include dir + the compiled lib.
 ## Platform status
 
 Windows (Vulkan Native, WIN32 WSI) is the certified baseline. Linux headless
-builds and the macOS build boundary are in place; Metal, Android, and iOS are
-in incremental phases. See [docs/PlatformSupport.md](docs/PlatformSupport.md)
-and [docs/Build.md](docs/Build.md) — a platform is never listed as supported
-merely because it compiles.
+builds and the macOS build boundary are in place. Android now has an arm64 NDK
+cross-build in CI plus an opt-in self-hosted wireless-ADB common-test path, but
+Android Vulkan conformance is still experimental. Metal and iOS remain in
+incremental phases. See [docs/PlatformSupport.md](docs/PlatformSupport.md) and
+[docs/Build.md](docs/Build.md) — a platform is never listed as supported merely
+because it compiles.
 
 ## Examples
 
