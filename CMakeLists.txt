@@ -260,7 +260,7 @@ if(IZANAGI_BUILD_TESTS)
     )
 
     add_executable(izanagi_tests tests/api_tests.cpp)
-    target_link_libraries(izanagi_tests PRIVATE izanagi volk_headers)
+    target_link_libraries(izanagi_tests PRIVATE izanagi volk_headers GPUOpen::VulkanMemoryAllocator)
     target_include_directories(izanagi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(izanagi_tests PRIVATE
         IZ_VK_PROFILE_${IZANAGI_VK_PROFILE}

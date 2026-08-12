@@ -481,6 +481,38 @@ struct QueueImpl {
     Vector<RetireBatch*> retire_queue;
 };
 
+// --- Logical graphics state (static-graphics-state fallback) -------------------------
+// Normalized command-buffer shadow of the public graphics state. Baked
+// members participate in the private static variant key; core-dynamic
+// members are applied directly on every path. Defaults mirror the public
+// API and the current backend behavior.
+struct LogicalGraphicsState {
+    FrontFace front_face = FrontFace::CCW;
+    Cull      cull       = Cull::None;
+
+    bool depth_test_enable      = false;
+    bool depth_write_enable     = false;
+    Op   depth_compare          = Op::Always;
+    bool depth_bounds_test_enable = false;
+
+    bool    stencil_test_enable = false;
+    Stencil stencil_front;
+    Stencil stencil_back;
+    uint8_t stencil_read_mask  = 0xff;
+    uint8_t stencil_write_mask = 0xff;
+
+    // Core-dynamic (never baked): depth bias values are applied directly.
+    // Viewport/scissor remain dynamic on the fallback path.
+    Rect2D viewport{0, 0, 0, 0};
+    Rect2D scissor{0, 0, 0, 0};
+
+    // dirty_static_state: a baked member changed since the last variant bind
+    // (a new private variant is required on the fallback path).
+    // dirty_core_dynamic_state: a core-dynamic member changed (re-apply).
+    bool dirty_static_state       = true;
+    bool dirty_core_dynamic_state = true;
+};
+
 // --- CommandBufferImpl ----------------------------------------------------------------
 struct CommandBufferImpl {
     DeviceImpl* device = nullptr;
@@ -498,6 +530,9 @@ struct CommandBufferImpl {
     // command buffer without submitting or advancing the timeline.
     bool        recording_failed = false;
     const char* fail_reason      = nullptr;
+
+    // Logical graphics-state shadow (reset at recording start).
+    LogicalGraphicsState graphics_state;
 
     // Pipelines bound by cmd_set_pipeline (Ready only); each holds one
     // reference. Textures explicitly named by commands (render attachments,
@@ -563,6 +598,8 @@ void       debug_force_legacy_copy(DeviceImpl* d, bool force);       // test hoo
 void       debug_force_static_state(DeviceImpl* d, bool force);      // test hook
 void       debug_derive_dispatch(DeviceImpl* d);                     // re-derive after force toggles
 void       capture_device_capabilities(DeviceImpl* d);                // version+ext+dispatch (device.cpp)
+void       reset_logical_graphics_state(CommandBufferImpl* cb);       // defaults + dirty flags
+const LogicalGraphicsState* debug_cb_graphics_state(CommandBufferImpl* cb);  // white-box
 int64_t    debug_stat(DeviceImpl* d, int which);                     // 0=copy2,1=legacy-copy,2=extdyn,3..7=static variants
 bool       debug_bindless_null_slot_written(DeviceImpl* d);   // slot-0 dummy present
 uint32_t   debug_legacy_stage_mask(StageFlags stage);        // legacy barrier stage bits

@@ -225,6 +225,7 @@ CommandBuffer queue_start_command_recording(Queue q) {
                     "queue_start_command_recording failed")) {
             return nullptr;
         }
+        reset_logical_graphics_state(buffer);
         // Bind descriptor heaps once at recording start
         cmd_bind_descriptor_heaps(d, buffer->buffer);
     }
@@ -776,6 +777,14 @@ void debug_force_legacy_barriers(DeviceImpl* d, bool force) {
     d->force_legacy_barriers = force ? 1 : 0;
 }
 
+void reset_logical_graphics_state(CommandBufferImpl* cb) {
+    cb->graphics_state = LogicalGraphicsState{};
+}
+
+const LogicalGraphicsState* debug_cb_graphics_state(CommandBufferImpl* cb) {
+    return &cb->graphics_state;
+}
+
 uint32_t debug_legacy_stage_mask(StageFlags stage) {
     return static_cast<uint32_t>(bridge_pipeline_stage_legacy(stage));
 }
@@ -803,36 +812,46 @@ int64_t debug_pool_resets(DeviceImpl* d) {
     }
 
 static void backend_set_front_face(DeviceImpl* d, VkCommandBuffer cmd, VkFrontFace face) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetFrontFace(cmd, face); } else { vkCmdSetFrontFaceEXT(cmd, face); }
 }
 static void backend_set_cull_mode(DeviceImpl* d, VkCommandBuffer cmd, VkCullModeFlags mode) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetCullMode(cmd, mode); } else { vkCmdSetCullModeEXT(cmd, mode); }
 }
 static void backend_set_depth_write_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetDepthWriteEnable(cmd, b); } else { vkCmdSetDepthWriteEnableEXT(cmd, b); }
 }
 static void backend_set_depth_test_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetDepthTestEnable(cmd, b); } else { vkCmdSetDepthTestEnableEXT(cmd, b); }
 }
 static void backend_set_depth_compare_op(DeviceImpl* d, VkCommandBuffer cmd, VkCompareOp op) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetDepthCompareOp(cmd, op); } else { vkCmdSetDepthCompareOpEXT(cmd, op); }
 }
 static void backend_set_depth_bounds_test_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetDepthBoundsTestEnable(cmd, b); } else { vkCmdSetDepthBoundsTestEnableEXT(cmd, b); }
 }
 static void backend_set_stencil_test_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetStencilTestEnable(cmd, b); } else { vkCmdSetStencilTestEnableEXT(cmd, b); }
 }
 static void backend_set_stencil_op(DeviceImpl* d, VkCommandBuffer cmd, VkStencilFaceFlags face,
                                    VkStencilOp fail, VkStencilOp pass, VkStencilOp depth_fail,
                                    VkCompareOp compare) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetStencilOp(cmd, face, fail, pass, depth_fail, compare); }
     else { vkCmdSetStencilOpEXT(cmd, face, fail, pass, depth_fail, compare); }
 }
 static void backend_set_viewport_with_count(DeviceImpl* d, VkCommandBuffer cmd, uint32_t n, const VkViewport* v) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetViewportWithCount(cmd, n, v); } else { vkCmdSetViewportWithCountEXT(cmd, n, v); }
 }
 static void backend_set_scissor_with_count(DeviceImpl* d, VkCommandBuffer cmd, uint32_t n, const VkRect2D* r) {
+    atomic_fetch_add(&d->stat_ext_dyn_state_calls, 1);
     if (route_is_core13(d)) { vkCmdSetScissorWithCount(cmd, n, r); } else { vkCmdSetScissorWithCountEXT(cmd, n, r); }
 }
 
@@ -1240,27 +1259,49 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     auto* d = cmd->device;
     auto& desc = d->depth_stencil_pool[state].desc;
 
+    // Update the logical shadow (baked members -> variant key on the static
+    // fallback; core-dynamic members are applied on every path).
+    LogicalGraphicsState& gs = cmd->graphics_state;
+    gs.depth_test_enable      = bool(desc.depth_mode & DepthFlags::Read);
+    gs.depth_write_enable     = bool(desc.depth_mode & DepthFlags::Write);
+    gs.depth_compare          = desc.depth_test;
+    gs.stencil_test_enable    = true;   // matches the current backend behavior
+    gs.stencil_front          = desc.stencil_front;
+    gs.stencil_back           = desc.stencil_back;
+    gs.stencil_read_mask      = desc.stencil_read_mask;
+    gs.stencil_write_mask     = desc.stencil_write_mask;
+    gs.dirty_static_state     = true;
+
+    // Core-dynamic (applied on every path): depth bias, stencil references,
+    // stencil write/compare masks.
+    vkCmdSetDepthBias(cmd->buffer, desc.depth_bias, desc.depth_bias_clamp,
+                      desc.depth_bias_slope_factor);
+    vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT, desc.stencil_front.reference);
+    vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_BACK_BIT, desc.stencil_back.reference);
+    vkCmdSetStencilWriteMask(cmd->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, desc.stencil_write_mask);
+    vkCmdSetStencilCompareMask(cmd->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, desc.stencil_read_mask);
+
+    if (d->dispatch.use_static_graphics_state) {
+        // Baked members: shadow only (the variant carries them). The
+        // extended-dynamic-state commands are not available.
+        return;
+    }
     backend_set_depth_write_enable(d, cmd->buffer, bool(desc.depth_mode & DepthFlags::Write));
     backend_set_depth_test_enable(d, cmd->buffer, bool(desc.depth_mode & DepthFlags::Read));
     backend_set_depth_compare_op(d, cmd->buffer, bridge(desc.depth_test));
-    vkCmdSetDepthBias(cmd->buffer, desc.depth_bias, desc.depth_bias_clamp,
-                      desc.depth_bias_slope_factor);
-
     backend_set_stencil_test_enable(d, cmd->buffer, true);
     backend_set_stencil_op(d, cmd->buffer, VK_STENCIL_FACE_FRONT_BIT,
                       bridge(desc.stencil_front.fail_op), bridge(desc.stencil_front.pass_op),
                       bridge(desc.stencil_front.depth_fail_op), bridge(desc.stencil_front.test));
-    vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT, desc.stencil_front.reference);
     backend_set_stencil_op(d, cmd->buffer, VK_STENCIL_FACE_BACK_BIT,
                       bridge(desc.stencil_back.fail_op), bridge(desc.stencil_back.pass_op),
                       bridge(desc.stencil_back.depth_fail_op), bridge(desc.stencil_back.test));
-    vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_BACK_BIT, desc.stencil_back.reference);
-    vkCmdSetStencilWriteMask(cmd->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, desc.stencil_write_mask);
-    vkCmdSetStencilCompareMask(cmd->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, desc.stencil_read_mask);
 }
 
 void cmd_set_viewport(CommandBuffer cmd, const Rect2D& rect) {
     auto* d = cmd->device;
+    cmd->graphics_state.viewport = rect;
+    cmd->graphics_state.dirty_core_dynamic_state = true;
     VkViewport viewport{
         .x        = static_cast<float>(rect.offset_x),
         .y        = static_cast<float>(rect.offset_y + rect.height),
@@ -1269,20 +1310,35 @@ void cmd_set_viewport(CommandBuffer cmd, const Rect2D& rect) {
         .minDepth = 0,
         .maxDepth = 1.0,
     };
+    if (d->dispatch.use_static_graphics_state) {
+        // Core-1.0 dynamic viewport (the WithCount variant requires the
+        // extended-dynamic-state extension).
+        vkCmdSetViewport(cmd->buffer, 0, 1, &viewport);
+        return;
+    }
     backend_set_viewport_with_count(d, cmd->buffer, 1, &viewport);
 }
 
 void cmd_set_scissor_rect(CommandBuffer cmd, const Rect2D& rect) {
     auto* d = cmd->device;
+    cmd->graphics_state.scissor = rect;
+    cmd->graphics_state.dirty_core_dynamic_state = true;
     const VkRect2D vk_rect{
         .offset = {.x = (int32_t)rect.offset_x, .y = (int32_t)rect.offset_y},
         .extent = {.width = rect.width, .height = rect.height},
     };
+    if (d->dispatch.use_static_graphics_state) {
+        vkCmdSetScissor(cmd->buffer, 0, 1, &vk_rect);
+        return;
+    }
     backend_set_scissor_with_count(d, cmd->buffer, 1, &vk_rect);
 }
 
 void cmd_set_front_face(CommandBuffer cmd, FrontFace front) {
     auto* d = cmd->device;
+    cmd->graphics_state.front_face = front;
+    cmd->graphics_state.dirty_static_state = true;
+    if (d->dispatch.use_static_graphics_state) { return; }
     backend_set_front_face(d, cmd->buffer,
                            front == FrontFace::CCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                    : VK_FRONT_FACE_CLOCKWISE);
@@ -1290,6 +1346,9 @@ void cmd_set_front_face(CommandBuffer cmd, FrontFace front) {
 
 void cmd_set_cull_mode(CommandBuffer cmd, Cull cull) {
     auto* d = cmd->device;
+    cmd->graphics_state.cull = cull;
+    cmd->graphics_state.dirty_static_state = true;
+    if (d->dispatch.use_static_graphics_state) { return; }
     backend_set_cull_mode(d, cmd->buffer, bridge(cull));
 }
 

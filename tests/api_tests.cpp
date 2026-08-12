@@ -19,46 +19,18 @@
 #include "izanagi/gpu.h"
 #include "common/profile_report.h"
 // Named Vulkan constants for the legacy stage-mask checks (volk_headers
-// provides the include dir; the test links the library but not volk itself).
+// provides the include dir). VK_NO_PROTOTYPES must precede vulkan.h for
+// volk (pulled via the internal header below).
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 using namespace gpu;
 
-// White-box test hooks for the pipeline tests (declared here to avoid
-// pulling the backend's internal header into the test TU; implemented in
-// pipeline.cpp / platform_utils.cpp).
-namespace gpu {
-struct DeviceImpl;
-struct CommandBufferImpl;
-uint32_t  debug_live_pipelines(DeviceImpl*);         // records in the dedup map
-uintptr_t debug_last_compile_thread(DeviceImpl*);    // thread that last compiled natively
-void      debug_set_compiler_paused(DeviceImpl*, bool);
-void      debug_force_submit_failure(DeviceImpl*, bool);
-uint64_t  debug_queue_timeline(DeviceImpl*);         // last successfully submitted value
-int64_t   debug_pool_resets(DeviceImpl*);            // command-pool reuse resets
-// Fills a plain feature/limit snapshot from the physical device (profile.cpp).
-VulkanProfileFeatures query_vulkan_profile_features(DeviceImpl*);
-// True when the validation layer is actually attached (layer must be
-// installed; otherwise a validation test would be vacuous).
-bool debug_validation_active(DeviceImpl*);
-// Test hook: force the legacy (non-synchronization2) barrier path.
-void debug_force_legacy_barriers(DeviceImpl*, bool force);
-// True when the bindless reserved null slot (0) is backed by a dummy resource.
-bool debug_bindless_null_slot_written(DeviceImpl*);
-// Legacy barrier stage bits for the public StageFlags (test-only exposure).
-uint32_t debug_legacy_stage_mask(StageFlags stage);
-// Backend copy wrappers + conversions (commands.cpp) — GPU-independent tests.
-void backend_copy_buffer(CommandBufferImpl*, const VkCopyBufferInfo2&);
-void backend_copy_buffer_to_image(CommandBufferImpl*, const VkCopyBufferToImageInfo2&);
-void backend_copy_image_to_buffer(CommandBufferImpl*, const VkCopyImageToBufferInfo2&);
-void backend_blit_image(CommandBufferImpl*, const VkBlitImageInfo2&);
-void convert_buffer_copy_regions(const VkBufferCopy2* src, uint32_t count, VkBufferCopy* dst);
-void convert_buffer_image_copy_regions(const VkBufferImageCopy2* src, uint32_t count, VkBufferImageCopy* dst);
-void convert_image_blit_regions(const VkImageBlit2* src, uint32_t count, VkImageBlit* dst);
-void debug_force_legacy_copy(DeviceImpl*, bool force);
-int64_t debug_stat(DeviceImpl*, int which);
-uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
-}
+// White-box test hooks: the backend's internal header (the test TU links the
+// library; including internal.h gives the hooks + internal types like
+// LogicalGraphicsState for the white-box tests).
+#include "vk/internal.h"
+
 
 static int g_failures = 0;
 
@@ -77,8 +49,9 @@ static void test_log_callback(LogLevel lvl, Span<const char> msg, uint32_t line,
            (int)msg.size(), msg.data(), (int)file.size(), file.data(), line);
 }
 
-// Simple bump arena for test use
-struct Arena {
+// Simple bump arena for test use (named TestArena to avoid the gpu::Arena
+// from the internal header, which the white-box hooks now pull in).
+struct TestArena {
     uint8_t* base;
     size_t   offset;
     size_t   capacity;
@@ -92,7 +65,7 @@ struct Arena {
 };
 
 // Load a SPIR-V file into memory
-static Span<const uint8_t> load_spirv(const char* path, Arena* arena) {
+static Span<const uint8_t> load_spirv(const char* path, TestArena* arena) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) { return {}; }
     auto size = file.tellg();
@@ -236,7 +209,7 @@ static void test_compute() {
     CHECK(d != nullptr, "create_device returned null");
 
     // Load compute shader
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
@@ -551,7 +524,7 @@ static void test_dispatch_indirect() {
     Device d = create_device(desc);
     CHECK(d != nullptr, "create_device returned null");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
@@ -636,7 +609,7 @@ static void test_spec_constants() {
     Device d = create_device(desc);
     CHECK(d != nullptr, "create_device returned null");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("spec_mul_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load spec_mul_kernel.spv");
@@ -739,7 +712,7 @@ static void test_draw_indirect() {
         return;
     }
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("offscreen_triangle.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
@@ -1069,7 +1042,7 @@ static void test_msaa_resolve() {
         return;
     }
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("offscreen_triangle.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
@@ -1230,7 +1203,7 @@ static void test_dual_source_blend() {
         return;
     }
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("dual_src.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load dual_src.spv");
@@ -1335,7 +1308,7 @@ static void test_pipeline_dedup() {
     Device d = create_device(desc);
     CHECK(d != nullptr, "create_device returned null");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("offscreen_triangle.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
@@ -1509,7 +1482,7 @@ static void test_pipeline_cache_persistence() {
     CHECK(cache_a.load_called, "load callback must fire during create_device");
 
     {
-        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
         std::string comp_path = find_shader_path("memcpy_kernel.spv");
         auto comp_spirv = load_spirv(comp_path.c_str(), &arena);
         std::string gfx_path = find_shader_path("offscreen_triangle.spv");
@@ -1558,7 +1531,7 @@ static void test_pipeline_cache_persistence() {
     CHECK(cache_b.identity.vendor_id == cache_a.identity.vendor_id,
           "cache identity must be stable across devices");
     if (b != nullptr) {
-        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
         std::string comp_path = find_shader_path("memcpy_kernel.spv");
         auto comp_spirv = load_spirv(comp_path.c_str(), &arena);
         if (comp_spirv.size() > 0) {
@@ -1603,7 +1576,7 @@ static void test_async_pipeline_compile() {
     auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
     const uintptr_t main_tid = gpu::current_thread_id();
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
@@ -1697,7 +1670,7 @@ static void test_async_pipeline_pending_and_failed() {
     // Deterministic Pending: park the compiler worker before requesting.
     gpu::debug_set_compiler_paused(impl, true);
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("offscreen_triangle.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
@@ -1779,7 +1752,7 @@ static void test_async_input_ownership() {
 
     // Load the shader into temporary storage, then copy it to stack buffers
     // that we will destroy immediately after requesting.
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("spec_mul_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0 && spirv.size() <= 8192, "Failed to load spec_mul_kernel.spv");
@@ -1870,7 +1843,7 @@ static void test_async_dedup_concurrent() {
     CHECK(d != nullptr, "create_device returned null");
     auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "Failed to load memcpy_kernel.spv");
@@ -1924,7 +1897,7 @@ static void test_async_shutdown_with_pending() {
         auto* impl = reinterpret_cast<gpu::DeviceImpl*>(d);
         gpu::debug_set_compiler_paused(impl, true);
 
-        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
         std::string shader_path = find_shader_path("memcpy_kernel.spv");
         auto spirv = load_spirv(shader_path.c_str(), &arena);
         if (spirv.size() > 0) {
@@ -1946,7 +1919,7 @@ static void test_async_shutdown_with_pending() {
         };
         Device d = create_device(desc);
         CHECK(d != nullptr, "create_device failed");
-        Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+        TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
         std::string shader_path = find_shader_path("memcpy_kernel.spv");
         auto spirv = load_spirv(shader_path.c_str(), &arena);
         if (spirv.size() > 0) {
@@ -2107,7 +2080,7 @@ static void test_free_after() {
     CHECK(rb[0] == 0x42, "copy result intact after retirement");
 
     // Pipeline: bound in a submission, then retired against it.
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "shader load failed");
@@ -2156,7 +2129,7 @@ static void test_texture_cb_retention() {
         return;
     }
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("offscreen_triangle.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "shader load failed");
@@ -2567,7 +2540,7 @@ static void test_typed_pointers() {
     Device d = create_device(desc);
     CHECK(d != nullptr, "create_device returned null");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("ptr_types.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "failed to load ptr_types.spv");
@@ -2669,7 +2642,7 @@ static void test_abi_gpu() {
     Device d = create_device(desc);
     CHECK(d != nullptr, "create_device returned null");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("abi_test.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "failed to load abi_test.spv");
@@ -2820,7 +2793,7 @@ static void test_validation_smoke() {
     SamplerId sampler = create_sampler(d, {});
     CHECK(sampled != 0 && storage != 0 && sampler != 0, "view/sampler creation failed");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "memcpy_kernel.spv load failed");
@@ -2888,7 +2861,7 @@ static void test_legacy_barrier_forced() {
     CHECK(debug_legacy_stage_mask(StageFlags::None) == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
           "None maps to ALL_COMMANDS");
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("memcpy_kernel.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "memcpy_kernel.spv load failed");
@@ -2950,7 +2923,7 @@ static void test_bindless_null_handle() {
 
 #if defined(IZ_VK_PROFILE_BINDLESS)
     CHECK(debug_bindless_null_slot_written(d), "dummy resource occupies the null slot");
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("null_sample.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "null_sample.spv load failed");
@@ -3106,6 +3079,90 @@ static void test_forced_legacy_copy() {
     destroy_device(d);
 }
 
+// --- Test 38: logical graphics-state shadow -----------------------------------------
+// The normalized state shadow: defaults, baked vs core-dynamic
+// classification, setter sequences (last write wins), and the static-path
+// behavior (baked setters issue no extended-dynamic-state commands).
+static void test_logical_graphics_state() {
+    printf("--- Test: logical graphics state shadow ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    if (d == nullptr) { return; }
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "recording failed");
+
+    // Defaults.
+    const LogicalGraphicsState* gs = debug_cb_graphics_state(cmd);
+    CHECK(gs->front_face == FrontFace::CCW && gs->cull == Cull::None,
+          "default front face + cull");
+    CHECK(!gs->depth_test_enable && !gs->depth_write_enable &&
+              gs->depth_compare == Op::Always, "default depth state");
+    CHECK(!gs->stencil_test_enable, "default stencil disabled");
+    CHECK(gs->stencil_read_mask == 0xff && gs->stencil_write_mask == 0xff,
+          "default stencil masks");
+    CHECK(gs->dirty_static_state && gs->dirty_core_dynamic_state,
+          "fresh shadow is dirty");
+
+    // Baked setters update the shadow (last write wins).
+    cmd_set_front_face(cmd, FrontFace::CW);
+    cmd_set_cull_mode(cmd, Cull::Back);
+    CHECK(gs->front_face == FrontFace::CW && gs->cull == Cull::Back,
+          "front face + cull shadowed");
+    cmd_set_front_face(cmd, FrontFace::CCW);
+    CHECK(gs->front_face == FrontFace::CCW, "last write wins");
+
+    // Core-dynamic viewport/scissor shadowed.
+    cmd_set_viewport(cmd, Rect2D{.offset_x = 4, .offset_y = 8, .width = 320, .height = 240});
+    cmd_set_scissor_rect(cmd, Rect2D{.offset_x = 1, .offset_y = 2, .width = 100, .height = 60});
+    CHECK(gs->viewport.width == 320 && gs->viewport.height == 240,
+          "viewport shadowed");
+    CHECK(gs->scissor.offset_x == 1 && gs->scissor.height == 60,
+          "scissor shadowed");
+
+    // Depth/stencil state shadows the baked fields.
+    DepthStencilDesc ds_desc{
+        .depth_mode = DepthFlags::Read | DepthFlags::Write,
+        .depth_test = Op::Less,
+        .stencil_read_mask = 0x0f,
+        .stencil_write_mask = 0xf0,
+    };
+    ds_desc.stencil_front = Stencil{.test = Op::Equal, .pass_op = StencilOp::Replace, .reference = 3};
+    Handle<DepthStencilState> ds = create_depth_stencil_state(d, ds_desc);
+    cmd_set_depth_stencil_state(cmd, ds);
+    CHECK(gs->depth_test_enable && gs->depth_write_enable &&
+              gs->depth_compare == Op::Less, "depth shadowed");
+    CHECK(gs->stencil_test_enable, "stencil enabled (backend behavior)");
+    CHECK(gs->stencil_front.test == Op::Equal &&
+              gs->stencil_front.pass_op == StencilOp::Replace &&
+              gs->stencil_front.reference == 3, "front stencil shadowed");
+    CHECK(gs->stencil_read_mask == 0x0f && gs->stencil_write_mask == 0xf0,
+          "stencil masks shadowed");
+    free_depth_stencil_state(d, ds);
+
+    // Static path: baked setters issue NO extended-dynamic-state commands
+    // (counter stays at the value it had before the setters), while the
+    // shadow still updates.
+    debug_force_static_state(d, true);
+    CommandBuffer cmd2 = queue_start_command_recording(q);
+    const int64_t before = debug_stat(d, 2);
+    cmd_set_front_face(cmd2, FrontFace::CW);
+    cmd_set_cull_mode(cmd2, Cull::Front);
+    cmd_set_viewport(cmd2, Rect2D{.offset_x = 0, .offset_y = 0, .width = 64, .height = 64});
+    const int64_t after = debug_stat(d, 2);
+    const LogicalGraphicsState* gs2 = debug_cb_graphics_state(cmd2);
+    CHECK(gs2->front_face == FrontFace::CW && gs2->cull == Cull::Front,
+          "static path still shadows");
+    CHECK(before == after, "static path issues no extended-dynamic-state commands");
+
+    destroy_device(d);
+}
+
 // --- Test 32: capability-gated 8/16-bit storage ABI -------------------------------
 // The mandatory ABI test avoids 8/16-bit storage (optional device
 // capabilities). Reading 8/16-bit members through a physical-storage-buffer
@@ -3129,7 +3186,7 @@ static void test_abi_int8_16() {
         return;
     }
 
-    Arena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
     std::string shader_path = find_shader_path("abi_int8_16.spv");
     auto spirv = load_spirv(shader_path.c_str(), &arena);
     CHECK(spirv.size() > 0, "failed to load abi_int8_16.spv");
@@ -3240,6 +3297,7 @@ int main() {
     test_bindless_null_handle();
     test_copy_conversions();
     test_forced_legacy_copy();
+    test_logical_graphics_state();
 
     printf("\n=================\n");
     if (g_failures == 0) {
