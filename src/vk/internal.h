@@ -4,6 +4,10 @@
 
 #include <atomic>
 
+// VulkanDispatchCapabilities + derive_dispatch_capabilities + the bindless
+// enabled-extension builder (pure, injectable for the mock capability
+// matrix). Included OUTSIDE namespace gpu — the header opens its own.
+#include "common/dispatch_capabilities.h"
 #include "common/containers.h"
 #include "common/platform_utils.h"
 #include "common/profile_report.h"
@@ -314,41 +318,6 @@ struct StaticVariantRecord {
     StaticVariantRecord* next_variant = nullptr;   // intrusive list on the base
 };
 
-// --- Vulkan 1.2 dispatch capabilities ------------------------------------------------
-// Which promoted-extension families a device provides and which private
-// fallbacks must be selected. Derived by the pure function below from the
-// effective API version + exported extension names + force-test overrides —
-// never from vendor IDs. effective_api_version is min(loader instance,
-// application-requested, physical-device).
-struct VulkanDispatchCapabilities {
-    uint32_t effective_api_version = 0;
-
-    bool dynamic_rendering        = false;
-    bool synchronization2         = false;
-    bool copy_commands2           = false;
-    bool extended_dynamic_state   = false;
-
-    bool dynamic_rendering_is_core      = false;
-    bool synchronization2_is_core       = false;
-    bool copy_commands2_is_core         = false;
-    bool extended_dynamic_state_is_core = false;
-
-    bool use_legacy_copy_commands   = false;   // no copy_commands2 (or forced)
-    bool use_static_graphics_state  = false;   // no extended_dynamic_state (or forced)
-};
-
-// Pure: injectable for unit tests (the mock capability matrix). is_core is
-// derived from effective_api_version >= 1.3. A family is "available" when
-// core OR its extension is exported. The fallback flags win over availability
-// when a force-test override is set.
-VulkanDispatchCapabilities derive_dispatch_capabilities(uint32_t effective_api_version,
-                                                        bool has_dynamic_rendering_ext,
-                                                        bool has_sync2_ext,
-                                                        bool has_copy2_ext,
-                                                        bool has_extended_dynamic_state_ext,
-                                                        bool force_legacy_copy,
-                                                        bool force_static_state);
-
 // --- DeviceImpl ----------------------------------------------------------------------
 // Cast between Handle<A> and Handle<B> when A and B are different tags
 // for the same underlying slot. Safe: the uint64_t encoding is identical.
@@ -381,6 +350,10 @@ struct DeviceImpl {
     int64_t                   force_legacy_barriers = 0;
     uint32_t                  device_api_version = VK_API_VERSION_1_4;
     uint32_t                  instance_api_version = VK_API_VERSION_1_4;
+    // The loader-clamped instance apiVersion requested at vkCreateInstance —
+    // the single source of truth for the effective-version derivation (the
+    // device can never be newer than what the instance requested).
+    uint32_t                  instance_api_requested = 0;
 
     // Capability-driven dispatch (bindless 1.2 route).
     VulkanDispatchCapabilities dispatch;

@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "common/dispatch_capabilities.h"
+
 namespace gpu {
 
 // --- Required device extensions ---------------------------------------------------
@@ -168,6 +170,20 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
     VkResult result = volkInitialize();
     if (result != VK_SUCCESS) { return result; }
 
+    // Loader-clamped instance version request: never exceed what the loader
+    // supports (vkEnumerateInstanceVersion), capped by the profile ceiling
+    // (Native 1.4, Bindless 1.3 — the lowest version with the core-1.3
+    // dispatch route). Stored on the device so the effective-version
+    // derivation uses the SAME request.
+    uint32_t loader_version = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion != nullptr) { vkEnumerateInstanceVersion(&loader_version); }
+    uint32_t requested_api = VK_API_VERSION_1_4;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    requested_api = VK_API_VERSION_1_3;
+#endif
+    if (requested_api > loader_version) { requested_api = loader_version; }
+    d->instance_api_requested = requested_api;
+
     VkApplicationInfo app_info{
         .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext              = nullptr,
@@ -175,14 +191,7 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
         .applicationVersion = 0,
         .pEngineName        = "izanagi",
         .engineVersion      = 0,
-#if defined(IZ_VK_PROFILE_BINDLESS)
-        // Bindless: Vulkan 1.2 instance; dynamic rendering + synchronization2
-        // are enabled as KHR extensions on 1.2 devices (or left as 1.3 cores
-        // when available — the promoted entry points resolve identically).
-        .apiVersion         = VK_API_VERSION_1_2,
-#else
-        .apiVersion         = VK_API_VERSION_1_4,
-#endif
+        .apiVersion         = requested_api,
     };
 
     // WSI extensions are enabled only when a surface-capable WSI is selected;
@@ -295,7 +304,15 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         vkEnumerateDeviceExtensionProperties(devices[i], nullptr, &ext_count, exts.data());
 
         bool all_supported = true;
-        const size_t required_count = required_extension_count(props.apiVersion);
+        // Validate against the CANDIDATE effective version (device version
+        // clamped by the loader's instance request): a 1.3 device under a
+        // 1.2-clamped instance must still pass the 1.2-route requirements
+        // (KHR dynamic-rendering/sync2), because that is the route the
+        // builder will enable.
+        const uint32_t candidate_effective =
+            props.apiVersion < d->instance_api_requested ? props.apiVersion
+                                                         : d->instance_api_requested;
+        const size_t required_count = required_extension_count(candidate_effective);
         for (size_t req = 0; req < required_count; ++req) {
             bool found = false;
             for (uint32_t e = 0; e < ext_count; ++e) {
@@ -353,10 +370,7 @@ void capture_device_capabilities(DeviceImpl* d) {
     vkGetPhysicalDeviceProperties(d->physical_device, &props);
     d->device_api_version = props.apiVersion;
 
-    uint32_t requested = VK_API_VERSION_1_4;
-#if defined(IZ_VK_PROFILE_BINDLESS)
-    requested = VK_API_VERSION_1_2;
-#endif
+    uint32_t requested = d->instance_api_requested;   // loader-clamped, from vkCreateInstance
     uint32_t effective = props.apiVersion;
     if (loader_version < effective) { effective = loader_version; }
     if (requested < effective) { effective = requested; }
@@ -587,6 +601,20 @@ static VkResult create_logical_device(DeviceImpl* d) {
     unified_layouts_features.unifiedImageLayouts  = VK_TRUE;
 #endif
 
+    // Enabled device-extension list, route-aware: the bindless list is built
+    // from the effective route (1.2 -> the promoted KHR names + selected
+    // optionals; 1.3+ -> swapchain only — every other family is core). The
+    // required-prefix array remains for candidate validation only.
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    const char* enabled_exts[8];
+    const bool  has_wsi = IZ_REQUIRE_SWAPCHAIN > 0;
+    const uint32_t enabled_count = build_bindless_enabled_extensions(
+        has_wsi, d->dispatch.effective_api_version, d->has_copy2_ext, d->has_extdyn_ext,
+        enabled_exts, 8);
+#else
+    const char* const* enabled_exts = kRequiredDeviceExtensions;
+    const uint32_t enabled_count = static_cast<uint32_t>(enabled_extension_count(d));
+#endif
     const VkDeviceCreateInfo create_info{
         .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext                   = &device_features,
@@ -595,8 +623,8 @@ static VkResult create_logical_device(DeviceImpl* d) {
         .pQueueCreateInfos       = &queue_create_info,
         .enabledLayerCount       = 0,
         .ppEnabledLayerNames     = nullptr,
-        .enabledExtensionCount   = static_cast<uint32_t>(enabled_extension_count(d)),
-        .ppEnabledExtensionNames = kRequiredDeviceExtensions,
+        .enabledExtensionCount   = enabled_count,
+        .ppEnabledExtensionNames = enabled_exts,
         .pEnabledFeatures        = nullptr, // Using pNext chain instead
     };
 

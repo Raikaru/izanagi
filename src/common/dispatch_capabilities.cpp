@@ -36,4 +36,36 @@ VulkanDispatchCapabilities derive_dispatch_capabilities(uint32_t effective_api_v
     return c;
 }
 
+
+// --- Bindless enabled-extension list ------------------------------------------------
+
+uint32_t build_bindless_enabled_extensions(bool has_wsi, uint32_t effective_api_version,
+                                           bool has_copy2_ext, bool has_extdyn_ext,
+                                           const char** out, uint32_t capacity) {
+    uint32_t n = 0;
+    // n counts EVERY entry, even when `out` is full — a returned n > capacity
+    // tells the caller the storage was undersized (no silent truncation).
+    if (has_wsi) {
+        if (n < capacity) { out[n] = "VK_KHR_swapchain"; }
+        ++n;
+    }
+    const bool core13 = effective_api_version >= kApiVersion13;
+    if (!core13) {
+        if (n < capacity) { out[n] = "VK_KHR_dynamic_rendering"; }
+        ++n;
+        if (n < capacity) { out[n] = "VK_KHR_synchronization2"; }
+        ++n;
+        if (has_copy2_ext) {
+            if (n < capacity) { out[n] = "VK_KHR_copy_commands2"; }
+            ++n;
+        }
+    }
+    // On 1.3+ EVERY promoted/EXT family is core — nothing else is enabled.
+    if (!core13 && has_extdyn_ext) {
+        if (n < capacity) { out[n] = "VK_EXT_extended_dynamic_state"; }
+        ++n;
+    }
+    return n;
+}
+
 }  // namespace gpu

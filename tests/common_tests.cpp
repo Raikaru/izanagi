@@ -751,6 +751,53 @@ static void test_dispatch_capabilities() {
         CHECK(c.dynamic_rendering_is_core, "1.3 families are core");
         CHECK(!c.use_legacy_copy_commands && !c.use_static_graphics_state, "no fallbacks on 1.3");
     }
+
+    // --- Bindless enabled-extension list (route-aware) --------------------------
+    // Explicit 1.2/1.3 boundary cases: the version word comparison must treat
+    // exactly >= 1.3 as core (a wrong word would misclassify 1.2).
+    {
+        auto expect = [](uint32_t version, bool copy2, bool eds, bool wsi,
+                         std::initializer_list<const char*> want) {
+            const char* out[8] = {};
+            const uint32_t n = gpu::build_bindless_enabled_extensions(wsi, version, copy2, eds,
+                                                                      out, 8);
+            bool ok = n == want.size();
+            uint32_t i = 0;
+            for (const char* w : want) {
+                if (i >= 8 || out[i] == nullptr || strcmp(out[i], w) != 0) { ok = false; }
+                ++i;
+            }
+            return ok;
+        };
+        CHECK(expect(v12, false, false, true, {"VK_KHR_swapchain", "VK_KHR_dynamic_rendering",
+                                               "VK_KHR_synchronization2"}),
+              "1.2: swapchain + the two required promoted KHR names");
+        CHECK(expect(v12, true, false, true, {"VK_KHR_swapchain", "VK_KHR_dynamic_rendering",
+                                              "VK_KHR_synchronization2", "VK_KHR_copy_commands2"}),
+              "1.2 + copy2: copy-commands2 included");
+        CHECK(expect(v12, true, true, true, {"VK_KHR_swapchain", "VK_KHR_dynamic_rendering",
+                                             "VK_KHR_synchronization2", "VK_KHR_copy_commands2",
+                                             "VK_EXT_extended_dynamic_state"}),
+              "1.2 + copy2 + EDS: both optionals included");
+        CHECK(expect(v13, true, true, true, {"VK_KHR_swapchain"}),
+              "1.3: swapchain only — even with copy2 + EDS advertised, NO promoted/EXT name");
+        CHECK(expect(v13, true, true, false, {}),
+              "1.3 headless: no extensions at all");
+        CHECK(expect(v12, true, true, false, {"VK_KHR_dynamic_rendering",
+                                              "VK_KHR_synchronization2",
+                                              "VK_KHR_copy_commands2",
+                                              "VK_EXT_extended_dynamic_state"}),
+              "1.2 headless: promoted + optional names only");
+        // Capacity contract: the count still reflects every entry on truncation.
+        {
+            const char* out[2] = {};
+            const uint32_t n = gpu::build_bindless_enabled_extensions(
+                true, v12, true, true, out, 2);
+            CHECK(n == 5 && strcmp(out[0], "VK_KHR_swapchain") == 0 &&
+                      strcmp(out[1], "VK_KHR_dynamic_rendering") == 0,
+                  "truncated builder reports the full count");
+        }
+    }
 }
 
 // --- Extracted shader-layout manifest (ABI §11.1) ------------------------------
