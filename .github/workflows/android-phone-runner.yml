@@ -41,6 +41,8 @@ jobs:
           -DIZANAGI_BUILD_TESTS=ON
           -DIZANAGI_BUILD_EXAMPLES=OFF
           -DIZANAGI_BUILD_CAPABILITY_REPORT=OFF
+      - name: Build Izanagi and common tests
+        run: cmake --build "$BUILD_DIR" --parallel 2
       - name: Run GPU-independent common tests
         run: ./bin/izanagi_common_tests
         working-directory: ${{ env.BUILD_DIR }}
