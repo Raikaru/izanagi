@@ -3639,8 +3639,15 @@ static void test_baked_state_readback() {
     };
     // Stencil-only target: depth and stencil may not be two distinct images
     // under Vulkan dynamic rendering, and the stencil checks disable depth.
+    // dzn/D3D12 has a single depth-stencil view format: the pipeline and the
+    // attachment must use ONE combined format for both aspects (separate
+    // depth + stencil formats are rejected, and standalone S8_UINT images
+    // fail to create). The stencil pipeline therefore uses
+    // Depth24PlusStencil8 for depth AND stencil, backed by one texture used
+    // as both attachments.
     RasterDesc raster_stencil{
-        .stencil_format = Format::Stencil8,
+        .depth_format   = Format::Depth24PlusStencil8,
+        .stencil_format = Format::Depth24PlusStencil8,
         .color_targets  = Span<const ColorTarget>(&color_target, 1),
     };
     Handle<Pipeline> p_plain = create_graphics_pipeline(d, vs_src, fs_src, raster_plain);
@@ -3692,11 +3699,23 @@ static void test_baked_state_readback() {
         .format = Format::Depth32Float, .usage = UsageFlags::DepthStencilAttachment,
     };
     Handle<Texture> depth_tex = create_texture(d, depth_desc);
+    // One combined depth-stencil texture for the stencil pipeline's passes
+    // (used as BOTH the depth and the stencil attachment).
     TextureDesc stencil_desc{
         .type = TextureType::Tex2D, .dimensions = {kSize, kSize, 1},
-        .format = Format::Stencil8, .usage = UsageFlags::DepthStencilAttachment,
+        .format = Format::Depth24PlusStencil8, .usage = UsageFlags::DepthStencilAttachment,
     };
     Handle<Texture> stencil_tex = create_texture(d, stencil_desc);
+    CHECK(stencil_tex.h != 0, "stencil render target created (combined depth-stencil format)");
+    if (stencil_tex.h == 0 || p_stencil.h == 0) {
+        free(d, color_tex); free(d, depth_tex);
+        for (auto h : {ds_none, ds_less, ds_greater, ds_stencil0, ds_stencil7}) {
+            free_depth_stencil_state(d, h);
+        }
+        free(d, p_plain); free(d, p_stencil);
+        destroy_device(d);
+        return;
+    }
     GpuPtr args_a = malloc(d, 16, Memory::Default);
     GpuPtr args_b = malloc(d, 16, Memory::Default);
     Queue q = get_queue(d);
@@ -3713,7 +3732,8 @@ static void test_baked_state_readback() {
             .clear_color = Color{20, 20, 40, 255},
         };
         RenderAttachment depth_att{
-            .texture = depth_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
+            .texture = use_stencil ? stencil_tex : depth_tex,
+            .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
             .clear_color = Color{255, 0, 0, 0},   // depth clear: r/255 = 1.0 (far)
         };
         RenderAttachment stencil_att{

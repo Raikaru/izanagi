@@ -76,21 +76,7 @@ static void release_cb_variant(CommandBufferImpl* cb) {
     cb->bound_base_pipeline = nullptr;
 }
 
-// Re-asserts the core-dynamic stencil/bias state from the shadow after a
-// static-variant bind. Dynamic-state capture is bind-time on some drivers
-// (D3D12-based dzn keeps the pipeline-static stencil reference otherwise),
-// so the state that precedes the bind must be re-issued after it. The
-// viewport/scissor are not re-asserted here (they are issued through their
-// own commands and verified working; the default viewport's Y-flip is
-// begin_render_pass-internal and not representable in the shadow).
-static void reapply_core_dynamic_state(CommandBufferImpl* cb) {
-    const LogicalGraphicsState& gs = cb->graphics_state;
-    vkCmdSetDepthBias(cb->buffer, gs.depth_bias, gs.depth_bias_clamp, gs.depth_bias_slope);
-    vkCmdSetStencilReference(cb->buffer, VK_STENCIL_FACE_FRONT_BIT, gs.stencil_front.reference);
-    vkCmdSetStencilReference(cb->buffer, VK_STENCIL_FACE_BACK_BIT, gs.stencil_back.reference);
-    vkCmdSetStencilWriteMask(cb->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, gs.stencil_write_mask);
-    vkCmdSetStencilCompareMask(cb->buffer, VK_STENCIL_FACE_FRONT_AND_BACK, gs.stencil_read_mask);
-}
+
 
 static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
     // Release references retained by recorded-but-never-submitted command
@@ -1340,7 +1326,6 @@ bool prepare_static_graphics(CommandBufferImpl* cb) {
     if (is_default_baked_state(cb->graphics_state)) {
         if (cb->bound_variant != nullptr) {
             vkCmdBindPipeline(cb->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, base->vk_pipeline);
-            reapply_core_dynamic_state(cb);
             cb->bound_variant = nullptr;
         }
         cb->graphics_state.dirty_static_state = false;
@@ -1363,7 +1348,6 @@ bool prepare_static_graphics(CommandBufferImpl* cb) {
         return false;
     }
     vkCmdBindPipeline(cb->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, v->vk_pipeline);
-    reapply_core_dynamic_state(cb);
     cb->bound_variant = v;
     cb->graphics_state.dirty_static_state = false;
     return true;
@@ -1383,9 +1367,6 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     // stencil write/compare masks. The values are shadowed so a variant bind
     // at draw time can re-assert them (some drivers capture dynamic state at
     // pipeline bind).
-    gs.depth_bias       = desc.depth_bias;
-    gs.depth_bias_clamp = desc.depth_bias_clamp;
-    gs.depth_bias_slope = desc.depth_bias_slope_factor;
     vkCmdSetDepthBias(cmd->buffer, desc.depth_bias, desc.depth_bias_clamp,
                       desc.depth_bias_slope_factor);
     vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT, desc.stencil_front.reference);

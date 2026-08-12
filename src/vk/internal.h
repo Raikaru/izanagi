@@ -568,9 +568,6 @@ struct LogicalGraphicsState {
     // Viewport/scissor remain dynamic on the fallback path.
     Rect2D viewport{0, 0, 0, 0};
     Rect2D scissor{0, 0, 0, 0};
-    float  depth_bias        = 0.0f;
-    float  depth_bias_clamp  = 0.0f;
-    float  depth_bias_slope  = 0.0f;
 
     // dirty_static_state: a baked member changed since the last variant bind
     // (a new private variant is required on the fallback path).
