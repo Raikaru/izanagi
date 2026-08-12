@@ -662,6 +662,8 @@ int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse re
 bool       debug_validation_active(DeviceImpl* d);      // validation layer actually attached
 void       debug_force_legacy_barriers(DeviceImpl* d, bool force);  // test hook
 bool      debug_using_static_state(DeviceImpl* d);                    // white-box
+uint32_t  debug_effective_api_version(DeviceImpl* d);              // white-box
+bool      debug_limited_1_2(DeviceImpl* d);                        // white-box (dzn signature)
 void       debug_force_legacy_copy(DeviceImpl* d, bool force);       // test hook
 void       debug_force_static_state(DeviceImpl* d, bool force);      // test hook
 void       debug_derive_dispatch(DeviceImpl* d);                     // re-derive after force toggles

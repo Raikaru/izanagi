@@ -798,6 +798,18 @@ bool debug_using_static_state(DeviceImpl* d) {
     return d->dispatch.use_static_graphics_state;
 }
 
+uint32_t debug_effective_api_version(DeviceImpl* d) {
+    return d->dispatch.effective_api_version;
+}
+
+// True for the observable "limited 1.2" dispatch signature: 1.2 device with
+// neither copy-commands2 nor extended-dynamic-state (Mesa dzn). Behavior-
+// based; never vendor-ID-based.
+bool debug_limited_1_2(DeviceImpl* d) {
+    return d->dispatch.effective_api_version < VK_API_VERSION_1_3 &&
+           d->dispatch.use_legacy_copy_commands && d->dispatch.use_static_graphics_state;
+}
+
 int64_t debug_stat(DeviceImpl* d, int which) {
     switch (which) {
         case 0: return atomic_load(&d->stat_copy2_calls);
