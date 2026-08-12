@@ -97,10 +97,32 @@ Start the daemon once per boot from a Termux session:
 bash ~/bin/phone_exec_daemon.sh &
 ```
 
-Install `Termux:Boot` and drop the same line in `~/.termux/boot/` to survive
-reboots. proot's `root` is the same Android uid as Termux, so the dispatcher
-grants a job no privileges it did not already have — but it does let job code
-run outside the proot view, so keep the workflow limited to reviewed `main`
+### Unattended recovery after reboot
+
+`tools/termux_boot_izanagi.sh` restores the whole rig with no interaction:
+the wake lock, the phone-exec daemon, and the GitHub runner itself. Install
+the `Termux:Boot` app (the build must be signed with the same key as the
+installed Termux — a GitHub debug Termux needs the GitHub debug Termux:Boot,
+not the F-Droid one), launch it once so Android leaves the stopped state,
+then install the script:
+
+```sh
+mkdir -p ~/.termux/boot
+cp tools/termux_boot_izanagi.sh ~/.termux/boot/00-izanagi.sh
+chmod +x ~/.termux/boot/00-izanagi.sh
+```
+
+The script is idempotent: the daemon is detected through its heartbeat file
+and the runner through a procfs scan, so running it twice never starts a
+duplicate. Liveness must not be probed with `kill -0` (denied under `run-as`)
+or `pgrep -f` (matches its own invoking shell).
+
+Note that Wireless debugging itself does not survive a reboot; re-enable it
+in Developer options if `adb` access is needed afterwards.
+
+proot's `root` is the same Android uid as Termux, so the dispatcher grants a
+job no privileges it did not already have — but it does let job code run
+outside the proot view, so keep the workflow limited to reviewed `main`
 pushes.
 
 Replacement drivers are selected with `IZANAGI_ADRENOTOOLS_DRIVER_DIR`,
