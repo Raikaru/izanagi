@@ -655,11 +655,15 @@ static VkResult create_logical_device(DeviceImpl* d) {
         IZ_LOG(d, LogLevel::Error, "bindless: VK_KHR_synchronization2 entry points missing");
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
-    if (!d->dispatch.use_legacy_copy_commands && vkCmdCopyBuffer2 == nullptr) {
+    if (!d->dispatch.use_legacy_copy_commands &&
+        (d->dispatch.effective_api_version >= VK_API_VERSION_1_3 ? vkCmdCopyBuffer2 == nullptr
+                                                                 : vkCmdCopyBuffer2KHR == nullptr)) {
         IZ_LOG(d, LogLevel::Error, "bindless: copy-commands2 entry points missing but modern path selected");
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
-    if (!d->dispatch.use_static_graphics_state && vkCmdSetDepthTestEnable == nullptr) {
+    if (!d->dispatch.use_static_graphics_state &&
+        (d->dispatch.effective_api_version >= VK_API_VERSION_1_3 ? vkCmdSetDepthTestEnable == nullptr
+                                                                 : vkCmdSetDepthTestEnableEXT == nullptr)) {
         IZ_LOG(d, LogLevel::Error, "bindless: extended-dynamic-state entry points missing but dynamic path selected");
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
