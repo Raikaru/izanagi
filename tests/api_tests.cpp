@@ -3653,6 +3653,10 @@ static void test_baked_state_readback() {
     Handle<Pipeline> p_plain = create_graphics_pipeline(d, vs_src, fs_src, raster_plain);
     Handle<Pipeline> p_stencil = create_graphics_pipeline(d, vs_src, fs_src, raster_stencil);
     CHECK(p_plain.h != 0 && p_stencil.h != 0, "graphics pipelines created");
+    if (p_plain.h == 0 || p_stencil.h == 0) {
+        destroy_device(d);
+        return;
+    }
 
     // Depth-stencil states: depth disabled (cull/front/viewport pairs),
     // depth Less, depth Greater, stencil Equal ref 0, stencil Equal ref 7.
@@ -3707,7 +3711,7 @@ static void test_baked_state_readback() {
     };
     Handle<Texture> stencil_tex = create_texture(d, stencil_desc);
     CHECK(stencil_tex.h != 0, "stencil render target created (combined depth-stencil format)");
-    if (stencil_tex.h == 0 || p_stencil.h == 0) {
+    if (stencil_tex.h == 0) {
         free(d, color_tex); free(d, depth_tex);
         for (auto h : {ds_none, ds_less, ds_greater, ds_stencil0, ds_stencil7}) {
             free_depth_stencil_state(d, h);
@@ -3738,11 +3742,16 @@ static void test_baked_state_readback() {
         };
         RenderAttachment stencil_att{
             .texture = stencil_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
-            .clear_color = Color{0, stencil_clear, 0, 0},   // stencil clear: g
+            // Stencil clear rides the green channel: the backend maps the
+            // stencil attachment's clearValue from clear_color.g (uint32).
+            .clear_color = Color{0, stencil_clear, 0, 0},
         };
         RenderPassDesc pass_desc{
             .color_attachments = Span<const RenderAttachment>(&color_att, 1),
-            .depth_attachment  = use_stencil ? RenderAttachment{} : depth_att,
+            // depth_att already points at the combined texture for the
+            // stencil pipeline, so the depth attachment is always present —
+            // a pass whose pipeline declares a depth format must provide it.
+            .depth_attachment  = depth_att,
             .stencil_attachment = use_stencil ? stencil_att : RenderAttachment{},
             .render_area       = Rect2D{.width = kSize, .height = kSize},
         };
