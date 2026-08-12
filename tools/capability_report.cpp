@@ -9,6 +9,7 @@
 
 #include "izanagi/gpu.h"
 #include "vk/internal.h"
+#include "../tests/android_driver_loader.h"
 
 using namespace gpu;
 
@@ -27,6 +28,7 @@ static const char* backend_name() {
 }
 
 int main() {
+    if (!load_custom_android_driver()) { return 2; }
     DeviceDesc desc{
         .log_callback = log_cb,
         .log_level    = LogLevel::Info,

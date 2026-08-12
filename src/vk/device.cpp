@@ -166,8 +166,19 @@ BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr) {
 }
 
 // --- Instance creation -------------------------------------------------------------------
+
+// Test hosts may pre-initialize volk with a custom loader (e.g. an
+// adrenotools-loaded driver on Android). Such a dispatch is owned by the
+// host: never clobber it at create and never tear it down at destroy.
+static bool g_external_vk_loader = false;
+
 static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
-    VkResult result = volkInitialize();
+    VkResult result = VK_SUCCESS;
+    if (vkGetInstanceProcAddr != nullptr) {
+        g_external_vk_loader = true;
+    } else {
+        result = volkInitialize();
+    }
     if (result != VK_SUCCESS) { return result; }
 
     // Loader-clamped instance version request: never exceed what the loader
@@ -253,6 +264,7 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
     uint32_t device_count = 0;
     VkResult result = vkEnumeratePhysicalDevices(d->instance, &device_count, nullptr);
     if (result != VK_SUCCESS || device_count == 0) {
+        log_vk_impl(d, result, "vkEnumeratePhysicalDevices returned no devices", __LINE__, "device.cpp"_sv);
         return result != VK_SUCCESS ? result : VK_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -274,7 +286,10 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         // required and enabled either as 1.3 cores or via their KHR
         // extensions on 1.2 devices — see kRequiredDeviceExtensions). The
         // exact feature gate is in create_device, below.
-        if (props.apiVersion < VK_API_VERSION_1_2) { continue; }
+        if (props.apiVersion < VK_API_VERSION_1_2) {
+            IZ_LOG(d, LogLevel::Info, "device skipped: api version below 1.2 (bindless minimum)");
+            continue;
+        }
 #else
         // Require Vulkan 1.4
         if (props.apiVersion < VK_API_VERSION_1_4) { continue; }
@@ -295,7 +310,10 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
                 break;
             }
         }
-        if (graphics_family < 0) { continue; }
+        if (graphics_family < 0) {
+            IZ_LOG(d, LogLevel::Info, "device skipped: no graphics+compute queue family");
+            continue;
+        }
 
         // Check required extensions
         uint32_t ext_count = 0;
@@ -1555,7 +1573,7 @@ void destroy_device(Device dev) {
         vkDestroySurfaceKHR(d->instance, d->surface.surface, nullptr);
     }
     vkDestroyInstance(d->instance, nullptr);
-    volkFinalize();
+    if (!g_external_vk_loader) { volkFinalize(); }
 
     tls_free(d->thread_local_key);
     auto alloc = d->allocator;

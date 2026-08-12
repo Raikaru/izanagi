@@ -16,6 +16,10 @@ endif()
 option(IZANAGI_BUILD_TESTS    "Build the API test suite"    ${PROJECT_IS_TOP_LEVEL})
 option(IZANAGI_BUILD_EXAMPLES "Build the example programs"  ${PROJECT_IS_TOP_LEVEL})
 option(IZANAGI_BUILD_CAPABILITY_REPORT "Build the capability-report tool" ${PROJECT_IS_TOP_LEVEL})
+# Android test hosts: optional replacement-driver loading (adrenotools
+# packaging). Point IZANAGI_ADRENOTOOLS_ROOT at a libadrenotools source
+# checkout; drivers are selected at runtime via IZANAGI_ADRENOTOOLS_* env.
+set(IZANAGI_ADRENOTOOLS_ROOT "" CACHE PATH "libadrenotools source dir (Android test hosts only)")
 mark_as_advanced(IZANAGI_BUILD_TESTS IZANAGI_BUILD_EXAMPLES IZANAGI_BUILD_CAPABILITY_REPORT)
 
 # --- Backend and WSI selection -------------------------------------------------
@@ -281,6 +285,11 @@ if(IZANAGI_BUILD_TESTS)
                      izanagi_test_shaders4 izanagi_test_shaders5 izanagi_test_shaders6
                      izanagi_test_shaders7 izanagi_test_shaders8
                      izanagi_test_shaders_untyped izanagi_test_shaders_untyped_neg)
+    if(ANDROID AND IZANAGI_ADRENOTOOLS_ROOT)
+        add_subdirectory(${IZANAGI_ADRENOTOOLS_ROOT} adrenotools EXCLUDE_FROM_ALL)
+        target_link_libraries(izanagi_tests PRIVATE adrenotools)
+        target_compile_definitions(izanagi_tests PRIVATE IZANAGI_ANDROID_ADRENOTOOLS)
+    endif()
 
     # GPU-independent container/arena/profile tests (no Vulkan device required)
     add_executable(izanagi_common_tests
@@ -316,6 +325,13 @@ if(IZANAGI_BUILD_CAPABILITY_REPORT)
     target_link_libraries(izanagi_capability_report PRIVATE izanagi volk_headers GPUOpen::VulkanMemoryAllocator)
     target_include_directories(izanagi_capability_report PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(izanagi_capability_report PRIVATE IZ_PROFILE="${IZANAGI_PROFILE}")
+    if(ANDROID AND IZANAGI_ADRENOTOOLS_ROOT)
+        if(NOT TARGET adrenotools)
+            add_subdirectory(${IZANAGI_ADRENOTOOLS_ROOT} adrenotools EXCLUDE_FROM_ALL)
+        endif()
+        target_link_libraries(izanagi_capability_report PRIVATE adrenotools)
+        target_compile_definitions(izanagi_capability_report PRIVATE IZANAGI_ANDROID_ADRENOTOOLS)
+    endif()
 endif()
 
 # --- Examples ------------------------------------------------------------------

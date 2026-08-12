@@ -9,7 +9,7 @@ only when the required conformance passes on physical hardware.
 |---|---|---|---|
 | Windows | Vulkan Native | `IZANAGI_VK_NATIVE_1` + `IZANAGI_VK_BINDLESS_1` | Certified baseline on the RTX 4080: full suite (43 tests) passes on both profiles, including the forced legacy-copy and forced static-graphics-state configurations; CI. |
 | Linux | Vulkan Bindless | `IZANAGI_VK_BINDLESS_1` | WSL dzn rig (mesa 26.2.0 dzn, RTX 4080 via D3D12): full suite (43/43, Debug + Release) passes with the private copy + static-state fallbacks; capability JSON + suite logs archived. Headless CI: builds + common tests; Lavapipe probe job added (qualification pending first green run). |
-| Android | Vulkan Bindless via Mesa Turnip | `IZANAGI_VK_BINDLESS_1` | Qualified on the Adreno 650 phone rig: full Vulkan API suite passes on pinned Turnip/KGSL (mesa 26.2.0-devel, api 1.3.354) via the phone-hosted CI on every `main` push. Arm64 NDK cross-build on CI. Stock Qualcomm Vulkan remains a capability-rejection path. |
+| Android | Vulkan Bindless via Mesa Turnip | `IZANAGI_VK_BINDLESS_1` | Qualified on the Adreno 650 phone rig two ways: (1) phone-hosted CI runs the full Vulkan suite on pinned Turnip/KGSL (Linux userland) on every `main` push; (2) a native NDK (bionic) test host passes the full suite on an adrenotools-loaded Turnip driver, and the capability-rejection path is verified against the stock Qualcomm Vulkan 1.1 driver and Qualcomm's v615.77 blob (also 1.1 on this GPU). Replacement drivers select at runtime via `IZANAGI_ADRENOTOOLS_*` env (build with `IZANAGI_ADRENOTOOLS_ROOT`). |
 | macOS | Metal (planned) | — | Build boundary in place; backend in a later phase. |
 | iOS | Metal (planned) | — | Declared; simulator/device phases planned. |
 

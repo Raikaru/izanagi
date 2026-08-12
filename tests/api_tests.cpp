@@ -32,6 +32,7 @@ using namespace gpu;
 // library; including internal.h gives the hooks + internal types like
 // LogicalGraphicsState for the white-box tests).
 #include "vk/internal.h"
+#include "android_driver_loader.h"
 
 
 static int g_failures = 0;
@@ -3912,6 +3913,7 @@ static void test_baked_state_readback() {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);   // crash/hang diagnostics: no buffering
+    if (!load_custom_android_driver()) { return 2; }
     printf("Izanagi API Tests\n");
     printf("=================\n\n");
 
