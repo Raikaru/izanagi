@@ -30,12 +30,32 @@ jobs:
       DEPS_DIR: /home/runner/.cache/izanagi-fetchcontent
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Prepare persistent dependency cache
+      - name: Prepare persistent dependency sources
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$DEPS_DIR"
-          git config --global http.version HTTP/1.1
+          if [ ! -f "$DEPS_DIR/vulkanheaders-src/CMakeLists.txt" ]; then
+            rm -rf "$DEPS_DIR/vulkanheaders-src"
+            mkdir -p "$DEPS_DIR/vulkanheaders-src"
+            curl -L --fail --silent --show-error "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/vulkan-sdk-1.4.341.0" \
+              | tar -xzf - -C "$DEPS_DIR/vulkanheaders-src" --strip-components=1
+          fi
+          if [ ! -f "$DEPS_DIR/volk-src/CMakeLists.txt" ]; then
+            rm -rf "$DEPS_DIR/volk-src"
+            mkdir -p "$DEPS_DIR/volk-src"
+            curl -L --fail --silent --show-error "https://codeload.github.com/zeux/volk/tar.gz/vulkan-sdk-1.4.341.0" \
+              | tar -xzf - -C "$DEPS_DIR/volk-src" --strip-components=1
+          fi
+          if [ ! -f "$DEPS_DIR/vma-src/CMakeLists.txt" ]; then
+            rm -rf "$DEPS_DIR/vma-src"
+            mkdir -p "$DEPS_DIR/vma-src"
+            curl -L --fail --silent --show-error "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/tar.gz/v3.3.0" \
+              | tar -xzf - -C "$DEPS_DIR/vma-src" --strip-components=1
+          fi
+          echo "FETCHCONTENT_SOURCE_DIR_VULKANHEADERS=$DEPS_DIR/vulkanheaders-src" >> "$GITHUB_ENV"
+          echo "FETCHCONTENT_SOURCE_DIR_VOLK=$DEPS_DIR/volk-src" >> "$GITHUB_ENV"
+          echo "FETCHCONTENT_SOURCE_DIR_VULKANMEMORYALLOCATOR=$DEPS_DIR/vma-src" >> "$GITHUB_ENV"
       - name: Install pinned Turnip driver
         shell: bash
         run: |
