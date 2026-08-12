@@ -1187,7 +1187,16 @@ void apply_depth_stencil_to_shadow(const DepthStencilDesc& desc, LogicalGraphics
     gs.depth_test_enable   = bool(desc.depth_mode & DepthFlags::Read);
     gs.depth_write_enable  = bool(desc.depth_mode & DepthFlags::Write);
     gs.depth_compare       = desc.depth_test;
-    gs.stencil_test_enable = true;   // matches the current backend behavior
+    // Stencil testing is enabled only when the stencil state is non-default
+    // (compare != Always or any op != Keep). Forcing it on for every state
+    // made plain/depth-only pipelines run stencil testing without a stencil
+    // attachment — undefined behavior (fragments rejected erratically).
+    const auto& sf = desc.stencil_front;
+    const auto& sb = desc.stencil_back;
+    gs.stencil_test_enable = sf.test != Op::Always || sf.fail_op != StencilOp::Keep ||
+                             sf.pass_op != StencilOp::Keep || sf.depth_fail_op != StencilOp::Keep ||
+                             sb.test != Op::Always || sb.fail_op != StencilOp::Keep ||
+                             sb.pass_op != StencilOp::Keep || sb.depth_fail_op != StencilOp::Keep;
     gs.stencil_front       = desc.stencil_front;
     gs.stencil_back        = desc.stencil_back;
     gs.stencil_read_mask   = desc.stencil_read_mask;

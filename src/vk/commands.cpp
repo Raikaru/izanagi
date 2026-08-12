@@ -1386,7 +1386,7 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     backend_set_depth_write_enable(d, cmd->buffer, bool(desc.depth_mode & DepthFlags::Write));
     backend_set_depth_test_enable(d, cmd->buffer, bool(desc.depth_mode & DepthFlags::Read));
     backend_set_depth_compare_op(d, cmd->buffer, bridge(desc.depth_test));
-    backend_set_stencil_test_enable(d, cmd->buffer, true);
+    backend_set_stencil_test_enable(d, cmd->buffer, gs.stencil_test_enable);
     backend_set_stencil_op(d, cmd->buffer, VK_STENCIL_FACE_FRONT_BIT,
                       bridge(desc.stencil_front.fail_op), bridge(desc.stencil_front.pass_op),
                       bridge(desc.stencil_front.depth_fail_op), bridge(desc.stencil_front.test));
