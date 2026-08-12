@@ -440,15 +440,19 @@ static VkResult create_logical_device(DeviceImpl* d) {
     };
     // Pointers to the booleans that gate dynamic rendering / sync2 / ext
     // dynamic state for the selected route (used for enable + verification).
+    // VK_EXT_extended_dynamic_state was promoted to 1.3 as MANDATORY — the
+    // 1.3 aggregate has no bit (verified: Vulkan-Headers 1.4.341), so the
+    // EXT feature struct is only chained/enabled on the 1.2 extension route
+    // when the extension is advertised.
     VkBool32* dyn_rendering_out = nullptr;
     VkBool32* sync2_out         = nullptr;
     VkBool32* ext_dyn_state_out = nullptr;
     void*     render_features_chain = nullptr;
     if (d->dispatch.effective_api_version >= VK_API_VERSION_1_3) {
-        render_features_chain = &vulkan13_features;
-        dyn_rendering_out     = &vulkan13_features.dynamicRendering;
-        sync2_out             = &vulkan13_features.synchronization2;
-        ext_dyn_state_out     = &vulkan13_features.extendedDynamicState;
+        vulkan13_features.pNext = nullptr;
+        render_features_chain   = &vulkan13_features;
+        dyn_rendering_out       = &vulkan13_features.dynamicRendering;
+        sync2_out               = &vulkan13_features.synchronization2;
     } else {
         ext_dyn_state_features.pNext = nullptr;
         sync2_features.pNext         = &ext_dyn_state_features;
@@ -456,8 +460,7 @@ static VkResult create_logical_device(DeviceImpl* d) {
         render_features_chain        = &dyn_rendering_features;
         dyn_rendering_out            = &dyn_rendering_features.dynamicRendering;
         sync2_out                    = &sync2_features.synchronization2;
-        ext_dyn_state_out = d->dispatch.extended_dynamic_state ? &ext_dyn_state_features.extendedDynamicState
-                                                               : nullptr;
+        ext_dyn_state_out            = &ext_dyn_state_features.extendedDynamicState;
     }
     VkPhysicalDeviceVulkan12Features vulkan12_features{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -1138,6 +1141,16 @@ Device create_device(const DeviceDesc& desc) {
             IZ_LOG(d, LogLevel::Error,
                    "bindless: initial implementation requires dynamic rendering + synchronization2 "
                    "(the private render-pass / legacy-barrier paths land in the command phase)");
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto fail;
+        }
+        // Temporary gate (removed in the static-graphics-state phase): devices
+        // without VK_EXT_extended_dynamic_state select the private static
+        // variant fallback, which is not implemented yet.
+        if (d->dispatch.use_static_graphics_state) {
+            IZ_LOG(d, LogLevel::Error,
+                   "bindless: extended dynamic state unavailable; the private static "
+                   "graphics-state fallback lands in the next phase");
             result = VK_ERROR_FEATURE_NOT_PRESENT;
             goto fail;
         }

@@ -492,6 +492,13 @@ struct CommandBufferImpl {
     bool   wait_for_surface_texture = false;
     bool   signal_surface_texture   = false;
 
+    // Deterministic command-recording failure (e.g. a fallback conversion
+    // allocation failed, or a required private pipeline variant is Pending/
+    // Failed). cmd_finalize preserves the state; queue_submit rejects the
+    // command buffer without submitting or advancing the timeline.
+    bool        recording_failed = false;
+    const char* fail_reason      = nullptr;
+
     // Pipelines bound by cmd_set_pipeline (Ready only); each holds one
     // reference. Textures explicitly named by commands (render attachments,
     // copy sources/destinations) and buffers named by memory/copy/draw
@@ -579,5 +586,18 @@ bool enqueue_retire(QueueImpl* q, uint64_t value, const RetireItem& item);
 
 // Descriptor heap bind (commands.cpp, called from queue_start_command_recording)
 void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd);
+
+// Backend copy dispatch (commands.cpp): choose the modern (copy-commands2)
+// or legacy command from the device's dispatch capabilities; conversions
+// are exposed for GPU-independent tests.
+void backend_copy_buffer(CommandBufferImpl* cb, const VkCopyBufferInfo2& info);
+void backend_copy_buffer_to_image(CommandBufferImpl* cb, const VkCopyBufferToImageInfo2& info);
+void backend_copy_image_to_buffer(CommandBufferImpl* cb, const VkCopyImageToBufferInfo2& info);
+void backend_blit_image(CommandBufferImpl* cb, const VkBlitImageInfo2& info);
+// Region conversion helpers (assert-free: wrappers reject non-null pNext
+// before calling; the helpers copy the documented fields verbatim).
+void convert_buffer_copy_regions(const VkBufferCopy2* src, uint32_t count, VkBufferCopy* dst);
+void convert_buffer_image_copy_regions(const VkBufferImageCopy2* src, uint32_t count, VkBufferImageCopy* dst);
+void convert_image_blit_regions(const VkImageBlit2* src, uint32_t count, VkImageBlit* dst);
 
 }  // namespace gpu

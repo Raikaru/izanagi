@@ -227,6 +227,15 @@ CommandBuffer queue_start_command_recording(Queue q) {
 }
 
 void cmd_finalize(CommandBuffer cmd) {
+    // Preserve the recording-failed state (the application can inspect the
+    // error via submission rejection / debug logs; the buffer must not be
+    // submitted with partial or invalid commands).
+    if (cmd->recording_failed) {
+        IZ_LOG(cmd->device, LogLevel::Error,
+               cmd->fail_reason != nullptr ? cmd->fail_reason : "command buffer recording failed");
+        return;
+    }
+
     auto* d = cmd->device;
     IZ_CHK(d, vkEndCommandBuffer(cmd->buffer), "cmd_finalize failed");
     // The command pool stays checked out until this command buffer is
@@ -348,6 +357,18 @@ Submission queue_submit(Queue                     q,
     Span<VkSemaphoreSubmitInfo>     wait_info{};
     Span<VkCommandBufferSubmitInfo> command_info{};
     Span<VkSemaphoreSubmitInfo>     signal_info{};
+
+    // Reject command buffers with a recording error deterministically:
+    // nothing is submitted, no timeline advances.
+    for (uint32_t i = 0; i < command_buffers.size(); ++i) {
+        if (command_buffers[i]->recording_failed) {
+            IZ_LOG(d, LogLevel::Error,
+                   command_buffers[i]->fail_reason != nullptr
+                       ? command_buffers[i]->fail_reason
+                       : "queue_submit: command buffer recording failed");
+            return Submission{.queue = q, .value = q->timeline_value + 1, .status = SubmitStatus::Error};
+        }
+    }
 
     // Serialize submission (and presentation) per queue. The serialized region
     // covers the entire stateful sequence: claim texture initialization
@@ -768,6 +789,172 @@ int64_t debug_pool_resets(DeviceImpl* d) {
     return atomic_load(&d->stat_pool_resets);
 }
 
+// --- Backend copy dispatch -----------------------------------------------------------
+// Selects the modern (VK_KHR_copy_commands2) or legacy copy/blit command from
+// the device's dispatch capabilities. Region conversions use stack storage for
+// the common single-region case and the thread-local scratch arena for many
+// regions; any failure marks the command buffer failed deterministically
+// (no Vulkan command is issued with mismatched data).
+
+static void cmd_record_fail(CommandBufferImpl* cb, const char* reason) {
+    cb->recording_failed = true;
+    cb->fail_reason      = reason;
+    IZ_LOG(cb->device, LogLevel::Error, reason);
+}
+
+void convert_buffer_copy_regions(const VkBufferCopy2* src, uint32_t count, VkBufferCopy* dst) {
+    for (uint32_t i = 0; i < count; ++i) {
+        dst[i] = VkBufferCopy{
+            .srcOffset = src[i].srcOffset,
+            .dstOffset = src[i].dstOffset,
+            .size      = src[i].size,
+        };
+    }
+}
+
+void convert_buffer_image_copy_regions(const VkBufferImageCopy2* src, uint32_t count, VkBufferImageCopy* dst) {
+    for (uint32_t i = 0; i < count; ++i) {
+        dst[i] = VkBufferImageCopy{
+            .bufferOffset      = src[i].bufferOffset,
+            .bufferRowLength   = src[i].bufferRowLength,
+            .bufferImageHeight = src[i].bufferImageHeight,
+            .imageSubresource  = src[i].imageSubresource,
+            .imageOffset       = src[i].imageOffset,
+            .imageExtent       = src[i].imageExtent,
+        };
+    }
+}
+
+void convert_image_blit_regions(const VkImageBlit2* src, uint32_t count, VkImageBlit* dst) {
+    for (uint32_t i = 0; i < count; ++i) {
+        dst[i] = VkImageBlit{
+            .srcSubresource = src[i].srcSubresource,
+            .srcOffsets     = {src[i].srcOffsets[0], src[i].srcOffsets[1]},
+            .dstSubresource = src[i].dstSubresource,
+            .dstOffsets     = {src[i].dstOffsets[0], src[i].dstOffsets[1]},
+        };
+    }
+}
+
+// Rejects non-null pNext in the *2 info and its typed regions (Izanagi never
+// uses extension-specific copy payloads; silently discarding them would be
+// wrong). Typed access — a region array is an array of structs, not pointers.
+template <class T>
+static bool copy_info_has_pnext(const void* info_pnext, const T* regions, uint32_t region_count) {
+    if (info_pnext != nullptr) { return true; }
+    for (uint32_t i = 0; i < region_count; ++i) {
+        if (regions[i].pNext != nullptr) { return true; }
+    }
+    return false;
+}
+
+void backend_copy_buffer(CommandBufferImpl* cb, const VkCopyBufferInfo2& info) {
+    auto* d = cb->device;
+    if (!d->dispatch.use_legacy_copy_commands) {
+        atomic_fetch_add(&d->stat_copy2_calls, 1);
+        vkCmdCopyBuffer2(cb->buffer, &info);
+        return;
+    }
+    atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
+    if (copy_info_has_pnext(info.pNext, info.pRegions, info.regionCount)) {
+        cmd_record_fail(cb, "copy: unsupported non-null pNext in copy info");
+        return;
+    }
+    if (info.regionCount == 0) { return; }   // legal no-op
+    VkBufferCopy stack_region{};
+    VkBufferCopy* regions = &stack_region;
+    if (info.regionCount > 1) {
+        Arena* arena = get_thread_local_arena(d);
+        if (arena == nullptr) { cmd_record_fail(cb, "copy: no scratch arena"); return; }
+        ScratchScope scope(*arena);
+        regions = static_cast<VkBufferCopy*>(arena->alloc(sizeof(VkBufferCopy) * info.regionCount));
+        if (regions == nullptr) { cmd_record_fail(cb, "copy: region conversion allocation failed"); return; }
+    }
+    convert_buffer_copy_regions(info.pRegions, info.regionCount, regions);
+    vkCmdCopyBuffer(cb->buffer, info.srcBuffer, info.dstBuffer, info.regionCount, regions);
+}
+
+void backend_copy_buffer_to_image(CommandBufferImpl* cb, const VkCopyBufferToImageInfo2& info) {
+    auto* d = cb->device;
+    if (!d->dispatch.use_legacy_copy_commands) {
+        atomic_fetch_add(&d->stat_copy2_calls, 1);
+        vkCmdCopyBufferToImage2(cb->buffer, &info);
+        return;
+    }
+    atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
+    if (copy_info_has_pnext(info.pNext, info.pRegions, info.regionCount)) {
+        cmd_record_fail(cb, "copy: unsupported non-null pNext in copy info");
+        return;
+    }
+    if (info.regionCount == 0) { return; }
+    VkBufferImageCopy stack_region{};
+    VkBufferImageCopy* regions = &stack_region;
+    if (info.regionCount > 1) {
+        Arena* arena = get_thread_local_arena(d);
+        if (arena == nullptr) { cmd_record_fail(cb, "copy: no scratch arena"); return; }
+        ScratchScope scope(*arena);
+        regions = static_cast<VkBufferImageCopy*>(arena->alloc(sizeof(VkBufferImageCopy) * info.regionCount));
+        if (regions == nullptr) { cmd_record_fail(cb, "copy: region conversion allocation failed"); return; }
+    }
+    convert_buffer_image_copy_regions(info.pRegions, info.regionCount, regions);
+    vkCmdCopyBufferToImage(cb->buffer, info.srcBuffer, info.dstImage, info.dstImageLayout,
+                           info.regionCount, regions);
+}
+
+void backend_copy_image_to_buffer(CommandBufferImpl* cb, const VkCopyImageToBufferInfo2& info) {
+    auto* d = cb->device;
+    if (!d->dispatch.use_legacy_copy_commands) {
+        atomic_fetch_add(&d->stat_copy2_calls, 1);
+        vkCmdCopyImageToBuffer2(cb->buffer, &info);
+        return;
+    }
+    atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
+    if (copy_info_has_pnext(info.pNext, info.pRegions, info.regionCount)) {
+        cmd_record_fail(cb, "copy: unsupported non-null pNext in copy info");
+        return;
+    }
+    if (info.regionCount == 0) { return; }
+    VkBufferImageCopy stack_region{};
+    VkBufferImageCopy* regions = &stack_region;
+    if (info.regionCount > 1) {
+        Arena* arena = get_thread_local_arena(d);
+        if (arena == nullptr) { cmd_record_fail(cb, "copy: no scratch arena"); return; }
+        ScratchScope scope(*arena);
+        regions = static_cast<VkBufferImageCopy*>(arena->alloc(sizeof(VkBufferImageCopy) * info.regionCount));
+        if (regions == nullptr) { cmd_record_fail(cb, "copy: region conversion allocation failed"); return; }
+    }
+    convert_buffer_image_copy_regions(info.pRegions, info.regionCount, regions);
+    vkCmdCopyImageToBuffer(cb->buffer, info.srcImage, info.srcImageLayout, info.dstBuffer,
+                           info.regionCount, regions);
+}
+
+void backend_blit_image(CommandBufferImpl* cb, const VkBlitImageInfo2& info) {
+    auto* d = cb->device;
+    if (!d->dispatch.use_legacy_copy_commands) {
+        atomic_fetch_add(&d->stat_copy2_calls, 1);
+        vkCmdBlitImage2(cb->buffer, &info);
+        return;
+    }
+    atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
+    if (copy_info_has_pnext(info.pNext, info.pRegions, info.regionCount)) {
+        cmd_record_fail(cb, "blit: unsupported non-null pNext in blit info");
+        return;
+    }
+    if (info.regionCount == 0) { return; }
+    VkImageBlit stack_region{};
+    VkImageBlit* regions = &stack_region;
+    if (info.regionCount > 1) {
+        Arena* arena = get_thread_local_arena(d);
+        if (arena == nullptr) { cmd_record_fail(cb, "blit: no scratch arena"); return; }
+        ScratchScope scope(*arena);
+        regions = static_cast<VkImageBlit*>(arena->alloc(sizeof(VkImageBlit) * info.regionCount));
+        if (regions == nullptr) { cmd_record_fail(cb, "blit: region conversion allocation failed"); return; }
+    }
+    convert_image_blit_regions(info.pRegions, info.regionCount, regions);
+    vkCmdBlitImage(cb->buffer, info.srcImage, info.srcImageLayout, info.dstImage, info.dstImageLayout,
+                   info.regionCount, regions, info.filter);
+}
+
 // --- Commands -------------------------------------------------------------------------
 
 void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
@@ -789,7 +976,7 @@ void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
         .regionCount = 1,
         .pRegions    = &region,
     };
-    vkCmdCopyBuffer2(cmd->buffer, &copy_info);
+    backend_copy_buffer(cmd, copy_info);
 }
 
 void cmd_copy_to_texture(CommandBuffer                cmd,
@@ -834,7 +1021,7 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
         .regionCount    = 1,
         .pRegions       = &region,
     };
-    vkCmdCopyBufferToImage2(cmd->buffer, &copy_info);
+    backend_copy_buffer_to_image(cmd, copy_info);
 }
 
 void cmd_copy_from_texture(CommandBuffer                cmd,
@@ -879,7 +1066,7 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
         .regionCount    = 1,
         .pRegions       = &region,
     };
-    vkCmdCopyImageToBuffer2(cmd->buffer, &copy_info);
+    backend_copy_image_to_buffer(cmd, copy_info);
 }
 
 void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
@@ -974,7 +1161,7 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
             .pRegions       = &region,
             .filter         = VK_FILTER_LINEAR,
         };
-        vkCmdBlitImage2(cmd->buffer, &info);
+        backend_blit_image(cmd, info);
 
         // Serialize blit write (mip i) vs next blit read (mip i).
         if (i + 1 < tex.mip_count) {

@@ -29,6 +29,7 @@ using namespace gpu;
 // pipeline.cpp / platform_utils.cpp).
 namespace gpu {
 struct DeviceImpl;
+struct CommandBufferImpl;
 uint32_t  debug_live_pipelines(DeviceImpl*);         // records in the dedup map
 uintptr_t debug_last_compile_thread(DeviceImpl*);    // thread that last compiled natively
 void      debug_set_compiler_paused(DeviceImpl*, bool);
@@ -46,6 +47,16 @@ void debug_force_legacy_barriers(DeviceImpl*, bool force);
 bool debug_bindless_null_slot_written(DeviceImpl*);
 // Legacy barrier stage bits for the public StageFlags (test-only exposure).
 uint32_t debug_legacy_stage_mask(StageFlags stage);
+// Backend copy wrappers + conversions (commands.cpp) — GPU-independent tests.
+void backend_copy_buffer(CommandBufferImpl*, const VkCopyBufferInfo2&);
+void backend_copy_buffer_to_image(CommandBufferImpl*, const VkCopyBufferToImageInfo2&);
+void backend_copy_image_to_buffer(CommandBufferImpl*, const VkCopyImageToBufferInfo2&);
+void backend_blit_image(CommandBufferImpl*, const VkBlitImageInfo2&);
+void convert_buffer_copy_regions(const VkBufferCopy2* src, uint32_t count, VkBufferCopy* dst);
+void convert_buffer_image_copy_regions(const VkBufferImageCopy2* src, uint32_t count, VkBufferImageCopy* dst);
+void convert_image_blit_regions(const VkImageBlit2* src, uint32_t count, VkImageBlit* dst);
+void debug_force_legacy_copy(DeviceImpl*, bool force);
+int64_t debug_stat(DeviceImpl*, int which);
 uintptr_t current_thread_id();                       // platform primitive (worker uses it too)
 }
 
@@ -2988,6 +2999,113 @@ static void test_bindless_null_handle() {
     destroy_device(d);
 }
 
+// --- Test 36: copy region conversion helpers (GPU-independent) ----------------------
+// Field-fidelity checks for the legacy copy conversions: offsets, sizes,
+// subresource layers, mip levels, image offsets/extents, 64-bit buffer
+// offsets, multi-region arrays. No Vulkan device is required.
+static void test_copy_conversions() {
+    printf("--- Test: copy conversion helpers ---\n");
+
+    // Buffer copy: single + multiple regions, 64-bit offsets.
+    {
+        const VkBufferCopy2 src2[3] = {
+            {VK_STRUCTURE_TYPE_BUFFER_COPY_2, nullptr, 0, 0x1000ull, 64},
+            {VK_STRUCTURE_TYPE_BUFFER_COPY_2, nullptr, 0x2000ull, 0x40000000ull, 128},
+            {VK_STRUCTURE_TYPE_BUFFER_COPY_2, nullptr, 0xFFFFFFFFull, 0x1ull, 4096},
+        };
+        VkBufferCopy dst[3];
+        convert_buffer_copy_regions(src2, 3, dst);
+        CHECK(dst[0].srcOffset == 0 && dst[0].dstOffset == 0x1000ull && dst[0].size == 64,
+              "buffer copy region 0 fields");
+        CHECK(dst[1].srcOffset == 0x2000ull && dst[1].dstOffset == 0x40000000ull && dst[1].size == 128,
+              "buffer copy region 1 (64-bit offsets)");
+        CHECK(dst[2].srcOffset == 0xFFFFFFFFull && dst[2].dstOffset == 1 && dst[2].size == 4096,
+              "buffer copy region 2");
+    }
+    // Buffer<->image copy: subresource layers, mips, 3D offsets/extents.
+    {
+        const VkBufferImageCopy2 src2[2] = {
+            {VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2, nullptr,
+             0x8000ull, 256, 128,
+             {VK_IMAGE_ASPECT_COLOR_BIT, 3, 2, 4},
+             {1, 2, 3}, {8, 8, 1}},
+            {VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2, nullptr,
+             0, 0, 0,
+             {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+             {0, 0, 0}, {16, 16, 16}},
+        };
+        VkBufferImageCopy dst[2];
+        convert_buffer_image_copy_regions(src2, 2, dst);
+        CHECK(dst[0].bufferOffset == 0x8000ull && dst[0].bufferRowLength == 256 &&
+                  dst[0].bufferImageHeight == 128, "image copy region 0 buffer fields");
+        CHECK(dst[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+                  dst[0].imageSubresource.mipLevel == 3 && dst[0].imageSubresource.baseArrayLayer == 2 &&
+                  dst[0].imageSubresource.layerCount == 4, "image copy region 0 subresource");
+        CHECK(dst[0].imageOffset.x == 1 && dst[0].imageOffset.y == 2 && dst[0].imageOffset.z == 3 &&
+                  dst[0].imageExtent.width == 8 && dst[0].imageExtent.height == 8, "image copy region 0 geometry");
+        CHECK(dst[1].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                  dst[1].imageExtent.depth == 16, "image copy region 1 (depth aspect + 3D extent)");
+    }
+    // Blit: subresources + 6 offsets per region.
+    {
+        const VkImageBlit2 src2[1] = {
+            {VK_STRUCTURE_TYPE_IMAGE_BLIT_2, nullptr,
+             {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1},
+             {{0, 0, 0}, {32, 32, 1}},
+             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+             {{4, 4, 0}, {28, 28, 1}}},
+        };
+        VkImageBlit dst[1];
+        convert_image_blit_regions(src2, 1, dst);
+        CHECK(dst[0].srcSubresource.mipLevel == 1 &&
+                  dst[0].srcOffsets[0].x == 0 && dst[0].srcOffsets[1].x == 32 &&
+                  dst[0].dstOffsets[0].x == 4 && dst[0].dstOffsets[1].x == 28,
+              "blit region subresource + offsets");
+    }
+    // Zero regions: legal no-op (nothing written).
+    {
+        VkBufferCopy dst[1] = {{0, 0, 0}};
+        convert_buffer_copy_regions(nullptr, 0, dst);
+        CHECK(dst[0].size == 0, "zero-region conversion is a no-op");
+    }
+}
+
+// --- Test 37: forced legacy-copy path counters ---------------------------------------
+// Forces the legacy copy path on a working device and verifies the path is
+// actually taken via the counters (not only by visual output).
+static void test_forced_legacy_copy() {
+    printf("--- Test: forced legacy copy path ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    if (d == nullptr) { return; }
+
+    debug_force_legacy_copy(d, true);
+
+    // memcpy roundtrip through the legacy path.
+    Queue q = get_queue(d);
+    GpuPtr src = malloc(d, 256, Memory::Default);
+    GpuPtr dst = malloc(d, 256, Memory::Default);
+    auto* sh = reinterpret_cast<uint32_t*>(get_host_pointer(d, src));
+    for (int i = 0; i < 64; ++i) { sh[i] = 0xCAFE0000u + i; }
+    CommandBuffer cmd = queue_start_command_recording(q);
+    cmd_memcpy(cmd, dst, src, 256);
+    cmd_finalize(cmd);
+    Submission s = queue_submit(q, {&cmd, 1});
+    CHECK(s.status == SubmitStatus::Success, "submit failed");
+    CHECK(wait_submission(s), "copy did not complete");
+    auto* dh = reinterpret_cast<uint32_t*>(get_host_pointer(d, dst));
+    CHECK(dh[0] == 0xCAFE0000u && dh[63] == 0xCAFE003Fu, "legacy-copy memcpy result");
+    CHECK(debug_stat(d, 1) > 0, "legacy copy counter advanced");
+    CHECK(debug_stat(d, 0) == 0, "no copy2 calls on the forced legacy path");
+
+    free(d, src); free(d, dst);
+    destroy_device(d);
+}
+
 // --- Test 32: capability-gated 8/16-bit storage ABI -------------------------------
 // The mandatory ABI test avoids 8/16-bit storage (optional device
 // capabilities). Reading 8/16-bit members through a physical-storage-buffer
@@ -3120,6 +3238,8 @@ int main() {
     test_validation_smoke();
     test_legacy_barrier_forced();
     test_bindless_null_handle();
+    test_copy_conversions();
+    test_forced_legacy_copy();
 
     printf("\n=================\n");
     if (g_failures == 0) {
