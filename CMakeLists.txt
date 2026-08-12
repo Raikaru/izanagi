@@ -213,50 +213,59 @@ if(IZANAGI_BUILD_TESTS OR IZANAGI_BUILD_EXAMPLES)
     include(cmake/CompileSlangShader.cmake)
 endif()
 
+# Shader artifacts must land next to the executables: multi-config generators
+# place binaries under bin/<CONFIG>/, single-config generators under bin/.
+get_property(IZANAGI_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(IZANAGI_MULTI_CONFIG)
+    set(IZANAGI_SHADER_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders")
+else()
+    set(IZANAGI_SHADER_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders")
+endif()
+
 # --- Tests --------------------------------------------------------------------
 if(IZANAGI_BUILD_TESTS)
     add_slang_shader(izanagi_test_shaders
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/memcpy_kernel.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/memcpy_kernel.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/memcpy_kernel.spv
     )
     add_slang_shader(izanagi_test_shaders2
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/spec_mul_kernel.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/spec_mul_kernel.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/spec_mul_kernel.spv
     )
     add_slang_shader(izanagi_test_shaders3
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/offscreen_triangle.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/offscreen_triangle.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/offscreen_triangle.spv
     )
     add_slang_shader(izanagi_test_shaders4
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/dual_src.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/dual_src.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/dual_src.spv
     )
     # Phase 2: typed-pointer battery + GPU ABI test compile under BOTH
     # profiles; the native-only shader compiles natively and must FAIL under
     # the bindless profile (asserted by the negative test below).
     add_slang_shader(izanagi_test_shaders5
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/ptr_types.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/ptr_types.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/ptr_types.spv
     )
     add_slang_shader(izanagi_test_shaders6
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/abi_test.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/abi_test.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/abi_test.spv
     )
     add_slang_shader(izanagi_test_shaders7
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/abi_int8_16.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/abi_int8_16.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/abi_int8_16.spv
     )
     add_slang_shader(izanagi_test_shaders8
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/null_sample.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/null_sample.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/null_sample.spv
     )
     add_slang_shader(izanagi_test_shaders_untyped NATIVE_ONLY
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/untyped_negative.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/untyped_negative.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/untyped_negative.spv
     )
     add_slang_negative_test(izanagi_test_shaders_untyped_neg
         SOURCE ${CMAKE_SOURCE_DIR}/tests/shaders/untyped_negative.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/untyped_negative.negstamp
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/untyped_negative.negstamp
     )
 
     add_executable(izanagi_tests tests/api_tests.cpp)
@@ -318,15 +327,15 @@ endif()
 if(IZANAGI_BUILD_EXAMPLES AND IZANAGI_WSI STREQUAL "WIN32")
     add_slang_shader(izanagi_example_shaders
         SOURCE ${CMAKE_SOURCE_DIR}/examples/shaders/hello_triangle.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/hello_triangle.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/hello_triangle.spv
     )
     add_slang_shader(izanagi_example_shaders2
         SOURCE ${CMAKE_SOURCE_DIR}/examples/shaders/compute_texture.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/compute_texture.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/compute_texture.spv
     )
     add_slang_shader(izanagi_example_shaders3
         SOURCE ${CMAKE_SOURCE_DIR}/examples/shaders/textured_cube.slang
-        OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/shaders/textured_cube.spv
+        OUTPUT ${IZANAGI_SHADER_OUTPUT_DIR}/textured_cube.spv
     )
 
     add_executable(izanagi_examples WIN32
