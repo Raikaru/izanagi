@@ -12,7 +12,11 @@
 
 using namespace gpu;
 
-static void log_cb(LogLevel, Span<const char>, uint32_t, Span<const char>, void*) {}
+static void log_cb(LogLevel level, Span<const char> msg, uint32_t line, Span<const char> file, void*) {
+    fprintf(stderr, "[izanagi:%u] %.*s (%.*s:%u)\n", static_cast<unsigned>(level),
+            static_cast<int>(msg.size()), msg.data(),
+            static_cast<int>(file.size()), file.data(), line);
+}
 
 static const char* backend_name() {
     switch (device_backend_profile()) {
@@ -25,7 +29,7 @@ static const char* backend_name() {
 int main() {
     DeviceDesc desc{
         .log_callback = log_cb,
-        .log_level    = LogLevel::Error,
+        .log_level    = LogLevel::Info,
     };
     Device dev = create_device(desc);
     if (dev == nullptr) {
