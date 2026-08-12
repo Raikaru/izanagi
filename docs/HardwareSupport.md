@@ -12,8 +12,9 @@ only a *testing* label, used to organize which devices were actually run.
 | NVIDIA GeForce RTX 4080 Laptop GPU | Windows 11, NVIDIA driver 610.88 | 1.4.341 | Native + Bindless | Full suite passes (both profiles) |
 | NVIDIA GeForce RTX 4080 via D3D12 (**dzn**) | WSL Ubuntu / mesa 26.2.0 dzn | 1.2.354 | Bindless | Full suite passes (42/42) |
 | Lavapipe (mesa, CPU) | CI runner (ubuntu-latest, headless) | 1.x (CPU) | Bindless | Probe job added; qualification pending first successful CI run (non-authoritative) |
+| Qualcomm Adreno 650 (Galaxy S20+ 5G) via Mesa **Turnip** | Debian arm64 (Termux/proot), mesa 26.2.0-devel Turnip/KGSL | 1.3.354 | Bindless | Full suite passes |
 
-**This is the only physical hardware tested so far.** No Maxwell, Polaris,
+**Physical hardware tested: the RTX 4080 rig and the Adreno 650 phone.** No Maxwell, Polaris,
 Skylake, GCN, or Intel device has been qualified. The bindless profile's
 legacy fallbacks are now **runtime-exercised**: the legacy copy/blit path and
 the private static graphics-state fallback run the full suite on the RTX 4080

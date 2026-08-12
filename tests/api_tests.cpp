@@ -1738,15 +1738,10 @@ static void test_async_pipeline_pending_and_failed() {
     poll_live_pipelines(impl, 0);
 
     // Failed: a valid module with a MISSING entry point must fail
-    // deterministically on the worker. Some limited 1.2 drivers (Mesa's
-    // experimental dzn) trap the process on ANY SPIR-V parse failure
-    // instead of returning an error, so the injection is gated on the
-    // observable dispatch signature (1.2 + legacy copy + static state) —
-    // behavior-based, never vendor-ID-based. 1.3+ drivers always run it.
-    const bool robust_shader_errors = !gpu::debug_limited_1_2(impl);
-    if (!robust_shader_errors) {
-        printf("  (bad-shader injection skipped: driver traps on SPIR-V parse failures)\n");
-    } else {
+    // deterministically on the worker. The backend validates the SPIR-V
+    // header and entry point before the driver ever sees the module, so this
+    // is safe on drivers that trap on invalid modules (Mesa dzn, Turnip).
+    {
         std::string failed_path = find_shader_path("memcpy_kernel.spv");
         auto failed_spirv = load_spirv(failed_path.c_str(), &arena);
         CHECK(failed_spirv.size() > 0, "Failed to load memcpy_kernel.spv for the failure path");
@@ -3642,8 +3637,9 @@ static void test_baked_state_readback() {
         .depth_format  = Format::Depth32Float,
         .color_targets = Span<const ColorTarget>(&color_target, 1),
     };
+    // Stencil-only target: depth and stencil may not be two distinct images
+    // under Vulkan dynamic rendering, and the stencil checks disable depth.
     RasterDesc raster_stencil{
-        .depth_format   = Format::Depth32Float,
         .stencil_format = Format::Stencil8,
         .color_targets  = Span<const ColorTarget>(&color_target, 1),
     };
@@ -3726,7 +3722,7 @@ static void test_baked_state_readback() {
         };
         RenderPassDesc pass_desc{
             .color_attachments = Span<const RenderAttachment>(&color_att, 1),
-            .depth_attachment  = depth_att,
+            .depth_attachment  = use_stencil ? RenderAttachment{} : depth_att,
             .stencil_attachment = use_stencil ? stencil_att : RenderAttachment{},
             .render_area       = Rect2D{.width = kSize, .height = kSize},
         };

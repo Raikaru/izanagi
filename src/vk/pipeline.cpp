@@ -298,8 +298,49 @@ static VkSpecializationInfo rebuild_spec_info(Arena* arena, const PipelineRecord
     };
 }
 
+// SPIR-V pre-validation. Drivers are not required to survive modules that
+// violate the pName VUIDs (Turnip faults inside its NIR lowering on a
+// missing entry point; dzn traps on parse failures). Validate the header and
+// the requested entry point on the worker before the driver ever sees the
+// module, so invalid shaders retire deterministically as
+// PipelineStatus::Failed on every driver.
+static uint32_t spirv_word(const uint8_t* bytes, uint32_t index) {
+    uint32_t w;
+    memcpy(&w, bytes + index * 4u, 4);  // module bytes are not 4-aligned in key_block
+    return w;
+}
+
+static bool spirv_has_entry_point(const uint8_t* bytes, uint32_t size, const char* entry) {
+    if (bytes == nullptr || entry == nullptr) { return false; }
+    if (size < 20 || (size % 4u) != 0) { return false; }
+    const uint32_t count = size / 4u;
+    if (spirv_word(bytes, 0) != 0x07230203u) { return false; }
+    uint32_t i = 5;
+    while (i < count) {
+        const uint32_t inst = spirv_word(bytes, i);
+        const uint32_t len  = inst >> 16;
+        const uint32_t op   = inst & 0xFFFFu;
+        if (len == 0 || i + len > count) { return false; }  // malformed stream
+        if (op == 15u /*OpEntryPoint*/ && len >= 4) {
+            // Literal name starts at operand word 3 and is nul-terminated
+            // within the instruction.
+            const uint8_t* name      = bytes + (i + 3u) * 4u;
+            const uint32_t max_bytes = (len - 3u) * 4u;
+            uint32_t j = 0;
+            while (j < max_bytes && name[j] != '\0' && entry[j] != '\0' && name[j] == entry[j]) { ++j; }
+            if (j < max_bytes && name[j] == '\0' && entry[j] == '\0') { return true; }
+        }
+        i += len;
+    }
+    return false;
+}
+
 static VkResult compile_compute(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
                                 bool fail_on_compile, VkPipeline* out) {
+    if (!spirv_has_entry_point(rec->vs_bytes, rec->vs_size, rec->vs_entry)) {
+        IZ_LOG(d, LogLevel::Error, "compile_compute: SPIR-V module invalid or entry point not found");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     VkSpecializationInfo spec = rebuild_spec_info(arena, *rec);
 
     VkShaderModuleCreateInfo module_info{
@@ -390,6 +431,19 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
     const bool static_state = d->dispatch.use_static_graphics_state;
     LogicalGraphicsState defaults;
     const LogicalGraphicsState& gs = (baked != nullptr) ? *baked : defaults;
+
+    if (!spirv_has_entry_point(rec->vs_bytes, rec->vs_size, rec->vs_entry) ||
+        !spirv_has_entry_point(rec->fs_bytes, rec->fs_size, rec->fs_entry)) {
+        IZ_LOG(d, LogLevel::Error, "compile_graphics: SPIR-V module invalid or entry point not found");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    // Depth and stencil formats must be a single combined format (or one
+    // absent): dynamic rendering forbids two distinct depth/stencil images.
+    if (rec->depth_format != Format::None && rec->stencil_format != Format::None &&
+        rec->depth_format != rec->stencil_format) {
+        IZ_LOG(d, LogLevel::Error, "compile_graphics: depth and stencil formats must match (combined format) or one must be None");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
 
     VkSpecializationInfo spec = rebuild_spec_info(arena, *rec);
 
