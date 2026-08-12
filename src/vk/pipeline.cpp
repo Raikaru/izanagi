@@ -10,6 +10,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 #include "internal.h"
 
@@ -1156,19 +1158,44 @@ PipelineStatus get_pipeline_status(Device dev, Handle<Pipeline> pipeline) {
     }
 }
 
+// Blocks on a record's state machine until Ready/Failed or the timeout.
+// timeout_ms == 0 waits forever (condvar); a nonzero timeout polls with a
+// bounded sleep (at most 200 us or the remaining budget) so the deadline is
+// honored even when no completion signal arrives in time. Works for base
+// pipeline records AND static-variant records (same state/mutex/condvar
+// members).
+template <typename Rec>
+static bool wait_record_state(Rec* rec, uint64_t timeout_ms) {
+    mutex_lock(&rec->wait_mutex);
+    const double t0 = monotonic_seconds();
+    bool ready = false;
+    for (;;) {
+        const InternalPipelineState st = rec->state.load(std::memory_order_acquire);
+        if (st == InternalPipelineState::Ready) { ready = true; break; }
+        if (st == InternalPipelineState::Failed) { break; }
+        if (timeout_ms != 0) {
+            const double elapsed_ms = (monotonic_seconds() - t0) * 1000.0;
+            if (elapsed_ms >= static_cast<double>(timeout_ms)) { break; }
+            const double remaining_us =
+                (static_cast<double>(timeout_ms) - elapsed_ms) * 1000.0;
+            mutex_unlock(&rec->wait_mutex);
+            std::this_thread::sleep_for(std::chrono::microseconds(
+                static_cast<uint64_t>(remaining_us < 200.0 ? remaining_us : 200.0)));
+            mutex_lock(&rec->wait_mutex);
+            continue;
+        }
+        condvar_wait(&rec->wait_cv, &rec->wait_mutex);
+    }
+    mutex_unlock(&rec->wait_mutex);
+    return ready;
+}
+
 bool wait_pipeline(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
     const double t0 = monotonic_seconds();
 
-    mutex_lock(&rec->wait_mutex);
-    for (;;) {
-        const InternalPipelineState st = rec->state.load(std::memory_order_acquire);
-        if (st == InternalPipelineState::Ready || st == InternalPipelineState::Failed) { break; }
-        condvar_wait(&rec->wait_cv, &rec->wait_mutex);
-    }
-    const bool ready = rec->state.load(std::memory_order_acquire) == InternalPipelineState::Ready;
-    mutex_unlock(&rec->wait_mutex);
+    const bool ready = wait_record_state(rec, /*timeout_ms=*/0);
 
     const double waited_ms = (monotonic_seconds() - t0) * 1000.0;
     if (waited_ms > 0.5) {
@@ -1258,7 +1285,7 @@ bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const Graphic
     PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
     if (!d->dispatch.use_static_graphics_state ||
         rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
-        return wait_pipeline(device, pipeline);
+        return wait_record_state(rec, timeout_ms);
     }
     LogicalGraphicsState gs;
     gs.front_face = desc.front_face;
@@ -1266,23 +1293,10 @@ bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const Graphic
     if (desc.depth_stencil.h != 0) {
         apply_depth_stencil_to_shadow(d->depth_stencil_pool[desc.depth_stencil].desc, gs);
     }
-    if (is_default_baked_state(gs)) { return wait_pipeline(device, pipeline); }
+    if (is_default_baked_state(gs)) { return wait_record_state(rec, timeout_ms); }
     StaticVariantRecord* v = find_or_request_static_variant(d, rec, gs);
     if (v == nullptr) { return false; }
-    mutex_lock(&v->wait_mutex);
-    const double t0 = monotonic_seconds();
-    bool ready = false;
-    for (;;) {
-        const InternalPipelineState st = v->state.load(std::memory_order_acquire);
-        if (st == InternalPipelineState::Ready) { ready = true; break; }
-        if (st == InternalPipelineState::Failed) { break; }
-        if (timeout_ms != 0 && (monotonic_seconds() - t0) * 1000.0 >= static_cast<double>(timeout_ms)) {
-            break;
-        }
-        condvar_wait(&v->wait_cv, &v->wait_mutex);
-    }
-    mutex_unlock(&v->wait_mutex);
-    return ready;
+    return wait_record_state(v, timeout_ms);
 }
 
 // --- Persistent cache ----------------------------------------------------------------------

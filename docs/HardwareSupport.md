@@ -10,30 +10,36 @@ only a *testing* label, used to organize which devices were actually run.
 | Device | OS / driver | API | Profile | Result |
 |---|---|---|---|---|
 | NVIDIA GeForce RTX 4080 Laptop GPU | Windows 11, NVIDIA driver 610.88 | 1.4.341 | Native + Bindless | Full suite passes (both profiles) |
+| NVIDIA GeForce RTX 4080 via D3D12 (**dzn**) | WSL Ubuntu / mesa 26.2.0 dzn | 1.2.354 | Bindless | Full suite passes (42/42) |
+| Lavapipe (mesa, CPU) | CI runner (ubuntu-latest, headless) | 1.x (CPU) | Bindless | Probe job added; qualification pending first successful CI run (non-authoritative) |
 
-**This is the only hardware tested so far.** No Maxwell, Polaris, Skylake,
-GCN, or Intel device has been qualified. The bindless profile's legacy
-fallbacks (snapshot descriptor sets, render-pass fallback, legacy copy/blit,
-static dynamic state) are gated behind explicit device-creation gates and are
-not runtime-exercised on this machine (its driver has all the modern
-features); the legacy barrier path is force-tested on this device.
+**This is the only physical hardware tested so far.** No Maxwell, Polaris,
+Skylake, GCN, or Intel device has been qualified. The bindless profile's
+legacy fallbacks are now **runtime-exercised**: the legacy copy/blit path and
+the private static graphics-state fallback run the full suite on the RTX 4080
+Windows rig (both profiles, forced configurations) and on the WSL dzn rig
+(the dzn configuration selects exactly those fallbacks). RADV/NVK/ANV remain
+**unqualified** (no hardware; the `tools/run_hardware_qualification.sh`
+bundle + hardware-qualification issue template exist for volunteered
+reports).
 
-### dzn (Vulkan-on-D3D12 in WSL) probing — 2026-08-11
+### dzn (Vulkan-on-D3D12 in WSL) — qualified on the test rig — 2026-08-12
 
-The bindless feature probe ran against mesa 26.2.0's dzn (RTX 4080 through
-D3D12, api 1.2.354): **every bindless-required capability is present**
-(BDA, int64, scalar block layout, non-uniform indexing, sampled/storage
-update-after-bind, partially-bound, runtime + variable-count arrays,
-update-unused-while-pending, timeline semaphores, draw-indirect-count; 1M
-descriptor capacities), plus dynamic rendering + synchronization2 (KHR
-forms). Missing: `VK_KHR_copy_commands2` and
-`VK_EXT_extended_dynamic_state`. The 1.2 dispatch route (core-1.3 commands
-aliased to KHR/EXT entry points) is built, but dzn only exports the
-dynamic-rendering/sync2 extension entry points — not the two missing
-families — so dzn is **selection-rejected** today with the exact
-missing-extension list (`VK_KHR_copy_commands2`, then
-`VK_EXT_extended_dynamic_state`). It has not run the suite; the legacy-copy
-and static-dynamic-state fallbacks are the prerequisite (next phase).
+mesa 26.2.0's dzn (RTX 4080 through D3D12, api 1.2.354): **every
+bindless-required capability is present** (BDA, int64, scalar block layout,
+non-uniform indexing, sampled/storage update-after-bind, partially-bound,
+runtime + variable-count arrays, update-unused-while-pending, timeline
+semaphores, draw-indirect-count; 1M descriptor capacities), plus dynamic
+rendering + synchronization2 (KHR forms). Missing: `VK_KHR_copy_commands2`
+and `VK_EXT_extended_dynamic_state` — the dispatch route selects the private
+legacy-copy fallback and the private static graphics-state fallback, and the
+**full 42-test suite passes** (compute, copies, graphics draws with private
+static variants, variant Pending/recovery, baked-state readback matrices).
+Caveats: the experimental dzn driver traps the process on any malformed
+SPIR-V (the bad-shader failure-injection test is gated off on the
+limited-1.2 dispatch signature), and dzn's `WARNING: dzn is not a conformant
+Vulkan implementation` banner is expected. "Qualified" here means
+suite-green on this test rig — not a driver-conformance claim.
 
 ## Tiers
 
@@ -59,9 +65,12 @@ samplers; the exact numbers per device are reported by
 
 ## Known driver limitations
 
-- The initial bindless slice requires Vulkan 1.3 + dynamic rendering +
-  synchronization2 + update-unused-while-pending (each gated with a logged
-  reason in `create_device`; the fallbacks land in later phases).
+- The initial bindless slice requires dynamic rendering + synchronization2 +
+  update-unused-while-pending (gated with a logged reason). Devices without
+  `VK_KHR_copy_commands2` get the legacy copy/blit fallback; devices without
+  `VK_EXT_extended_dynamic_state` get the private static graphics-state
+  fallback (static pipeline variants + the `request_graphics_state` prewarm).
+  Both are selected by capability, never by vendor or generation name.
 - Validation-layer runs require the Vulkan SDK's `VK_LAYER_KHRONOS_validation`
   (test 33 reports when the layer is absent).
 - No guarantee is based on the Vulkan version alone; no guarantee is based on

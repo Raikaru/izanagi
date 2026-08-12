@@ -69,6 +69,39 @@ if (cmd_set_pipeline(cmd, compute_pipeline)) {
 Ignoring the return value is valid source-level usage for code that only binds
 blocking-created pipelines.
 
+## Static graphics-state variants (fallback devices)
+
+Devices without `VK_EXT_extended_dynamic_state` (e.g. Mesa dzn) cannot apply
+front face, cull, depth, or stencil state dynamically. The bindless backend
+compiles that state into **private static pipeline variants** on the same
+compiler worker:
+
+- a per-command-buffer `LogicalGraphicsState` shadow classifies each member
+  baked (front face, cull, depth test/write/compare/bounds, stencil test +
+  ops) vs core-dynamic (viewport, scissor, depth bias, stencil
+  reference/masks — always applied directly);
+- draws resolve the variant for (bound base pipeline, baked shadow): the
+  default baked state binds the base pipeline itself; a non-default state
+  binds a deduped private variant. Variants are map-owned for their base
+  pipeline's lifetime (the queued job retains the base; eviction is
+  allocation-free on the base's final release);
+- a variant still compiling fails the command buffer deterministically
+  (`SubmitStatus::Error`, no timeline advance) — the same no-silent-
+  substitution contract as `cmd_set_pipeline` failing for a Pending base.
+
+Prewarming works through the dedicated API (loading screens / hot paths),
+which the command-buffer setters match exactly (identical baked-shadow
+derivation):
+
+```cpp
+GraphicsStateDesc gs{.depth_stencil = ds, .front_face = FrontFace::CW, .cull = Cull::Back};
+PipelineStatus st = request_graphics_state(device, pipeline, gs);  // never blocks
+bool ready = wait_graphics_state(device, pipeline, gs);            // blocks to Ready/Failed
+```
+
+On devices WITH extended dynamic state this API is a no-op wrapper over the
+base pipeline (status mirrors the base).
+
 ## Prewarming
 
 There is no "compile every permutation" operation. A prewarm set is just a set
