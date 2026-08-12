@@ -3607,6 +3607,284 @@ static void test_static_variant_pending() {
 }
 
 
+// --- Test 41: baked graphics-state readback matrix ------------------------------------
+// Renders the offscreen triangle (front-facing at CCW under the viewport
+// Y-flip, z = 0.5) with different baked states and verifies the READBACK
+// reflects each state: cull culls, front-face flips, the depth compare op
+// rejects, the stencil compare rejects, and the core-dynamic viewport
+// clips. On the static fallback the baked members are carried by private
+// pipeline variants; on the dynamic path by extended dynamic state — the
+// rendering contract is identical either way.
+static void test_baked_state_readback() {
+    printf("--- Test: baked graphics-state readback matrix ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    if (d == nullptr) { return; }
+    const bool static_mode = debug_using_static_state(d);
+
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    auto spirv = load_spirv(find_shader_path("offscreen_triangle.spv").c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vs_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fs_src{.source = spirv, .entry_point = "fragment_main"_sv};
+
+    constexpr uint32_t kSize = 64;
+    ColorTarget color_target{.format = Format::RGBA8Unorm};
+    RasterDesc raster_plain{
+        .depth_format  = Format::Depth32Float,
+        .color_targets = Span<const ColorTarget>(&color_target, 1),
+    };
+    RasterDesc raster_stencil{
+        .depth_format   = Format::Depth32Float,
+        .stencil_format = Format::Stencil8,
+        .color_targets  = Span<const ColorTarget>(&color_target, 1),
+    };
+    Handle<Pipeline> p_plain = create_graphics_pipeline(d, vs_src, fs_src, raster_plain);
+    Handle<Pipeline> p_stencil = create_graphics_pipeline(d, vs_src, fs_src, raster_stencil);
+    CHECK(p_plain.h != 0 && p_stencil.h != 0, "graphics pipelines created");
+
+    // Depth-stencil states: depth disabled (cull/front/viewport pairs),
+    // depth Less, depth Greater, stencil Equal ref 0, stencil Equal ref 7.
+    DepthStencilDesc ds_none_desc{.depth_mode = DepthFlags::None};
+    DepthStencilDesc ds_less_desc{.depth_mode = DepthFlags::Read | DepthFlags::Write, .depth_test = Op::Less};
+    DepthStencilDesc ds_greater_desc{.depth_mode = DepthFlags::Read | DepthFlags::Write, .depth_test = Op::Greater};
+    DepthStencilDesc ds_stencil0_desc{
+        .depth_mode = DepthFlags::None,
+        .stencil_read_mask = 0xff, .stencil_write_mask = 0xff,
+        .stencil_front = Stencil{.test = Op::Equal, .fail_op = StencilOp::Keep,
+                                 .pass_op = StencilOp::Keep, .depth_fail_op = StencilOp::Keep, .reference = 0},
+        .stencil_back = Stencil{.test = Op::Equal, .fail_op = StencilOp::Keep,
+                                .pass_op = StencilOp::Keep, .depth_fail_op = StencilOp::Keep, .reference = 0},
+    };
+    DepthStencilDesc ds_stencil7_desc = ds_stencil0_desc;
+    ds_stencil7_desc.stencil_front.reference = 7;
+    ds_stencil7_desc.stencil_back.reference  = 7;
+    Handle<DepthStencilState> ds_none     = create_depth_stencil_state(d, ds_none_desc);
+    Handle<DepthStencilState> ds_less     = create_depth_stencil_state(d, ds_less_desc);
+    Handle<DepthStencilState> ds_greater  = create_depth_stencil_state(d, ds_greater_desc);
+    Handle<DepthStencilState> ds_stencil0 = create_depth_stencil_state(d, ds_stencil0_desc);
+    Handle<DepthStencilState> ds_stencil7 = create_depth_stencil_state(d, ds_stencil7_desc);
+
+    // The triangle's framebuffer winding (after the viewport Y-flip) is
+    // discovered empirically below; every check pair derives from it. On the
+    // static path every distinct baked variant must be prewarmed before its
+    // first draw so no Pending rejection fires inside the test.
+    auto prewarm = [&](Handle<Pipeline> p, Handle<DepthStencilState> ds, FrontFace f, Cull c) {
+        if (!static_mode) { return; }
+        GraphicsStateDesc gs{.depth_stencil = ds, .front_face = f, .cull = c};
+        CHECK(wait_graphics_state(d, p, gs), "prewarm variant ready");
+    };
+    prewarm(p_plain, ds_none, FrontFace::CCW, Cull::Front);
+    prewarm(p_plain, ds_none, FrontFace::CCW, Cull::Back);
+
+    TextureDesc color_desc{
+        .type = TextureType::Tex2D, .dimensions = {kSize, kSize, 1},
+        .format = Format::RGBA8Unorm,
+        .usage  = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> color_tex = create_texture(d, color_desc);
+    TextureDesc depth_desc{
+        .type = TextureType::Tex2D, .dimensions = {kSize, kSize, 1},
+        .format = Format::Depth32Float, .usage = UsageFlags::DepthStencilAttachment,
+    };
+    Handle<Texture> depth_tex = create_texture(d, depth_desc);
+    TextureDesc stencil_desc{
+        .type = TextureType::Tex2D, .dimensions = {kSize, kSize, 1},
+        .format = Format::Stencil8, .usage = UsageFlags::DepthStencilAttachment,
+    };
+    Handle<Texture> stencil_tex = create_texture(d, stencil_desc);
+    GpuPtr args_a = malloc(d, 16, Memory::Default);
+    GpuPtr args_b = malloc(d, 16, Memory::Default);
+    Queue q = get_queue(d);
+
+    // One render + readback cycle for a given state; returns whether the
+    // triangle's red pixels are present. viewport_scale < 1 clips the
+    // viewport (core-dynamic on every path); stencil_clear sets the stencil
+    // clear value (clear_color.g).
+    auto render_and_check = [&](Handle<Pipeline> pipeline, FrontFace front, Cull cull,
+                                Handle<DepthStencilState> ds, float viewport_scale,
+                                uint8_t stencil_clear, bool use_stencil) -> bool {
+        RenderAttachment color_att{
+            .texture = color_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
+            .clear_color = Color{20, 20, 40, 255},
+        };
+        RenderAttachment depth_att{
+            .texture = depth_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
+            .clear_color = Color{255, 0, 0, 0},   // depth clear: r/255 = 1.0 (far)
+        };
+        RenderAttachment stencil_att{
+            .texture = stencil_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
+            .clear_color = Color{0, stencil_clear, 0, 0},   // stencil clear: g
+        };
+        RenderPassDesc pass_desc{
+            .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+            .depth_attachment  = depth_att,
+            .stencil_attachment = use_stencil ? stencil_att : RenderAttachment{},
+            .render_area       = Rect2D{.width = kSize, .height = kSize},
+        };
+        CommandBuffer cmd = queue_start_command_recording(q);
+        CHECK(cmd != nullptr, "recording started");
+        cmd_begin_render_pass(cmd, pass_desc);
+        CHECK(cmd_set_pipeline(cmd, pipeline), "pipeline bind accepted");
+        cmd_set_depth_stencil_state(cmd, ds);
+        cmd_set_front_face(cmd, front);
+        cmd_set_cull_mode(cmd, cull);
+        if (viewport_scale < 1.0f) {
+            cmd_set_viewport(cmd, Rect2D{.offset_x = 0, .offset_y = 0,
+                                         .width = (uint32_t)(kSize * viewport_scale),
+                                         .height = (uint32_t)(kSize * viewport_scale)});
+        }
+        cmd_draw(cmd, args_a, args_b, 3, 1);
+        cmd_end_render_pass(cmd);
+        cmd_finalize(cmd);
+        Submission sub = queue_submit(q, {&cmd, 1});
+        CHECK(sub.status == SubmitStatus::Success, "draw submitted");
+        device_wait_for_idle(d);
+
+        GpuPtr readback = malloc(d, kSize * kSize * 4, Memory::Readback);
+        BufferTextureCopyInfo copy_info{.image_extent = {kSize, kSize, 1}};
+        cmd = queue_start_command_recording(q);
+        cmd_copy_from_texture(cmd, color_tex, readback, copy_info);
+        cmd_finalize(cmd);
+        queue_submit(q, {&cmd, 1});
+        device_wait_for_idle(d);
+        auto* pixels = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+        bool found_red = false;
+        for (uint32_t i = 0; i < kSize * kSize; ++i) {
+            const uint8_t* p = pixels + i * 4;
+            if (p[0] > 200 && p[1] < 60 && p[2] < 60) { found_red = true; break; }
+        }
+        free(d, readback);
+        return found_red;
+    };
+
+    // Discover the front-facing winding empirically: exactly one of
+    // (CCW, Front) / (CCW, Back) renders the triangle.
+    const bool visible_with_front_cull =
+        render_and_check(p_plain, FrontFace::CCW, Cull::Front, ds_none, 1.0f, 0, false);
+    const bool visible_with_back_cull =
+        render_and_check(p_plain, FrontFace::CCW, Cull::Back, ds_none, 1.0f, 0, false);
+    CHECK(visible_with_front_cull != visible_with_back_cull,
+          "exactly one cull mode renders the triangle");
+    if (visible_with_front_cull == visible_with_back_cull) {
+        free(d, args_a); free(d, args_b);
+        free(d, color_tex); free(d, depth_tex); free(d, stencil_tex);
+        destroy_device(d);
+        return;
+    }
+    const Cull   visible_cull   = visible_with_front_cull ? Cull::Front : Cull::Back;
+    const Cull   invisible_cull = visible_with_front_cull ? Cull::Back : Cull::Front;
+
+    // Prewarm the remaining combos the checks use (static path).
+    prewarm(p_plain, ds_none,    FrontFace::CW,  visible_cull);
+    prewarm(p_plain, ds_less,    FrontFace::CCW, visible_cull);
+    prewarm(p_plain, ds_greater, FrontFace::CCW, visible_cull);
+    prewarm(p_stencil, ds_stencil0, FrontFace::CCW, visible_cull);
+    prewarm(p_stencil, ds_stencil7, FrontFace::CCW, visible_cull);
+    if (static_mode) {
+        // Six distinct baked states: the two stencil references (0 vs 7)
+        // share one variant — the reference is core-dynamic, never baked.
+        CHECK(debug_stat(d, 5) >= 6, "six distinct baked states compiled");
+    }
+
+    // 1. Cull: the visible cull renders the triangle; the other culls it.
+    CHECK(render_and_check(p_plain, FrontFace::CCW, visible_cull, ds_none, 1.0f, 0, false),
+          "visible cull: triangle renders");
+    CHECK(!render_and_check(p_plain, FrontFace::CCW, invisible_cull, ds_none, 1.0f, 0, false),
+          "opposite cull: triangle culled");
+
+    // 2. Front face: with the visible cull, flipping the front-face winding
+    //    makes the triangle back-facing -> culled.
+    CHECK(!render_and_check(p_plain, FrontFace::CW, visible_cull, ds_none, 1.0f, 0, false),
+          "front-face flip: triangle culled");
+
+    // 3. Depth compare: Less passes against the far clear; Greater rejects.
+    CHECK(render_and_check(p_plain, FrontFace::CCW, visible_cull, ds_less, 1.0f, 0, false),
+          "depth Less: triangle visible");
+    CHECK(!render_and_check(p_plain, FrontFace::CCW, visible_cull, ds_greater, 1.0f, 0, false),
+          "depth Greater: triangle rejected");
+
+    // 4. Viewport (core-dynamic): half-size viewport keeps the triangle in
+    //    the top-left quadrant; the bottom-right quadrant stays clear.
+    CHECK(render_and_check(p_plain, FrontFace::CCW, visible_cull, ds_none, 0.5f, 0, false),
+          "half viewport: triangle still visible");
+    //    Verify the clipped region stayed clear in the same pass.
+    {
+        RenderAttachment color_att{
+            .texture = color_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
+            .clear_color = Color{20, 20, 40, 255},
+        };
+        RenderAttachment depth_att{
+            .texture = depth_tex, .load_op = LoadOp::Clear, .store_op = StoreOp::Store,
+            .clear_color = Color{255, 0, 0, 0},
+        };
+        RenderPassDesc pass_desc{
+            .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+            .depth_attachment  = depth_att,
+            .render_area       = Rect2D{.width = kSize, .height = kSize},
+        };
+        CommandBuffer cmd = queue_start_command_recording(q);
+        cmd_begin_render_pass(cmd, pass_desc);
+        cmd_set_pipeline(cmd, p_plain);
+        cmd_set_depth_stencil_state(cmd, ds_none);
+        cmd_set_front_face(cmd, FrontFace::CCW);
+        cmd_set_cull_mode(cmd, visible_cull);
+        cmd_set_viewport(cmd, Rect2D{.offset_x = 0, .offset_y = 0,
+                                     .width = kSize / 2, .height = kSize / 2});
+        cmd_draw(cmd, args_a, args_b, 3, 1);
+        cmd_end_render_pass(cmd);
+        cmd_finalize(cmd);
+        queue_submit(q, {&cmd, 1});
+        device_wait_for_idle(d);
+        GpuPtr readback = malloc(d, kSize * kSize * 4, Memory::Readback);
+        BufferTextureCopyInfo copy_info{.image_extent = {kSize, kSize, 1}};
+        cmd = queue_start_command_recording(q);
+        cmd_copy_from_texture(cmd, color_tex, readback, copy_info);
+        cmd_finalize(cmd);
+        queue_submit(q, {&cmd, 1});
+        device_wait_for_idle(d);
+        auto* pixels = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+        bool bottom_right_clear = true;
+        for (uint32_t y = kSize / 2; y < kSize && bottom_right_clear; ++y) {
+            for (uint32_t x = kSize / 2; x < kSize; ++x) {
+                const uint8_t* p = pixels + (y * kSize + x) * 4;
+                if (!(p[0] == 20 && p[1] == 20 && p[2] == 40)) { bottom_right_clear = false; break; }
+            }
+        }
+        CHECK(bottom_right_clear, "viewport clipped: bottom-right quadrant stays clear");
+        free(d, readback);
+    }
+
+    // 5. Stencil compare: ref matches the stencil clear -> visible; ref 7
+    //    against a clear of 0 -> every fragment rejected.
+    CHECK(render_and_check(p_stencil, FrontFace::CCW, visible_cull, ds_stencil0, 1.0f, 0, true),
+          "stencil Equal ref 0 (clear 0): visible");
+    CHECK(!render_and_check(p_stencil, FrontFace::CCW, visible_cull, ds_stencil7, 1.0f, 0, true),
+          "stencil Equal ref 7 (clear 0): rejected");
+
+    free(d, args_a);
+    free(d, args_b);
+    free(d, color_tex);
+    free(d, depth_tex);
+    free(d, stencil_tex);
+    for (auto h : {ds_none, ds_less, ds_greater, ds_stencil0, ds_stencil7}) {
+        free_depth_stencil_state(d, h);
+    }
+    free(d, p_plain);
+    free(d, p_stencil);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);   // crash/hang diagnostics: no buffering
     printf("Izanagi API Tests\n");
@@ -3665,6 +3943,7 @@ int main() {
     test_logical_graphics_state();
     test_static_variant_graphics();
     test_static_variant_pending();
+    test_baked_state_readback();
 
     printf("\n=================\n");
     if (g_failures == 0) {
