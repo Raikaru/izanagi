@@ -641,14 +641,18 @@ static VkResult create_logical_device(DeviceImpl* d) {
 
 #if defined(IZ_VK_PROFILE_BINDLESS)
     // Function-pointer validation for the selected dispatch path: every
-    // command the path needs must resolve (the names below compile to the
-    // KHR/EXT entry points via the alias block under bindless).
-    if (vkQueueSubmit2 == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "bindless: vkQueueSubmit2 (synchronization2) entry point missing");
-        return VK_ERROR_FEATURE_NOT_PRESENT;
-    }
-    if (vkCmdPipelineBarrier2 == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "bindless: vkCmdPipelineBarrier2 (synchronization2) entry point missing");
+    // command the path needs must resolve. The names are route-aware — a
+    // device with effective API version >= 1.3 exports the core names; a 1.2
+    // device (e.g. Mesa dzn) exports only the KHR/EXT names. The backend
+    // dispatch helpers select the same way (route_is_core13).
+    if (d->dispatch.effective_api_version >= VK_API_VERSION_1_3) {
+        if (vkQueueSubmit2 == nullptr || vkCmdPipelineBarrier2 == nullptr) {
+            IZ_LOG(d, LogLevel::Error,
+                   "bindless: core 1.3 synchronization2 entry points missing");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+    } else if (vkQueueSubmit2KHR == nullptr || vkCmdPipelineBarrier2KHR == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "bindless: VK_KHR_synchronization2 entry points missing");
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     if (!d->dispatch.use_legacy_copy_commands && vkCmdCopyBuffer2 == nullptr) {
