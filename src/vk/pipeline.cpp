@@ -262,6 +262,7 @@ static PipelineRecord* alloc_record(DeviceImpl* d) {
     if (blk.ptr == nullptr) { return nullptr; }
     auto* rec = ::new (blk.ptr) PipelineRecord();
     condvar_init(&rec->wait_cv);
+    rec->stable_id = static_cast<uint64_t>(atomic_fetch_add(&d->next_pipeline_stable_id, 1));
     return rec;
 }
 
@@ -379,7 +380,15 @@ static VkResult compile_compute(DeviceImpl* d, Arena* arena, PipelineRecord* rec
 }
 
 static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
-                                 bool fail_on_compile, VkPipeline* out) {
+                                 bool fail_on_compile, const LogicalGraphicsState* baked,
+                                 VkPipeline* out) {
+    // baked == nullptr  -> base pipeline (defaults on the static path; the
+    // full extended-dynamic-state set on the dynamic path).
+    // baked != nullptr  -> a private static variant (static path only).
+    const bool static_state = d->dispatch.use_static_graphics_state;
+    LogicalGraphicsState defaults;
+    const LogicalGraphicsState& gs = (baked != nullptr) ? *baked : defaults;
+
     VkSpecializationInfo spec = rebuild_spec_info(arena, *rec);
 
     VkShaderModuleCreateInfo vert_module_info{
@@ -513,8 +522,12 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .depthClampEnable        = false,
         .rasterizerDiscardEnable = false,
         .polygonMode             = VK_POLYGON_MODE_FILL,
-        .cullMode                = VK_CULL_MODE_BACK_BIT,
-        .frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        // Static path: front face + cull are baked (not dynamic).
+        .cullMode                = static_state ? bridge(gs.cull) : VK_CULL_MODE_BACK_BIT,
+        .frontFace               = static_state ? (gs.front_face == FrontFace::CCW
+                                                       ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                       : VK_FRONT_FACE_CLOCKWISE)
+                                                : VK_FRONT_FACE_COUNTER_CLOCKWISE,
         .depthBiasEnable         = false,
         .depthBiasConstantFactor = 0,
         .depthBiasClamp          = 0,
@@ -551,21 +564,72 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
     };
+    // Core-dynamic only: plain viewport/scissor + depth bias + stencil
+    // reference/masks + depth bounds values. The baked members are static in
+    // the pipeline state.
+    VkDynamicState static_dynamic_states[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+    };
+    const VkDynamicState* selected_dynamic_states = dynamic_states;
+    uint32_t dynamic_state_count = static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(VkDynamicState));
+    if (static_state) {
+        selected_dynamic_states = static_dynamic_states;
+        dynamic_state_count     = static_cast<uint32_t>(sizeof(static_dynamic_states) / sizeof(VkDynamicState));
+    }
 
+    // With the plain (non-WithCount) dynamic viewport/scissor states on the
+    // static path, the pipeline must declare the viewport/scissor count the
+    // draw-time commands will set (one each; the WithCount path uses 0).
     VkPipelineViewportStateCreateInfo viewport_state{
         .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .pNext         = nullptr,
         .flags         = 0,
-        .viewportCount = 0,
-        .scissorCount  = 0,
+        .viewportCount = static_state ? 1u : 0u,
+        .scissorCount  = static_state ? 1u : 0u,
     };
 
     VkPipelineDynamicStateCreateInfo dynamic_state{
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext             = nullptr,
         .flags             = 0,
-        .dynamicStateCount = sizeof(dynamic_states) / sizeof(VkDynamicState),
-        .pDynamicStates    = dynamic_states,
+        .dynamicStateCount = dynamic_state_count,
+        .pDynamicStates    = selected_dynamic_states,
+    };
+
+    // Static path: depth/stencil state is baked (compare ops + stencil ops),
+    // with the reference/masks supplied dynamically. Defaults mirror the
+    // public API: depth/stencil disabled, Always compare, Keep ops.
+    VkPipelineDepthStencilStateCreateInfo depth_stencil_state{
+        .sType                 = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext                 = nullptr,
+        .flags                 = 0,
+        .depthTestEnable       = static_state && gs.depth_test_enable,
+        .depthWriteEnable      = static_state && gs.depth_write_enable,
+        .depthCompareOp        = bridge(gs.depth_compare),
+        .depthBoundsTestEnable = static_state && gs.depth_bounds_test_enable,
+        .stencilTestEnable     = static_state && gs.stencil_test_enable,
+        .front                 = {.failOp      = bridge(gs.stencil_front.fail_op),
+                                  .passOp      = bridge(gs.stencil_front.pass_op),
+                                  .depthFailOp = bridge(gs.stencil_front.depth_fail_op),
+                                  .compareOp   = bridge(gs.stencil_front.test),
+                                  .compareMask = 0xff,
+                                  .writeMask   = 0xff,
+                                  .reference   = 0},
+        .back                  = {.failOp      = bridge(gs.stencil_back.fail_op),
+                                  .passOp      = bridge(gs.stencil_back.pass_op),
+                                  .depthFailOp = bridge(gs.stencil_back.depth_fail_op),
+                                  .compareOp   = bridge(gs.stencil_back.test),
+                                  .compareMask = 0xff,
+                                  .writeMask   = 0xff,
+                                  .reference   = 0},
+        .minDepthBounds         = 0.f,
+        .maxDepthBounds         = 1.f,
     };
 
     VkFormat depth_format   = bridge(rec->depth_format);
@@ -609,7 +673,7 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .pViewportState      = &viewport_state,
         .pRasterizationState = &rasterization_state,
         .pMultisampleState   = &multisample_state,
-        .pDepthStencilState  = nullptr,
+        .pDepthStencilState  = static_state ? &depth_stencil_state : nullptr,
         .pColorBlendState    = &color_blend_state,
         .pDynamicState       = &dynamic_state,
 #if defined(IZ_VK_PROFILE_BINDLESS)
@@ -640,7 +704,7 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
 static VkResult compile_record(DeviceImpl* d, Arena* arena, PipelineRecord* rec,
                                bool fail_on_compile, VkPipeline* out) {
     return rec->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS
-               ? compile_graphics(d, arena, rec, fail_on_compile, out)
+               ? compile_graphics(d, arena, rec, fail_on_compile, /*baked=*/nullptr, out)
                : compile_compute(d, arena, rec, fail_on_compile, out);
 }
 
@@ -699,23 +763,36 @@ void compiler_worker_main(void* arg) {
     auto* d = static_cast<DeviceImpl*>(arg);
     d->compiler_thread_id = current_thread_id();
     for (;;) {
-        PipelineRecord* rec = nullptr;
+        PipelineRecord*     rec  = nullptr;
+        StaticVariantRecord* vrec = nullptr;
         mutex_lock(&d->compiler_lock);
         while (!atomic_load(&d->compiler_shutdown) &&
-               (d->compiler_queue.is_empty() || atomic_load(&d->compiler_paused))) {
+               ((d->compiler_queue.is_empty() && d->variant_queue.is_empty()) ||
+                atomic_load(&d->compiler_paused))) {
             condvar_wait(&d->compiler_cv, &d->compiler_lock);
         }
-        if (d->compiler_queue.is_empty() && atomic_load(&d->compiler_shutdown)) {
+        if (d->variant_queue.is_empty() && d->compiler_queue.is_empty() &&
+            atomic_load(&d->compiler_shutdown)) {
             mutex_unlock(&d->compiler_lock);
             break;
         }
-        rec = d->compiler_queue[0];
-        d->compiler_queue.erase(d->compiler_queue.begin(), d->compiler_queue.begin() + 1);
+        // Static variants first (they gate the draw path), then base records.
+        if (!d->variant_queue.is_empty()) {
+            vrec = d->variant_queue[0];
+            d->variant_queue.erase(d->variant_queue.begin(), d->variant_queue.begin() + 1);
+        } else {
+            rec = d->compiler_queue[0];
+            d->compiler_queue.erase(d->compiler_queue.begin(), d->compiler_queue.begin() + 1);
+        }
         atomic_fetch_add(&d->compiler_busy, 1);
         mutex_unlock(&d->compiler_lock);
 
-        process_record(d, rec);
-        release_pipeline_ref(d, rec);   // the worker's reference
+        if (vrec != nullptr) {
+            process_static_variant(d, vrec);
+        } else {
+            process_record(d, rec);
+            release_pipeline_ref(d, rec);   // the worker's reference
+        }
 
         mutex_lock(&d->compiler_lock);
         atomic_fetch_add(&d->compiler_busy, -1);
@@ -724,15 +801,173 @@ void compiler_worker_main(void* arg) {
     }
 }
 
+// --- Private static graphics variants -------------------------------------------------
+
+// Normalized key from the baked shadow members + the base pipeline's stable
+// identity.
+static StaticVariantKey make_variant_key(DeviceImpl* d, uint64_t base_stable_id,
+                                          const LogicalGraphicsState& gs) {
+    return StaticVariantKey{
+        .base_stable_id = base_stable_id,
+        .impl_version   = kStaticVariantImplVersion,
+        .profile_id     = static_cast<uint32_t>(device_backend_profile()),
+        .front_face     = gs.front_face == FrontFace::CCW ? 0u : 1u,
+        .cull           = static_cast<uint8_t>(gs.cull),
+        .depth_test_enable      = gs.depth_test_enable,
+        .depth_write_enable     = gs.depth_write_enable,
+        .depth_compare          = static_cast<uint8_t>(gs.depth_compare),
+        .depth_bounds_test_enable = gs.depth_bounds_test_enable,
+        .stencil_test_enable    = gs.stencil_test_enable,
+        .stencil_front_test     = static_cast<uint8_t>(gs.stencil_front.test),
+        .stencil_front_fail     = static_cast<uint8_t>(gs.stencil_front.fail_op),
+        .stencil_front_pass     = static_cast<uint8_t>(gs.stencil_front.pass_op),
+        .stencil_front_depth_fail = static_cast<uint8_t>(gs.stencil_front.depth_fail_op),
+        .stencil_back_test      = static_cast<uint8_t>(gs.stencil_back.test),
+        .stencil_back_fail      = static_cast<uint8_t>(gs.stencil_back.fail_op),
+        .stencil_back_pass      = static_cast<uint8_t>(gs.stencil_back.pass_op),
+        .stencil_back_depth_fail = static_cast<uint8_t>(gs.stencil_back.depth_fail_op),
+    };
+}
+
+// Rebuilds a LogicalGraphicsState from a normalized key (variant worker side).
+static LogicalGraphicsState state_from_key(const StaticVariantKey& k) {
+    LogicalGraphicsState gs;
+    gs.front_face = k.front_face == 0 ? FrontFace::CCW : FrontFace::CW;
+    gs.cull       = static_cast<Cull>(k.cull);
+    gs.depth_test_enable        = k.depth_test_enable;
+    gs.depth_write_enable       = k.depth_write_enable;
+    gs.depth_compare            = static_cast<Op>(k.depth_compare);
+    gs.depth_bounds_test_enable = k.depth_bounds_test_enable;
+    gs.stencil_test_enable      = k.stencil_test_enable;
+    gs.stencil_front.test       = static_cast<Op>(k.stencil_front_test);
+    gs.stencil_front.fail_op    = static_cast<StencilOp>(k.stencil_front_fail);
+    gs.stencil_front.pass_op    = static_cast<StencilOp>(k.stencil_front_pass);
+    gs.stencil_front.depth_fail_op = static_cast<StencilOp>(k.stencil_front_depth_fail);
+    gs.stencil_back.test        = static_cast<Op>(k.stencil_back_test);
+    gs.stencil_back.fail_op     = static_cast<StencilOp>(k.stencil_back_fail);
+    gs.stencil_back.pass_op     = static_cast<StencilOp>(k.stencil_back_pass);
+    gs.stencil_back.depth_fail_op = static_cast<StencilOp>(k.stencil_back_depth_fail);
+    return gs;
+}
+
+// Fieldwise equality — NEVER memcmp: the struct has one trailing padding byte
+// (align 8 on the uint64 + 15 uint8s) that would be nondeterministic.
+static bool variant_key_eq(const StaticVariantKey& a, const StaticVariantKey& b) {
+    return a.base_stable_id == b.base_stable_id && a.impl_version == b.impl_version &&
+           a.profile_id == b.profile_id && a.front_face == b.front_face &&
+           a.cull == b.cull && a.depth_test_enable == b.depth_test_enable &&
+           a.depth_write_enable == b.depth_write_enable && a.depth_compare == b.depth_compare &&
+           a.depth_bounds_test_enable == b.depth_bounds_test_enable &&
+           a.stencil_test_enable == b.stencil_test_enable &&
+           a.stencil_front_test == b.stencil_front_test && a.stencil_front_fail == b.stencil_front_fail &&
+           a.stencil_front_pass == b.stencil_front_pass && a.stencil_front_depth_fail == b.stencil_front_depth_fail &&
+           a.stencil_back_test == b.stencil_back_test && a.stencil_back_fail == b.stencil_back_fail &&
+           a.stencil_back_pass == b.stencil_back_pass && a.stencil_back_depth_fail == b.stencil_back_depth_fail;
+}
+
+// Serialized key (header + body), explicit field-by-field — no padding bytes.
+// Little-endian host; all supported targets (x86-64/arm64) are little-endian.
+static void serialize_variant_key(const StaticVariantKey& k, uint8_t* out) {
+    uint32_t header[3] = {kStaticVariantHeaderMagic, k.impl_version, k.profile_id};
+    memcpy(out, header, sizeof(header));
+    uint8_t* p = out + sizeof(header);
+    memcpy(p, &k.base_stable_id, sizeof(k.base_stable_id));
+    p += sizeof(k.base_stable_id);
+    *p++ = k.front_face;
+    *p++ = k.cull;
+    *p++ = k.depth_test_enable;
+    *p++ = k.depth_write_enable;
+    *p++ = k.depth_compare;
+    *p++ = k.depth_bounds_test_enable;
+    *p++ = k.stencil_test_enable;
+    *p++ = k.stencil_front_test;
+    *p++ = k.stencil_front_fail;
+    *p++ = k.stencil_front_pass;
+    *p++ = k.stencil_front_depth_fail;
+    *p++ = k.stencil_back_test;
+    *p++ = k.stencil_back_fail;
+    *p++ = k.stencil_back_pass;
+    *p++ = k.stencil_back_depth_fail;
+}
+
+void process_static_variant(DeviceImpl* d, StaticVariantRecord* rec) {
+    Arena*      arena = get_thread_local_arena(d);
+    ScratchScope scope(*arena);
+    VkPipeline  pipeline = VK_NULL_HANDLE;
+    const LogicalGraphicsState gs = state_from_key(rec->key);
+    VkResult    result   = arena->overflowed()
+                               ? VK_ERROR_OUT_OF_HOST_MEMORY
+                               : compile_graphics(d, arena, rec->base, /*fail_on_compile=*/false,
+                                                  &gs, &pipeline);
+    mutex_lock(&rec->wait_mutex);
+    if (result == VK_SUCCESS) {
+        rec->vk_pipeline = pipeline;
+        rec->state.store(InternalPipelineState::Ready, std::memory_order_release);
+    } else {
+        rec->failure_result = result;
+        rec->state.store(InternalPipelineState::Failed, std::memory_order_release);
+        IZ_LOG(d, LogLevel::Error, "static graphics variant compile failed");
+    }
+    condvar_signal(&rec->wait_cv);
+    mutex_unlock(&rec->wait_mutex);
+    release_pipeline_ref(d, rec->base);   // the worker job's base reference
+}
+
+// Finds or enqueues the private static variant for (base, baked state). The
+// device map owns the record for the base's lifetime; the caller receives a
+// pure borrow (valid while the base is retained). The queued worker job
+// retains the BASE so compilation can never race base eviction.
+StaticVariantRecord* find_or_request_static_variant(DeviceImpl* d, PipelineRecord* base,
+                                                    const LogicalGraphicsState& gs) {
+    const StaticVariantKey key = make_variant_key(d, base->stable_id, gs);
+    atomic_fetch_add(&d->stat_static_variant_lookups, 1);
+    mutex_lock(&d->pipeline_lock);
+    for (StaticVariantRecord* r : d->static_variants) {
+        if (r->base == base && variant_key_eq(r->key, key)) {
+            atomic_fetch_add(&d->stat_static_variant_hits, 1);
+            mutex_unlock(&d->pipeline_lock);
+            return r;
+        }
+    }
+    atomic_fetch_add(&d->stat_static_variant_misses, 1);
+    MemoryBlock blk = d->allocator.alloc(sizeof(StaticVariantRecord));
+    if (blk.ptr == nullptr) {
+        mutex_unlock(&d->pipeline_lock);
+        return nullptr;
+    }
+    auto* rec = ::new (blk.ptr) StaticVariantRecord();
+    rec->base = base;
+    rec->key  = key;
+    condvar_init(&rec->wait_cv);
+    rec->next_variant   = base->first_variant;   // intrusive list on the base
+    base->first_variant = rec;
+    d->static_variants.push_back(rec);
+
+    mutex_lock(&d->compiler_lock);
+    d->variant_queue.push_back(rec);
+    base->refs.fetch_add(1, std::memory_order_relaxed);   // the worker job's base reference
+    condvar_signal(&d->compiler_cv);
+    mutex_unlock(&d->compiler_lock);
+    mutex_unlock(&d->pipeline_lock);
+
+    atomic_fetch_add(&d->stat_static_variant_compilations, 1);
+    return rec;
+}
+
 // --- Reference lifetime ------------------------------------------------------------------
 
 // Releases one reference; destroys the record (and its VkPipeline) with the last.
 void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec) {
     if (rec->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) { return; }
-    // Last reference: remove from the dedup map (under the lock, re-checking
-    // that no lookup resurrected it), then destroy outside the lock.
+    // Last reference: remove from the dedup map AND evict the base's private
+    // static variants only if the locked recheck still sees zero references
+    // (a concurrent lookup may have resurrected the record — then nothing is
+    // destroyed). Destroy happens outside the lock.
+    bool destroy = false;
+    StaticVariantRecord* evict = nullptr;   // detached chain, destroyed after unlock
     mutex_lock(&d->pipeline_lock);
     if (rec->refs.load(std::memory_order_relaxed) == 0) {
+        destroy = true;
         for (uint32_t i = 0; i < d->pipeline_records.size(); ++i) {
             if (d->pipeline_records[i] == rec) {
                 d->pipeline_records[i] = d->pipeline_records[d->pipeline_records.size() - 1];
@@ -740,11 +975,40 @@ void release_pipeline_ref(DeviceImpl* d, PipelineRecord* rec) {
                 break;
             }
         }
+        // Evict the base's private static variants. Allocation-free: detach
+        // the base's intrusive list under the lock, remove the records from
+        // the map, destroy them one at a time after the unlock. Never orphan
+        // a variant on OOM.
+        evict         = rec->first_variant;
+        rec->first_variant = nullptr;
+        if (evict != nullptr) {
+            for (uint32_t i = 0; i < d->static_variants.size();) {
+                StaticVariantRecord* v = d->static_variants[i];
+                if (v->base == rec) {
+                    d->static_variants[i] = d->static_variants[d->static_variants.size() - 1];
+                    d->static_variants.pop_back();
+                } else {
+                    ++i;
+                }
+            }
+        }
     }
     mutex_unlock(&d->pipeline_lock);
+    if (!destroy) { return; }   // resurrected by a concurrent lookup
 
     if (rec->vk_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(d->device, rec->vk_pipeline, nullptr);
+    }
+    StaticVariantRecord* v = evict;
+    while (v != nullptr) {
+        StaticVariantRecord* next = v->next_variant;
+        if (v->vk_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(d->device, v->vk_pipeline, nullptr);
+        }
+        condvar_destroy(&v->wait_cv);
+        v->~StaticVariantRecord();
+        d->allocator.free({.ptr = v, .len = sizeof(StaticVariantRecord)});
+        v = next;
     }
     free_key(d, rec);
     free_record(d, rec);
@@ -911,6 +1175,104 @@ bool wait_pipeline(Device dev, Handle<Pipeline> pipeline) {
         log_fmt(d, LogLevel::Info, __LINE__, "pipeline.cpp",
                 "wait_pipeline blocked %.2f ms", waited_ms);
     }
+    return ready;
+}
+
+// --- Static graphics-state prewarm ------------------------------------------------------
+
+// Shared derivation of the baked shadow members from a public depth-stencil
+// description. Used by the command-buffer setter AND the request_graphics_state
+// prewarm, so both produce identical variant keys.
+void apply_depth_stencil_to_shadow(const DepthStencilDesc& desc, LogicalGraphicsState& gs) {
+    gs.depth_test_enable   = bool(desc.depth_mode & DepthFlags::Read);
+    gs.depth_write_enable  = bool(desc.depth_mode & DepthFlags::Write);
+    gs.depth_compare       = desc.depth_test;
+    gs.stencil_test_enable = true;   // matches the current backend behavior
+    gs.stencil_front       = desc.stencil_front;
+    gs.stencil_back        = desc.stencil_back;
+    gs.stencil_read_mask   = desc.stencil_read_mask;
+    gs.stencil_write_mask  = desc.stencil_write_mask;
+}
+
+// True when the baked shadow members equal the base pipeline's defaults (the
+// base pipeline IS the default-state variant; no private record needed).
+bool is_default_baked_state(const LogicalGraphicsState& gs) {
+    return gs.front_face == FrontFace::CCW && gs.cull == Cull::None &&
+           !gs.depth_test_enable && !gs.depth_write_enable && gs.depth_compare == Op::Always &&
+           !gs.depth_bounds_test_enable && !gs.stencil_test_enable &&
+           gs.stencil_front.test == Op::Always && gs.stencil_front.fail_op == StencilOp::Keep &&
+           gs.stencil_front.pass_op == StencilOp::Keep &&
+           gs.stencil_front.depth_fail_op == StencilOp::Keep &&
+           gs.stencil_back.test == Op::Always && gs.stencil_back.fail_op == StencilOp::Keep &&
+           gs.stencil_back.pass_op == StencilOp::Keep &&
+           gs.stencil_back.depth_fail_op == StencilOp::Keep;
+}
+
+static PipelineStatus record_status(const PipelineRecord* rec) {
+    const InternalPipelineState st = rec->state.load(std::memory_order_acquire);
+    return st == InternalPipelineState::Ready   ? PipelineStatus::Ready
+         : st == InternalPipelineState::Failed  ? PipelineStatus::Failed
+                                                : PipelineStatus::Pending;
+}
+
+// Ensures a private static variant for (pipeline, graphics state) is queued
+// on the compiler worker and returns its current status. On the dynamic path
+// (or for compute pipelines) this is a no-op over the base pipeline.
+PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
+                                      const GraphicsStateDesc& desc) {
+    auto* d = reinterpret_cast<DeviceImpl*>(device);
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    if (!d->dispatch.use_static_graphics_state ||
+        rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        return record_status(rec);
+    }
+    LogicalGraphicsState gs;
+    gs.front_face = desc.front_face;
+    gs.cull       = desc.cull;
+    if (desc.depth_stencil.h != 0) {
+        apply_depth_stencil_to_shadow(d->depth_stencil_pool[desc.depth_stencil].desc, gs);
+    }
+    if (is_default_baked_state(gs)) { return record_status(rec); }   // base IS the variant
+    StaticVariantRecord* v = find_or_request_static_variant(d, rec, gs);
+    if (v == nullptr) { return PipelineStatus::Failed; }
+    const InternalPipelineState st = v->state.load(std::memory_order_acquire);
+    return st == InternalPipelineState::Ready   ? PipelineStatus::Ready
+         : st == InternalPipelineState::Failed  ? PipelineStatus::Failed
+                                                : PipelineStatus::Pending;
+}
+
+// Blocks until the requested variant is Ready or Failed (timeout_ms == 0
+// waits forever). Returns true only for Ready.
+bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const GraphicsStateDesc& desc,
+                         uint64_t timeout_ms) {
+    auto* d = reinterpret_cast<DeviceImpl*>(device);
+    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    if (!d->dispatch.use_static_graphics_state ||
+        rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        return wait_pipeline(device, pipeline);
+    }
+    LogicalGraphicsState gs;
+    gs.front_face = desc.front_face;
+    gs.cull       = desc.cull;
+    if (desc.depth_stencil.h != 0) {
+        apply_depth_stencil_to_shadow(d->depth_stencil_pool[desc.depth_stencil].desc, gs);
+    }
+    if (is_default_baked_state(gs)) { return wait_pipeline(device, pipeline); }
+    StaticVariantRecord* v = find_or_request_static_variant(d, rec, gs);
+    if (v == nullptr) { return false; }
+    mutex_lock(&v->wait_mutex);
+    const double t0 = monotonic_seconds();
+    bool ready = false;
+    for (;;) {
+        const InternalPipelineState st = v->state.load(std::memory_order_acquire);
+        if (st == InternalPipelineState::Ready) { ready = true; break; }
+        if (st == InternalPipelineState::Failed) { break; }
+        if (timeout_ms != 0 && (monotonic_seconds() - t0) * 1000.0 >= static_cast<double>(timeout_ms)) {
+            break;
+        }
+        condvar_wait(&v->wait_cv, &v->wait_mutex);
+    }
+    mutex_unlock(&v->wait_mutex);
     return ready;
 }
 

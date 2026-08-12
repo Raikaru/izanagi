@@ -1144,15 +1144,13 @@ Device create_device(const DeviceDesc& desc) {
             result = VK_ERROR_FEATURE_NOT_PRESENT;
             goto fail;
         }
-        // Temporary gate (removed in the static-graphics-state phase): devices
-        // without VK_EXT_extended_dynamic_state select the private static
-        // variant fallback, which is not implemented yet.
+        // Devices without VK_EXT_extended_dynamic_state select the private
+        // static-graphics-state fallback (static pipeline variants compiled
+        // on the compiler worker, resolved at draw time).
         if (d->dispatch.use_static_graphics_state) {
-            IZ_LOG(d, LogLevel::Error,
-                   "bindless: extended dynamic state unavailable; the private static "
-                   "graphics-state fallback lands in the next phase");
-            result = VK_ERROR_FEATURE_NOT_PRESENT;
-            goto fail;
+            IZ_LOG(d, LogLevel::Info,
+                   "bindless: extended dynamic state unavailable; using the private "
+                   "static graphics-state fallback");
         }
     }
 #endif
@@ -1315,6 +1313,8 @@ Device create_device(const DeviceDesc& desc) {
     d->uninitialized_textures = Vector<TextureImpl*>(d->allocator);
     d->pipeline_records       = Vector<PipelineRecord*>(d->allocator);
     d->compiler_queue         = Vector<PipelineRecord*>(d->allocator);
+    d->static_variants        = Vector<StaticVariantRecord*>(d->allocator);
+    d->variant_queue          = Vector<StaticVariantRecord*>(d->allocator);
 
 #if defined(IZ_VK_PROFILE_BINDLESS)
     // Valid null-handle behavior: descriptor slot 0 is reserved as null. A
@@ -1430,6 +1430,18 @@ void destroy_device(Device dev) {
 
     // Destroy every remaining record (leaked handles, failed compiles, etc.).
     mutex_lock(&d->pipeline_lock);
+    // Remaining private static variants first (map-owned; the base records
+    // below are destroyed after them).
+    for (StaticVariantRecord* v : d->static_variants) {
+        if (v->vk_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(d->device, v->vk_pipeline, nullptr);
+        }
+        condvar_destroy(&v->wait_cv);
+        v->~StaticVariantRecord();
+        d->allocator.free({.ptr = v, .len = sizeof(StaticVariantRecord)});
+    }
+    d->static_variants.clear();
+    d->variant_queue.clear();
     for (PipelineRecord* rec : d->pipeline_records) {
         if (rec->vk_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(d->device, rec->vk_pipeline, nullptr);

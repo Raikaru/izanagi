@@ -688,6 +688,25 @@ PipelineStatus   get_pipeline_status(Device, Handle<Pipeline>);
 // Block until the pipeline reaches Ready or Failed. Returns true only for
 // Ready.
 bool             wait_pipeline(Device, Handle<Pipeline>);
+// Optional graphics state for the static-graphics-state fallback (private
+// static pipeline variants). On devices without extended dynamic state the
+// baked members (front face, cull, depth/stencil test + ops) are compiled
+// into private pipeline variants; this is the prewarm API for that path.
+// On the regular path it is a no-op wrapper over the base pipeline.
+struct GraphicsStateDesc {
+    Handle<DepthStencilState> depth_stencil;   // null: depth/stencil disabled
+    FrontFace                 front_face       = FrontFace::CCW;
+    Cull                      cull             = Cull::None;
+};
+// Ensures a private static variant for (pipeline, graphics state) is
+// requested (compilation happens on the device compiler worker; never
+// blocks). Returns its current status. Identity dedup: repeated calls with
+// the same description share one variant.
+PipelineStatus   request_graphics_state(Device, Handle<Pipeline>, const GraphicsStateDesc&);
+// Blocks until the requested variant is Ready or Failed (timeout_ms == 0
+// waits forever). Returns true only for Ready.
+bool             wait_graphics_state(Device, Handle<Pipeline>, const GraphicsStateDesc&,
+                                     uint64_t timeout_ms = 0);
 // Explicitly persist the native pipeline cache now (blocking: waits for
 // queued compilation to drain). For loading screens / shutdown, not frame
 // recording. No-op when no cache callbacks were provided.

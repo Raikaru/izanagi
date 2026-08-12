@@ -2011,6 +2011,12 @@ static void test_headless_pool_retirement() {
         last = queue_submit(q, {&cmd, 1});
         CHECK(last.status == SubmitStatus::Success, "headless submit failed");
         CHECK(last.value == static_cast<uint64_t>(i + 1), "submission values are sequential");
+        // Bounded-batch throttle: the pool cap is 64, and pool reuse is gated
+        // on GPU completion of the pool's submissions. Without any wait the
+        // test races the driver's completion rate and starves sporadically;
+        // waiting every 64 keeps in-flight <= the pool count deterministically
+        // while still exercising recycling (resets) at scale.
+        if ((i & 63) == 63) { wait_submission(last); }
     }
     CHECK(wait_submission(last), "last headless submission must complete");
     CHECK(gpu::debug_pool_resets(impl) > resets_before,
@@ -3242,6 +3248,334 @@ static void test_abi_int8_16() {
     destroy_device(d);
 }
 
+// --- Test 39: static graphics-state variant lifecycle + draw --------------------------
+// Full graphics draw under the forced static fallback: a non-default baked
+// state (front=CW, cull=Back, depth Read|Write Less) requires a private
+// static variant. The prewarm API compiles it on the worker (Pending ->
+// Ready via wait_graphics_state), the dedup map reuses it (hits), and the
+// draw-time resolution binds it. Readback proves the triangle actually
+// rendered with the variant-bound pipeline.
+static void test_static_variant_graphics() {
+    printf("--- Test: static graphics variant lifecycle + draw ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    if (d == nullptr) { return; }
+
+    // The static fallback is selected at device creation (env var, covered
+    // by the suite-level forced-static run). This test never toggles it
+    // after creation — that would bypass the real capability gate. The
+    // variant asserts run only when the device is genuinely static.
+    const bool static_mode = debug_using_static_state(d);
+
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    auto spirv = load_spirv(find_shader_path("offscreen_triangle.spv").c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vs_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fs_src{.source = spirv, .entry_point = "fragment_main"_sv};
+
+    constexpr uint32_t kSize = 64;
+    ColorTarget color_target{.format = Format::RGBA8Unorm};
+    RasterDesc raster{
+        .depth_format = Format::Depth32Float,
+        .color_targets = Span<const ColorTarget>(&color_target, 1),
+    };
+    Handle<Pipeline> pipeline = create_graphics_pipeline(d, vs_src, fs_src, raster);
+    CHECK(pipeline.h != 0, "create_graphics_pipeline failed");
+    if (pipeline.h == 0) {
+        destroy_device(d);
+        return;
+    }
+
+    // Non-default baked state (mirrors textured_cube): front=CW, cull=Back,
+    // depth Read|Write Less.
+    DepthStencilDesc ds_desc{
+        .depth_mode = DepthFlags::Read | DepthFlags::Write,
+        .depth_test = Op::Less,
+    };
+    Handle<DepthStencilState> ds = create_depth_stencil_state(d, ds_desc);
+    CHECK(ds.h != 0, "create_depth_stencil_state failed");
+    GraphicsStateDesc gs_desc{.depth_stencil = ds, .front_face = FrontFace::CW, .cull = Cull::Back};
+
+    // Prewarm BEFORE any draw: the variant compiles on the worker; first use
+    // must find it Ready. On the dynamic path the prewarm is a no-op wrapper
+    // over the base pipeline (validated separately).
+    int64_t compilations_before = 0;
+    if (static_mode) {
+        const PipelineStatus pre = request_graphics_state(d, pipeline, gs_desc);
+        CHECK(pre == PipelineStatus::Pending || pre == PipelineStatus::Ready,
+              "prewarm returns Pending or Ready");
+        CHECK(wait_graphics_state(d, pipeline, gs_desc), "prewarm variant becomes Ready");
+        CHECK(debug_stat(d, 5) >= 1, "variant miss counted (first compile)");
+        CHECK(debug_stat(d, 7) >= 1, "variant compilation counted");
+
+        // Dedup: an identical request must hit, not recompile.
+        compilations_before = debug_stat(d, 7);
+        CHECK(request_graphics_state(d, pipeline, gs_desc) == PipelineStatus::Ready,
+              "identical prewarm is Ready");
+        CHECK(debug_stat(d, 4) >= 1, "variant hit counted (dedup)");
+        CHECK(debug_stat(d, 7) == compilations_before, "no recompile on dedup hit");
+    } else {
+        CHECK(wait_graphics_state(d, pipeline, gs_desc),
+              "dynamic-path prewarm waits on the base pipeline");
+    }
+
+    // Render targets: color + depth.
+    TextureDesc color_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> color_tex = create_texture(d, color_desc);
+    TextureDesc depth_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::Depth32Float,
+        .usage      = UsageFlags::DepthStencilAttachment,
+    };
+    Handle<Texture> depth_tex = create_texture(d, depth_desc);
+    CHECK(color_tex.h != 0 && depth_tex.h != 0, "render target creation failed");
+
+    // Root-argument slots (the shader reads none; the pointers are still pushed).
+    GpuPtr args_a = malloc(d, 16, Memory::Default);
+    GpuPtr args_b = malloc(d, 16, Memory::Default);
+    CHECK(args_a != 0 && args_b != 0, "arg malloc failed");
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "recording failed");
+    RenderAttachment color_att{
+        .texture     = color_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{20, 20, 40, 255},
+    };
+    RenderAttachment depth_att{
+        .texture     = depth_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{255, 0, 0, 0},   // depth clear: r/255 = 1.0 (far)
+    };
+    RenderPassDesc pass_desc{
+        .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+        .depth_attachment  = depth_att,
+        .render_area       = Rect2D{.width = kSize, .height = kSize},
+    };
+    cmd_begin_render_pass(cmd, pass_desc);
+    CHECK(cmd_set_pipeline(cmd, pipeline), "pipeline bind accepted");
+    cmd_set_depth_stencil_state(cmd, ds);
+    cmd_set_front_face(cmd, FrontFace::CW);
+    cmd_set_cull_mode(cmd, Cull::Back);
+    cmd_draw(cmd, args_a, args_b, 3, 1);
+    cmd_end_render_pass(cmd);
+    cmd_finalize(cmd);
+    Submission sub = queue_submit(q, {&cmd, 1});
+    CHECK(sub.status == SubmitStatus::Success, "submission accepted");
+    device_wait_for_idle(d);
+
+    // Static path: the draw-time resolution hit the prewarmed variant (no
+    // new compilation, no pending hit).
+    if (static_mode) {
+        CHECK(debug_stat(d, 7) == compilations_before, "draw reuses the prewarmed variant");
+        CHECK(debug_stat(d, 6) == 0, "no pending hits (variant prewarmed)");
+    }
+
+    // Readback: the triangle covers the upper half; some pixel is red, the
+    // bottom corners keep the clear color.
+    GpuPtr readback = malloc(d, kSize * kSize * 4, Memory::Readback);
+    BufferTextureCopyInfo copy_info{.image_extent = {kSize, kSize, 1}};
+    cmd = queue_start_command_recording(q);
+    cmd_copy_from_texture(cmd, color_tex, readback, copy_info);
+    cmd_finalize(cmd);
+    Submission sub2 = queue_submit(q, {&cmd, 1});
+    CHECK(sub2.status == SubmitStatus::Success, "readback submission accepted");
+    device_wait_for_idle(d);
+
+    auto* pixels = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    bool found_red = false;
+    bool found_clear = false;
+    for (uint32_t y = 0; y < kSize && !(found_red && found_clear); ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const uint8_t* p = pixels + (y * kSize + x) * 4;
+            if (p[0] > 200 && p[1] < 60 && p[2] < 60) { found_red = true; }
+            if (p[0] == 20 && p[1] == 20 && p[2] == 40) { found_clear = true; }
+        }
+    }
+    CHECK(found_red, "triangle rendered (red pixels present)");
+    CHECK(found_clear, "clear color preserved outside the triangle");
+
+    free(d, readback);
+    free(d, args_a);
+    free(d, args_b);
+    free(d, color_tex);
+    free(d, depth_tex);
+    free_depth_stencil_state(d, ds);
+    free(d, pipeline);
+    destroy_device(d);
+}
+
+
+// --- Test 40: static variant Pending rejection + recovery ---------------------------
+// Deterministic Pending-path test: with the compiler worker paused, a
+// non-default baked state draws with a variant stuck at Queued. The draw
+// fails recording ("variant pending"), the submission is rejected with
+// SubmitStatus::Error, and — critically — the rejected submission releases
+// its command-pool checkout and retained references so the pool recovers.
+// Resuming the worker compiles the variant; the identical draw then succeeds
+// and the readback proves the pixels. Runs only on a genuinely static device
+// (the env-var forced-static suite process).
+static void test_static_variant_pending() {
+    printf("--- Test: static variant pending rejection + recovery ---\n");
+    DeviceDesc desc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    if (d == nullptr) { return; }
+    if (!debug_using_static_state(d)) {
+        destroy_device(d);
+        printf("  SKIP (dynamic device)\n");
+        return;
+    }
+
+    TestArena arena{reinterpret_cast<uint8_t*>(g_arena_mem), 0, sizeof(g_arena_mem)};
+    auto spirv = load_spirv(find_shader_path("offscreen_triangle.spv").c_str(), &arena);
+    CHECK(spirv.size() > 0, "Failed to load offscreen_triangle.spv");
+    if (spirv.size() == 0) {
+        destroy_device(d);
+        return;
+    }
+    ShaderSource vs_src{.source = spirv, .entry_point = "vertex_main"_sv};
+    ShaderSource fs_src{.source = spirv, .entry_point = "fragment_main"_sv};
+
+    constexpr uint32_t kSize = 64;
+    ColorTarget color_target{.format = Format::RGBA8Unorm};
+    RasterDesc raster{
+        .depth_format  = Format::Depth32Float,
+        .color_targets = Span<const ColorTarget>(&color_target, 1),
+    };
+    Handle<Pipeline> pipeline = create_graphics_pipeline(d, vs_src, fs_src, raster);
+    CHECK(pipeline.h != 0, "create_graphics_pipeline failed");
+    if (pipeline.h == 0) {
+        destroy_device(d);
+        return;
+    }
+    DepthStencilDesc ds_desc{.depth_mode = DepthFlags::Read | DepthFlags::Write, .depth_test = Op::Less};
+    Handle<DepthStencilState> ds = create_depth_stencil_state(d, ds_desc);
+    GraphicsStateDesc gs_desc{.depth_stencil = ds, .front_face = FrontFace::CW, .cull = Cull::Back};
+
+    // Pause the worker: the requested variant stays Queued deterministically.
+    debug_set_compiler_paused(d, true);
+    CHECK(request_graphics_state(d, pipeline, gs_desc) == PipelineStatus::Pending,
+          "variant Pending while worker paused");
+
+    TextureDesc color_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+    };
+    Handle<Texture> color_tex = create_texture(d, color_desc);
+    TextureDesc depth_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {kSize, kSize, 1},
+        .format     = Format::Depth32Float,
+        .usage      = UsageFlags::DepthStencilAttachment,
+    };
+    Handle<Texture> depth_tex = create_texture(d, depth_desc);
+    GpuPtr args_a = malloc(d, 16, Memory::Default);
+    GpuPtr args_b = malloc(d, 16, Memory::Default);
+    Queue q = get_queue(d);
+
+    RenderAttachment color_att{
+        .texture     = color_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{20, 20, 40, 255},
+    };
+    RenderAttachment depth_att{
+        .texture     = depth_tex,
+        .load_op     = LoadOp::Clear,
+        .store_op    = StoreOp::Store,
+        .clear_color = Color{255, 0, 0, 0},
+    };
+    RenderPassDesc pass_desc{
+        .color_attachments = Span<const RenderAttachment>(&color_att, 1),
+        .depth_attachment  = depth_att,
+        .render_area       = Rect2D{.width = kSize, .height = kSize},
+    };
+
+    // First draw with the Pending variant: recording fails deterministically,
+    // the submission is rejected, and the pool checkout is released.
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "recording started");
+    cmd_begin_render_pass(cmd, pass_desc);
+    CHECK(cmd_set_pipeline(cmd, pipeline), "pipeline bind accepted");
+    cmd_set_depth_stencil_state(cmd, ds);
+    cmd_set_front_face(cmd, FrontFace::CW);
+    cmd_set_cull_mode(cmd, Cull::Back);
+    cmd_draw(cmd, args_a, args_b, 3, 1);
+    cmd_end_render_pass(cmd);
+    cmd_finalize(cmd);
+    Submission sub = queue_submit(q, {&cmd, 1});
+    CHECK(sub.status == SubmitStatus::Error, "pending variant rejects the submission");
+    CHECK(debug_stat(d, 6) >= 1, "pending hit counted");
+
+    // Resume the worker; the variant compiles. The identical draw then
+    // succeeds — proving both the Pending -> Ready transition and that the
+    // rejected submission freed its command pool (recording restarts).
+    debug_set_compiler_paused(d, false);
+    CHECK(wait_graphics_state(d, pipeline, gs_desc), "variant Ready after resume");
+    cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "pool recovered after the rejected submission");
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_set_depth_stencil_state(cmd, ds);
+    cmd_set_front_face(cmd, FrontFace::CW);
+    cmd_set_cull_mode(cmd, Cull::Back);
+    cmd_draw(cmd, args_a, args_b, 3, 1);
+    cmd_end_render_pass(cmd);
+    cmd_finalize(cmd);
+    Submission sub2 = queue_submit(q, {&cmd, 1});
+    CHECK(sub2.status == SubmitStatus::Success, "recovered draw submitted");
+    device_wait_for_idle(d);
+
+    GpuPtr readback = malloc(d, kSize * kSize * 4, Memory::Readback);
+    BufferTextureCopyInfo copy_info{.image_extent = {kSize, kSize, 1}};
+    cmd = queue_start_command_recording(q);
+    cmd_copy_from_texture(cmd, color_tex, readback, copy_info);
+    cmd_finalize(cmd);
+    Submission sub3 = queue_submit(q, {&cmd, 1});
+    CHECK(sub3.status == SubmitStatus::Success, "readback submission accepted");
+    device_wait_for_idle(d);
+    auto* pixels = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback));
+    bool found_red = false;
+    for (uint32_t i = 0; i < kSize * kSize; ++i) {
+        const uint8_t* p = pixels + i * 4;
+        if (p[0] > 200 && p[1] < 60 && p[2] < 60) { found_red = true; break; }
+    }
+    CHECK(found_red, "triangle rendered after variant recovery");
+
+    free(d, readback);
+    free(d, args_a);
+    free(d, args_b);
+    free(d, color_tex);
+    free(d, depth_tex);
+    free_depth_stencil_state(d, ds);
+    free(d, pipeline);
+    destroy_device(d);
+}
+
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);   // crash/hang diagnostics: no buffering
     printf("Izanagi API Tests\n");
@@ -3298,6 +3632,8 @@ int main() {
     test_copy_conversions();
     test_forced_legacy_copy();
     test_logical_graphics_state();
+    test_static_variant_graphics();
+    test_static_variant_pending();
 
     printf("\n=================\n");
     if (g_failures == 0) {

@@ -69,6 +69,13 @@ void cmd_bind_descriptor_heaps(DeviceImpl* d, VkCommandBuffer cmd) {
 
 // --- Command pool management -----------------------------------------------------------
 
+// Clears the command buffer's static-variant binding state (borrows — the
+// variants live for the base pipeline's lifetime, so nothing is released).
+static void release_cb_variant(CommandBufferImpl* cb) {
+    cb->bound_variant       = nullptr;
+    cb->bound_base_pipeline = nullptr;
+}
+
 static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
     // Release references retained by recorded-but-never-submitted command
     // buffers (their commands are discarded; the GPU never executed them,
@@ -76,6 +83,7 @@ static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
     for (uint32_t i = 0; i < pool->command_buffers.size(); ++i) {
         auto& cb = pool->command_buffers[i];
         if (cb.device == nullptr) { continue; }
+        release_cb_variant(&cb);
         for (PipelineRecord* rec : cb.retained_pipelines) {
             release_pipeline_ref(cb.device, rec);
         }
@@ -226,6 +234,9 @@ CommandBuffer queue_start_command_recording(Queue q) {
             return nullptr;
         }
         reset_logical_graphics_state(buffer);
+        release_cb_variant(buffer);
+        buffer->recording_failed = false;
+        buffer->fail_reason      = nullptr;
         // Bind descriptor heaps once at recording start
         cmd_bind_descriptor_heaps(d, buffer->buffer);
     }
@@ -365,13 +376,36 @@ Submission queue_submit(Queue                     q,
     Span<VkSemaphoreSubmitInfo>     signal_info{};
 
     // Reject command buffers with a recording error deterministically:
-    // nothing is submitted, no timeline advances.
+    // nothing is submitted, no timeline advances. The never-submitted
+    // checkouts and retained references MUST be released here — otherwise
+    // every rejected buffer leaks its command pool (outstanding never
+    // returns to 0) and the retained buffers/textures/pipelines never drain,
+    // starving later submissions (pool exhaustion / in-flight hangs).
     for (uint32_t i = 0; i < command_buffers.size(); ++i) {
         if (command_buffers[i]->recording_failed) {
             IZ_LOG(d, LogLevel::Error,
                    command_buffers[i]->fail_reason != nullptr
                        ? command_buffers[i]->fail_reason
                        : "queue_submit: command buffer recording failed");
+            mutex_lock(&q->record_lock);
+            for (uint32_t j = 0; j < command_buffers.size(); ++j) {
+                CommandBufferImpl* cb = command_buffers[j];
+                if (cb->pool != nullptr && cb->pool->outstanding > 0) { cb->pool->outstanding--; }
+            }
+            mutex_unlock(&q->record_lock);
+            for (uint32_t j = 0; j < command_buffers.size(); ++j) {
+                CommandBufferImpl* cb = command_buffers[j];
+                release_cb_variant(cb);
+                for (PipelineRecord* r : cb->retained_pipelines) { release_pipeline_ref(d, r); }
+                cb->retained_pipelines.clear();
+                for (TextureImpl* rec : cb->retained_textures) {
+                    Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
+                    if (h.h != 0) { release_texture_ref(d, h); }
+                }
+                cb->retained_textures.clear();
+                for (Handle<Buffer> b : cb->retained_buffers) { release_buffer_ref(d, b); }
+                cb->retained_buffers.clear();
+            }
             return Submission{.queue = q, .value = q->timeline_value + 1, .status = SubmitStatus::Error};
         }
     }
@@ -596,6 +630,7 @@ Submission queue_submit(Queue                     q,
         mutex_unlock(&q->record_lock);
         for (uint32_t i = 0; i < command_buffers.size(); ++i) {
             auto* cb = command_buffers[i];
+            release_cb_variant(cb);
             for (PipelineRecord* rec : cb->retained_pipelines) { release_pipeline_ref(d, rec); }
             cb->retained_pipelines.clear();
             for (TextureImpl* rec : cb->retained_textures) {
@@ -759,6 +794,10 @@ void debug_derive_dispatch(DeviceImpl* d) {
     capture_device_capabilities(d);
 }
 
+bool debug_using_static_state(DeviceImpl* d) {
+    return d->dispatch.use_static_graphics_state;
+}
+
 int64_t debug_stat(DeviceImpl* d, int which) {
     switch (which) {
         case 0: return atomic_load(&d->stat_copy2_calls);
@@ -779,6 +818,8 @@ void debug_force_legacy_barriers(DeviceImpl* d, bool force) {
 
 void reset_logical_graphics_state(CommandBufferImpl* cb) {
     cb->graphics_state = LogicalGraphicsState{};
+    cb->bound_variant       = nullptr;
+    cb->bound_base_pipeline = nullptr;
 }
 
 const LogicalGraphicsState* debug_cb_graphics_state(CommandBufferImpl* cb) {
@@ -1245,6 +1286,9 @@ bool cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
         return false;
     }
     vkCmdBindPipeline(cmd->buffer, rec->bind_point, rec->vk_pipeline);
+    // Track the base pipeline for static-variant resolution at draw time.
+    cmd->bound_base_pipeline = rec;
+    cmd->graphics_state.dirty_static_state = true;
     // Retain the native pipeline for the command buffer's lifetime (one
     // reference per distinct pipeline; repeated binds reuse it).
     for (PipelineRecord* r : cmd->retained_pipelines) {
@@ -1255,6 +1299,54 @@ bool cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
     return true;
 }
 
+// Draw-time variant resolution on the static-graphics-state fallback. On the
+// dynamic path this is a no-op. On the static path it resolves the private
+// variant for (bound base pipeline, baked shadow):
+//   - default baked state -> the base pipeline itself is the variant
+//   - Ready variant       -> bound (deduped; map-owned)
+//   - Pending/Failed      -> deterministic recording failure (submit rejects)
+bool prepare_static_graphics(CommandBufferImpl* cb) {
+    DeviceImpl* d = cb->device;
+    if (!d->dispatch.use_static_graphics_state) { return true; }
+    PipelineRecord* base = cb->bound_base_pipeline;
+    if (base == nullptr) {
+        cmd_record_fail(cb, "draw without a bound graphics pipeline");
+        return false;
+    }
+    if (!cb->graphics_state.dirty_static_state && cb->bound_variant != nullptr &&
+        cb->bound_variant->base == base) {
+        return true;   // the currently bound variant still applies
+    }
+    if (is_default_baked_state(cb->graphics_state)) {
+        if (cb->bound_variant != nullptr) {
+            vkCmdBindPipeline(cb->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, base->vk_pipeline);
+            cb->bound_variant = nullptr;
+        }
+        cb->graphics_state.dirty_static_state = false;
+        return true;
+    }
+    StaticVariantRecord* v = find_or_request_static_variant(d, base, cb->graphics_state);
+    if (v == nullptr) {
+        cmd_record_fail(cb, "static graphics variant allocation failed");
+        return false;
+    }
+    const InternalPipelineState st = v->state.load(std::memory_order_acquire);
+    if (st != InternalPipelineState::Ready) {
+        if (st == InternalPipelineState::Queued || st == InternalPipelineState::Compiling ||
+            st == InternalPipelineState::ProbingCache) {
+            atomic_fetch_add(&d->stat_static_variant_pending, 1);
+        }
+        cmd_record_fail(cb, st == InternalPipelineState::Failed
+                                ? "static graphics variant compile failed"
+                                : "static graphics variant pending");
+        return false;
+    }
+    vkCmdBindPipeline(cb->buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, v->vk_pipeline);
+    cb->bound_variant = v;
+    cb->graphics_state.dirty_static_state = false;
+    return true;
+}
+
 void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> state) {
     auto* d = cmd->device;
     auto& desc = d->depth_stencil_pool[state].desc;
@@ -1262,14 +1354,7 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     // Update the logical shadow (baked members -> variant key on the static
     // fallback; core-dynamic members are applied on every path).
     LogicalGraphicsState& gs = cmd->graphics_state;
-    gs.depth_test_enable      = bool(desc.depth_mode & DepthFlags::Read);
-    gs.depth_write_enable     = bool(desc.depth_mode & DepthFlags::Write);
-    gs.depth_compare          = desc.depth_test;
-    gs.stencil_test_enable    = true;   // matches the current backend behavior
-    gs.stencil_front          = desc.stencil_front;
-    gs.stencil_back           = desc.stencil_back;
-    gs.stencil_read_mask      = desc.stencil_read_mask;
-    gs.stencil_write_mask     = desc.stencil_write_mask;
+    apply_depth_stencil_to_shadow(desc, gs);
     gs.dirty_static_state     = true;
 
     // Core-dynamic (applied on every path): depth bias, stencil references,
@@ -1554,16 +1639,6 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     auto buf = cmd->buffer;
             backend_begin_rendering(d, buf, &rendering_info);
 
-    // Default dynamic state
-    backend_set_depth_write_enable(d, buf, false);
-    backend_set_depth_test_enable(d, buf, false);
-    backend_set_depth_compare_op(d, buf, VK_COMPARE_OP_ALWAYS);
-    backend_set_depth_bounds_test_enable(d, buf, false);
-    backend_set_stencil_test_enable(d, buf, false);
-    vkCmdSetStencilOp(buf, VK_STENCIL_FACE_FRONT_AND_BACK,
-                      VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
-                      VK_COMPARE_OP_ALWAYS);
-
     VkViewport viewport{
         .x        = 0,
         .y        = (float)desc.render_area.height,
@@ -1572,8 +1647,26 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         .minDepth = 0,
         .maxDepth = 1.0,
     };
-    backend_set_viewport_with_count(d, buf, 1, &viewport);
-    backend_set_scissor_with_count(d, buf, 1, &render_rect);
+    // Default dynamic state. On the static fallback the baked depth/stencil
+    // members live in the pipeline variant (the shadow was reset to defaults
+    // at recording start) and only the core-dynamic viewport/scissor are
+    // issued, with plain core-1.0 commands — never call the unavailable EDS
+    // function pointers.
+    if (d->dispatch.use_static_graphics_state) {
+        vkCmdSetViewport(buf, 0, 1, &viewport);
+        vkCmdSetScissor(buf, 0, 1, &render_rect);
+    } else {
+        backend_set_depth_write_enable(d, buf, false);
+        backend_set_depth_test_enable(d, buf, false);
+        backend_set_depth_compare_op(d, buf, VK_COMPARE_OP_ALWAYS);
+        backend_set_depth_bounds_test_enable(d, buf, false);
+        backend_set_stencil_test_enable(d, buf, false);
+        vkCmdSetStencilOp(buf, VK_STENCIL_FACE_FRONT_AND_BACK,
+                          VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
+                          VK_COMPARE_OP_ALWAYS);
+        backend_set_viewport_with_count(d, buf, 1, &viewport);
+        backend_set_scissor_with_count(d, buf, 1, &render_rect);
+    }
     cmd_set_front_face(cmd, FrontFace::CCW);
     cmd_set_cull_mode(cmd, Cull::None);
 }
@@ -1585,6 +1678,7 @@ void cmd_end_render_pass(CommandBuffer cmd) {
 
 void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
               uint32_t vertexCount, uint32_t instanceCount) {
+    if (!prepare_static_graphics(cmd)) { return; }
     retain_buffer(cmd, vertexDataGpu);
     retain_buffer(cmd, fragmentDataGpu);
     push_graphics_ptrs(cmd->device, cmd->buffer, vertexDataGpu, fragmentDataGpu);
@@ -1593,6 +1687,7 @@ void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
 
 void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInfo& args) {
     auto* d = cmd->device;
+    if (!prepare_static_graphics(cmd)) { return; }
     retain_buffer(cmd, args.vertexDataGpu);
     retain_buffer(cmd, args.fragmentDataGpu);
     retain_buffer(cmd, args.indicesGpu);
@@ -1613,6 +1708,7 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
 
 void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedIndirectInfo& args) {
     auto* d = cmd->device;
+    if (!prepare_static_graphics(cmd)) { return; }
     retain_buffer(cmd, args.vertexDataGpu);
     retain_buffer(cmd, args.fragmentDataGpu);
     retain_buffer(cmd, args.indicesGpu);
@@ -1636,6 +1732,7 @@ void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedInd
 
 void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer cmd, const MultiDrawIndirectInfo& args) {
     auto* d = cmd->device;
+    if (!prepare_static_graphics(cmd)) { return; }
     retain_buffer(cmd, args.vertexDataGpu);
     retain_buffer(cmd, args.pixelDataGpu);
     retain_buffer(cmd, args.indicesGpu);

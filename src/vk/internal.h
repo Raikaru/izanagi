@@ -97,6 +97,8 @@ struct DepthStencilState {
 // Pipeline state machine (monotonic; never Ready -> non-Ready).
 enum class InternalPipelineState : uint8_t { Queued, ProbingCache, Compiling, Ready, Failed };
 
+struct StaticVariantRecord;   // defined below (intrusive list head uses it)
+
 // A pipeline record shared by every handle created from an identical
 // description. Owns one contiguous key copy (key_block) that fully
 // determines the VkPipeline. Compiled on a device-owned worker thread;
@@ -104,6 +106,10 @@ enum class InternalPipelineState : uint8_t { Queued, ProbingCache, Compiling, Re
 // command-buffer/in-flight) is released. Dedup only — no retention beyond
 // live references.
 struct PipelineRecord {
+    // Stable identity for semantic hashing (never a public handle address).
+    uint64_t stable_id = 0;
+    // Head of this base's intrusive static-variant list (under pipeline_lock).
+    StaticVariantRecord* first_variant = nullptr;
     std::atomic<InternalPipelineState> state{InternalPipelineState::Queued};
     VkPipeline          vk_pipeline    = VK_NULL_HANDLE;  // published with Ready
     VkPipelineBindPoint bind_point     = VK_PIPELINE_BIND_POINT_COMPUTE;
@@ -257,6 +263,57 @@ struct GpuPtrMap {
     Handle<Buffer> buffer;
 };
 
+// --- Private static graphics variants (static-graphics-state fallback) ----------------
+// Normalized key over the BAKED shadow members + the base pipeline's stable
+// identity. The key carries the static-fallback implementation version and
+// the backend profile id, so variants from a different implementation or
+// profile can never collide. The struct carries padding (align 8 + uint8s),
+// so equality is FIELDWISE and serialization is EXPLICIT field-by-field —
+// never memcmp/memcpy of the raw struct (the trailing padding byte would be
+// nondeterministic).
+inline constexpr uint32_t kStaticVariantImplVersion = 1;
+inline constexpr uint32_t kStaticVariantHeaderMagic = 0x495A5356u;   // "IZSV"
+// Serialized key: header (magic + impl version + profile id = 12 bytes) +
+// 31 body bytes (uint64 + 2 uint32 + 15 uint8, written field-by-field).
+// No padding.
+inline constexpr uint32_t kStaticVariantSerializedSize = 43;
+struct StaticVariantKey {
+    uint64_t base_stable_id = 0;
+    uint32_t impl_version   = kStaticVariantImplVersion;
+    uint32_t profile_id     = 0;         // BackendProfile
+    uint8_t  front_face;                 // 0=CCW, 1=CW
+    uint8_t  cull;                       // public Cull order (0=Front, 1=Back, 2=None)
+    uint8_t  depth_test_enable;
+    uint8_t  depth_write_enable;
+    uint8_t  depth_compare;              // public Op
+    uint8_t  depth_bounds_test_enable;
+    uint8_t  stencil_test_enable;
+    uint8_t  stencil_front_test, stencil_front_fail, stencil_front_pass, stencil_front_depth_fail;
+    uint8_t  stencil_back_test,  stencil_back_fail,  stencil_back_pass,  stencil_back_depth_fail;
+};
+// Lifetime model: the DEVICE MAP OWNS every variant record for the base
+// pipeline's lifetime. Callers (command-buffer binds, prewarm requests) are
+// pure borrows — the base pipeline's retained reference transitively keeps
+// the variant alive (eviction happens only when the base is finally
+// released). The queued worker job retains the BASE (not the record) so a
+// compile can never race eviction; the record is destroyed with its
+// VkPipeline at base eviction. There is intentionally no per-record
+// refcount: a caller-only count would destroy prewarmed variants as soon as
+// the request returned, defeating the prewarm.
+// Each variant is also linked into its base's intrusive list (under
+// pipeline_lock) so final-release eviction is allocation-free: detach the
+// list under the lock, destroy outside it. Never orphan a variant on OOM.
+struct StaticVariantRecord {
+    PipelineRecord* base = nullptr;
+    StaticVariantKey key;
+    std::atomic<InternalPipelineState> state{InternalPipelineState::Queued};
+    VkPipeline vk_pipeline = VK_NULL_HANDLE;
+    VkResult   failure_result = VK_SUCCESS;
+    mutex      wait_mutex = IZ_MUTEX_INIT;   // only wait_graphics_state() sleeps on these
+    condvar    wait_cv;
+    StaticVariantRecord* next_variant = nullptr;   // intrusive list on the base
+};
+
 // --- Vulkan 1.2 dispatch capabilities ------------------------------------------------
 // Which promoted-extension families a device provides and which private
 // fallbacks must be selected. Derived by the pure function below from the
@@ -361,6 +418,12 @@ struct DeviceImpl {
 
     // Queues (single Default queue in v1)
     QueueImpl* default_queue = nullptr;
+
+    // Private static graphics variants (static-graphics-state fallback):
+    // dedup map + worker queue, both under pipeline_lock/compiler_lock.
+    int64_t                     next_pipeline_stable_id = 1;
+    Vector<StaticVariantRecord*> static_variants;
+    Vector<StaticVariantRecord*> variant_queue;
 
     // Pipelines: dedup map + persistent native cache + async compiler worker.
     // pipeline_lock covers the map (and record destruction); compiler_lock
@@ -533,6 +596,10 @@ struct CommandBufferImpl {
 
     // Logical graphics-state shadow (reset at recording start).
     LogicalGraphicsState graphics_state;
+    // Static-variant binding state: the base pipeline selected by
+    // cmd_set_pipeline and the private variant bound at the last draw.
+    PipelineRecord*     bound_base_pipeline = nullptr;
+    StaticVariantRecord* bound_variant      = nullptr;
 
     // Pipelines bound by cmd_set_pipeline (Ready only); each holds one
     // reference. Textures explicitly named by commands (render attachments,
@@ -594,12 +661,21 @@ uint64_t   debug_queue_timeline(DeviceImpl* d);         // last successfully sub
 int64_t    debug_pool_resets(DeviceImpl* d);            // command-pool reuse resets
 bool       debug_validation_active(DeviceImpl* d);      // validation layer actually attached
 void       debug_force_legacy_barriers(DeviceImpl* d, bool force);  // test hook
+bool      debug_using_static_state(DeviceImpl* d);                    // white-box
 void       debug_force_legacy_copy(DeviceImpl* d, bool force);       // test hook
 void       debug_force_static_state(DeviceImpl* d, bool force);      // test hook
 void       debug_derive_dispatch(DeviceImpl* d);                     // re-derive after force toggles
 void       capture_device_capabilities(DeviceImpl* d);                // version+ext+dispatch (device.cpp)
 void       reset_logical_graphics_state(CommandBufferImpl* cb);       // defaults + dirty flags
 const LogicalGraphicsState* debug_cb_graphics_state(CommandBufferImpl* cb);  // white-box
+// Static-variant machinery (pipeline.cpp / commands.cpp).
+StaticVariantRecord* find_or_request_static_variant(DeviceImpl* d, PipelineRecord* base,
+                                                    const LogicalGraphicsState& gs);
+void process_static_variant(DeviceImpl* d, StaticVariantRecord* rec);
+bool prepare_static_graphics(CommandBufferImpl* cb);   // draw-time variant resolution
+// Shared baked-shadow derivation (setter + prewarm must produce identical keys).
+void apply_depth_stencil_to_shadow(const DepthStencilDesc& desc, LogicalGraphicsState& gs);
+bool is_default_baked_state(const LogicalGraphicsState& gs);
 int64_t    debug_stat(DeviceImpl* d, int which);                     // 0=copy2,1=legacy-copy,2=extdyn,3..7=static variants
 bool       debug_bindless_null_slot_written(DeviceImpl* d);   // slot-0 dummy present
 uint32_t   debug_legacy_stage_mask(StageFlags stage);        // legacy barrier stage bits
