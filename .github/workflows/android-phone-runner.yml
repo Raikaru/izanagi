@@ -41,13 +41,13 @@ jobs:
           -DIZANAGI_BUILD_TESTS=ON
           -DIZANAGI_BUILD_EXAMPLES=OFF
           -DIZANAGI_BUILD_CAPABILITY_REPORT=OFF
-      - name: Build Izanagi and common tests
-        run: cmake --build "$BUILD_DIR" --parallel 2
       - name: Run GPU-independent common tests
-        run: ./"$BUILD_DIR"/bin/izanagi_common_tests
+        run: ./bin/izanagi_common_tests
+        working-directory: ${{ env.BUILD_DIR }}
       - name: Run Vulkan API tests on phone (opt-in)
         if: ${{ inputs.run_gpu_tests }}
-        run: ./"$BUILD_DIR"/bin/izanagi_tests
+        run: ./bin/izanagi_tests
+        working-directory: ${{ env.BUILD_DIR }}
       - name: Remove build outputs
         if: ${{ always() }}
         run: rm -rf "$BUILD_DIR"
