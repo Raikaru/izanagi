@@ -119,6 +119,16 @@ jobs:
       - name: Verify Turnip Vulkan capability
         run: ./bin/izanagi_capability_report
         working-directory: ${{ env.BUILD_DIR }}
+      - name: Diagnose Turnip runtime
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          ldd "$DEPS_DIR/turnip/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so" || true
+          echo "--- missing libs ---"
+          ldd "$DEPS_DIR/turnip/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so" 2>/dev/null | grep "not found" || echo "(none)"
+          echo "--- loader debug probe ---"
+          VK_LOADER_DEBUG=error,warn,driver "$BUILD_DIR/bin/izanagi_capability_report" || true
       - name: Run Vulkan API tests on Turnip (push or opt-in)
         if: ${{ github.event_name == 'push' || inputs.run_gpu_tests }}
         run: ./bin/izanagi_tests
