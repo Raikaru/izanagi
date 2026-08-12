@@ -36,6 +36,23 @@ jobs:
           IZANAGI_TESTS_ALLOW_SKIP: 1
         run: ctest --test-dir build --output-on-failure
 
+  linux-arm64-native:
+    # Native ARM64 Linux build + GPU-independent tests on GitHub's free arm64
+    # runners. The phone used to be the only ARM64 Linux builder; it is now a
+    # GPU test device only, so this job holds that coverage.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Configure (Clang Release, headless)
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Test (GPU-independent)
+        run: ./build/bin/izanagi_common_tests
+
   linux-gcc-release:
     runs-on: ubuntu-latest
     steps:

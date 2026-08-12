@@ -1,12 +1,26 @@
 name: android-phone-runner
 
+# Android GPU conformance on the physical phone (Adreno 650).
+#
+# Fast path (default): the Android test host is cross-compiled with the NDK on
+# a GitHub-hosted x86_64 runner and the phone only RUNS it, as a native bionic
+# binary on an adrenotools-loaded Turnip driver. The phone does no compilation.
+#
+# The bionic binaries cannot run inside the runner's proot Debian (the Android
+# loader can't use the sphal namespace there, so no ICD loads and zero devices
+# enumerate). They are dispatched to the Termux uid via tools/phone_exec.sh,
+# which needs tools/phone_exec_daemon.sh running in Termux. See docs/Build.md.
+#
+# The older glibc/proot Turnip lane (phone-side build + run) is preserved
+# behind a manual input for comparison.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
-      run_gpu_tests:
-        description: "Also run the Vulkan API suite locally on the phone"
+      run_glibc_lane:
+        description: "Also run the slower glibc/proot Turnip lane on the phone"
         required: false
         default: false
         type: boolean
@@ -18,9 +32,134 @@ concurrency:
   group: android-phone-runner
   cancel-in-progress: false
 
+env:
+  # Mesa Turnip packaged for adrenotools (bionic). Pinned by tag + SHA-256.
+  TURNIP_APK_URL: https://github.com/K11MCH1/AdrenoToolsDrivers/releases/download/v26.0.0-rc08/Turnip_v26.0.0_R8.zip
+  TURNIP_APK_SHA256: e634db0f929e2205e95511c769071817d0390180ec72c8e690bc76375e813715
+  TURNIP_SONAME: vulkan.ad07xx.so
+  ADRENOTOOLS_COMMIT: 8fae8ce254dfc1344527e05301e43f37dea2df80
+
 jobs:
-  phone-native:
-    # This runner is Debian inside Termux/proot on the Android phone.
+  android-native-build:
+    # Cross-build the bionic test host off-device: the phone should not compile.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+      - name: Install Android NDK r27c
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;27.2.12479018"
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?}}"
+          echo "ANDROID_NDK_HOME=$sdk_root/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Fetch libadrenotools
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/bylaws/libadrenotools external/libadrenotools
+          cd external/libadrenotools
+          git checkout --quiet "$ADRENOTOOLS_COMMIT"
+          git submodule update --init --recursive --depth 1
+      - name: Build adrenotools hooks
+        shell: bash
+        run: >
+          cmake -S external/libadrenotools -B build-adrenotools -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
+          -DCMAKE_BUILD_TYPE=Release &&
+          cmake --build build-adrenotools --parallel
+      - name: Configure Izanagi (Android arm64, bindless, tests on)
+        shell: bash
+        run: >
+          cmake -S . -B build-android -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
+          -DCMAKE_BUILD_TYPE=Release
+          -DIZANAGI_BACKEND=VULKAN_NATIVE -DIZANAGI_VK_PROFILE=BINDLESS
+          -DIZANAGI_WSI=ANDROID
+          -DIZANAGI_BUILD_TESTS=ON -DIZANAGI_BUILD_EXAMPLES=OFF
+          -DIZANAGI_BUILD_CAPABILITY_REPORT=ON
+          -DIZANAGI_ADRENOTOOLS_ROOT="$GITHUB_WORKSPACE/external/libadrenotools"
+      - name: Build Izanagi Android test host
+        run: cmake --build build-android --parallel
+      - name: Fetch pinned Turnip driver package
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --retry 3 --connect-timeout 15 --max-time 300 -L --fail --silent --show-error \
+            -o turnip.zip "$TURNIP_APK_URL"
+          printf '%s  %s\n' "$TURNIP_APK_SHA256" turnip.zip | sha256sum -c -
+          mkdir -p payload/turnip
+          unzip -q turnip.zip -d payload/turnip
+          test -f "payload/turnip/$TURNIP_SONAME"
+      - name: Assemble phone payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp build-android/bin/izanagi_tests build-android/bin/izanagi_capability_report payload/
+          cp -r build-android/bin/shaders payload/
+          cp build-adrenotools/src/hook/*.so payload/
+          ls -l payload
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: android-payload
+          path: payload/
+          retention-days: 3
+
+  phone-native-test:
+    # The phone RUNS only. Bionic + adrenotools Turnip, dispatched outside proot.
+    needs: android-native-build
+    runs-on: [self-hosted, android-phone]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: android-payload
+          path: android-payload
+      - name: Report phone environment
+        run: |
+          uname -a
+          ls -l android-payload
+      - name: Vulkan capability report (bionic + Turnip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x tools/phone_exec.sh
+          cat <<EOF | tools/phone_exec.sh
+          set -euo pipefail
+          PAY="\$IZ_ROOTFS$GITHUB_WORKSPACE/android-payload"
+          chmod 755 "\$PAY/izanagi_capability_report" "\$PAY/izanagi_tests"
+          export LD_LIBRARY_PATH=/system/lib64:/apex/com.android.i18n/lib64
+          export IZANAGI_ADRENOTOOLS_DRIVER_DIR="\$PAY/turnip/"
+          export IZANAGI_ADRENOTOOLS_DRIVER_NAME=$TURNIP_SONAME
+          export IZANAGI_ADRENOTOOLS_HOOK_DIR="\$PAY/"
+          cd "\$PAY" && ./izanagi_capability_report
+          EOF
+      - name: Vulkan API suite (bionic + Turnip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat <<EOF | tools/phone_exec.sh
+          set -euo pipefail
+          PAY="\$IZ_ROOTFS$GITHUB_WORKSPACE/android-payload"
+          export LD_LIBRARY_PATH=/system/lib64:/apex/com.android.i18n/lib64
+          export IZANAGI_ADRENOTOOLS_DRIVER_DIR="\$PAY/turnip/"
+          export IZANAGI_ADRENOTOOLS_DRIVER_NAME=$TURNIP_SONAME
+          export IZANAGI_ADRENOTOOLS_HOOK_DIR="\$PAY/"
+          cd "\$PAY" && ./izanagi_tests
+          EOF
+      - name: Remove payload
+        if: ${{ always() }}
+        run: rm -rf android-payload
+
+  phone-glibc-test:
+    # Legacy lane: build + run on the phone under glibc/proot with Turnip/KGSL.
+    # Manual only — the bionic lane above is the default coverage.
+    if: ${{ inputs.run_glibc_lane }}
     runs-on: [self-hosted, android-phone]
     timeout-minutes: 60
     env:
@@ -92,12 +231,6 @@ jobs:
           echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$loader_root/usr/lib/aarch64-linux-gnu:$turnip_root/usr/lib/aarch64-linux-gnu:$turnip_root/usr/lib/aarch64-linux-gnu/dri${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "LIBGL_DRIVERS_PATH=$turnip_root/usr/lib/aarch64-linux-gnu/dri" >> "$GITHUB_ENV"
-      - name: Report phone runner toolchain
-        run: |
-          uname -a
-          cmake --version
-          ninja --version
-          clang --version
       - name: Configure native ARM64 build
         run: >
           cmake -S . -B "$BUILD_DIR" -G Ninja
@@ -120,18 +253,7 @@ jobs:
       - name: Verify Turnip Vulkan capability
         run: ./bin/izanagi_capability_report
         working-directory: ${{ env.BUILD_DIR }}
-      - name: Diagnose Turnip runtime
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          ldd "$DEPS_DIR/turnip/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so" || true
-          echo "--- missing libs ---"
-          ldd "$DEPS_DIR/turnip/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so" 2>/dev/null | grep "not found" || echo "(none)"
-          echo "--- loader debug probe ---"
-          VK_LOADER_DEBUG=error,warn,driver "$BUILD_DIR/bin/izanagi_capability_report" || true
-      - name: Run Vulkan API tests on Turnip (push or opt-in)
-        if: ${{ github.event_name == 'push' || inputs.run_gpu_tests }}
+      - name: Run Vulkan API tests on Turnip
         run: ./bin/izanagi_tests
         working-directory: ${{ env.BUILD_DIR }}
       - name: Remove build outputs

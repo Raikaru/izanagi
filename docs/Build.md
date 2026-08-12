@@ -70,9 +70,49 @@ an older Vulkan profile than Izanagi's bindless requirements.
 The `android-phone-runner` workflow is for the phone itself acting as a
 GitHub Actions ARM64 runner. It runs inside a Debian userspace provided by
 Termux/proot and uses the labels `self-hosted`, `linux`, and `android-phone`.
-On each job it installs the pinned Debian ARM64 Mesa Turnip package and
-selects the KGSL backend. The phone must remain awake, charging, online, and
-exempted from Samsung battery optimization for Termux.
+The phone must remain awake, charging, online, and exempted from Samsung
+battery optimization for Termux.
+
+### Fast lane: native bionic tests (default)
+
+The Android test host is cross-compiled with the NDK on a GitHub-hosted
+x86_64 runner, packaged with the pinned adrenotools Turnip driver and the
+adrenotools hook libraries, and uploaded as an artifact. The phone only
+downloads and runs it, so it never compiles.
+
+Those binaries are bionic, and bionic Vulkan does not work inside proot: the
+Android loader reports `Loading vulkan.adreno.so from current namespace
+instead of sphal namespace`, adrenotools' hook never engages, and
+`vkEnumeratePhysicalDevices` returns zero devices. The run is therefore
+dispatched to the Termux uid outside proot:
+
+- `tools/phone_exec_daemon.sh` runs in Termux (outside proot) and watches a
+  spool directory inside the Debian rootfs;
+- `tools/phone_exec.sh` runs inside the job, submits a script, and returns its
+  output and exit code.
+
+Start the daemon once per boot from a Termux session:
+
+```sh
+bash ~/bin/phone_exec_daemon.sh &
+```
+
+Install `Termux:Boot` and drop the same line in `~/.termux/boot/` to survive
+reboots. proot's `root` is the same Android uid as Termux, so the dispatcher
+grants a job no privileges it did not already have — but it does let job code
+run outside the proot view, so keep the workflow limited to reviewed `main`
+pushes.
+
+Replacement drivers are selected with `IZANAGI_ADRENOTOOLS_DRIVER_DIR`,
+`IZANAGI_ADRENOTOOLS_DRIVER_NAME`, and `IZANAGI_ADRENOTOOLS_HOOK_DIR`; build
+the hosts with `-DIZANAGI_ADRENOTOOLS_ROOT=<libadrenotools checkout>`.
+
+### Legacy lane: glibc/proot Turnip (manual)
+
+The original lane builds on the phone under Debian and runs the suite against
+the pinned Debian ARM64 Mesa Turnip package with the KGSL backend. It is now
+manual only (`run_glibc_lane` input); native ARM64 Linux build coverage moved
+to GitHub's free `ubuntu-24.04-arm` runners.
 
 Register the runner with the ARM64 Linux runner package and a repository runner
 token generated in **Settings → Actions → Runners → New self-hosted runner**.
