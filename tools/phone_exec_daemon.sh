@@ -28,7 +28,10 @@ mkdir -p "$SPOOL" || exit 1
 echo "phone-exec: watching $SPOOL (rootfs $ROOTFS)"
 
 while true; do
-    date +%s > "$SPOOL/daemon.alive.tmp" 2>/dev/null && mv -f "$SPOOL/daemon.alive.tmp" "$SPOOL/daemon.alive"
+    # Per-PID temp file: a second daemon instance must not race this write.
+    if date +%s > "$SPOOL/daemon.alive.$$" 2>/dev/null; then
+        mv -f "$SPOOL/daemon.alive.$$" "$SPOOL/daemon.alive" 2>/dev/null
+    fi
     for req in "$SPOOL"/*.cmd; do
         [ -e "$req" ] || continue
         id="$(basename "$req" .cmd)"
