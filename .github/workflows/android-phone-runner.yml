@@ -78,12 +78,13 @@ jobs:
           fi
           test -r /dev/kgsl-3d0
           loader_root="$DEPS_DIR/vkloader"
-          if [ ! -f "$loader_root/.izanagi-complete" ]; then
+          if [ ! -f "$loader_root/.izanagi-complete-v2" ]; then
             rm -rf "$loader_root"
             mkdir -p "$loader_root"
-            (cd "$RUNNER_TEMP" && rm -f libvulkan1_*.deb && apt-get download libvulkan1 \
-              && dpkg-deb -x libvulkan1_*.deb "$loader_root" && rm -f libvulkan1_*.deb)
-            touch "$loader_root/.izanagi-complete"
+            pkgs="libvulkan1 libdrm2 libxcb-dri3-0 libwayland-client0 libx11-xcb1 libxcb-present0 libxcb-xfixes0 libxcb-sync1 libxcb-randr0 libxcb-shm0 libxshmfence1"
+            (cd "$RUNNER_TEMP" && rm -f ./*.deb && apt-get download $pkgs \
+              && for deb in ./*.deb; do dpkg-deb -x "$deb" "$loader_root"; done && rm -f ./*.deb)
+            touch "$loader_root/.izanagi-complete-v2"
           fi
           icd="$turnip_root/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json"
           echo "MESA_LOADER_DRIVER_OVERRIDE=kgsl" >> "$GITHUB_ENV"
