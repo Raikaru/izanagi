@@ -59,19 +59,20 @@ values to the workflow:
 - `adb_pair_address`: the temporary pairing `IP address & Port`;
 - `adb_pairing_code`: the six-digit Wi-Fi pairing code;
 - `adb_device_address`: the debugging `IP address & Port` used by `adb connect`.
-The workflow always builds and runs the GPU-independent common tests on the
-device. The Vulkan API suite is opt-in (`run_gpu_tests`) and must only be used
-on a device whose Vulkan capabilities have been separately qualified.
+The phone workflow builds and runs the GPU-independent common tests, verifies
+the pinned Mesa Turnip Vulkan driver, and runs the Vulkan API suite on every
+`main` push. Manual dispatch can also opt into the API suite. The stock
+Qualcomm Vulkan driver is not used for conformance because this phone reports
+an older Vulkan profile than Izanagi's bindless requirements.
 
 ## Android phone as a GitHub runner
 
 The `android-phone-runner` workflow is for the phone itself acting as a
 GitHub Actions ARM64 runner. It runs inside a Debian userspace provided by
 Termux/proot and uses the labels `self-hosted`, `linux`, and `android-phone`.
-It is manually triggered so a personal phone never executes arbitrary pull
-request code automatically. This workflow does not use ADB pairing; its jobs
-already execute on the phone. The phone must remain awake, charging, online,
-and exempted from Samsung battery optimization for Termux.
+On each job it installs the pinned Debian ARM64 Mesa Turnip package and
+selects the KGSL backend. The phone must remain awake, charging, online, and
+exempted from Samsung battery optimization for Termux.
 
 Register the runner with the ARM64 Linux runner package and a repository runner
 token generated in **Settings → Actions → Runners → New self-hosted runner**.
@@ -82,8 +83,8 @@ CoreCLR may fail its default heap reservation with error `0x8007000E`.
 
 ### Self-hosted runner security
 
-- Keep the phone workflow `workflow_dispatch`-only. Do not route
-  `pull_request` or unreviewed branch jobs to the phone.
+- Keep the phone workflow limited to reviewed `main` pushes and manual runs.
+  Do not route `pull_request` or unreviewed branch jobs to the phone.
 - Use the unique `android-phone` label and a repository-scoped runner group;
   never use a generic self-hosted label by itself.
 - Do not place repository secrets, signing keys, personal SSH keys, or cloud

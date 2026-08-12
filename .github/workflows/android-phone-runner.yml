@@ -25,8 +25,29 @@ jobs:
     timeout-minutes: 60
     env:
       BUILD_DIR: build-phone
+      TURNIP_URL: https://github.com/lfdevs/mesa-for-android-container/releases/download/mesa-26.2.0-devel-20260709/mesa-for-android-container_26.2.0-devel-20260709_debian_trixie_arm64.tar.gz
+      TURNIP_SHA256: 4ee525b4844fb189f3762ff75ef77f5b80eee8f6cdab2e5588731b5c9f8168bb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install pinned Turnip driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/turnip.tar.gz"
+          turnip_root="$RUNNER_TEMP/turnip"
+          curl -L --fail --silent --show-error "$TURNIP_URL" -o "$archive"
+          printf '%s  %s\n' "$TURNIP_SHA256" "$archive" | sha256sum -c -
+          rm -rf "$turnip_root"
+          mkdir -p "$turnip_root"
+          tar -xzf "$archive" -C "$turnip_root"
+          test -r /dev/kgsl-3d0
+          icd="$turnip_root/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json"
+          sed -i "s#/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so#$turnip_root/usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so#" "$icd"
+          echo "MESA_LOADER_DRIVER_OVERRIDE=kgsl" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$turnip_root/usr/lib/aarch64-linux-gnu:$turnip_root/usr/lib/aarch64-linux-gnu/dri${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "LIBGL_DRIVERS_PATH=$turnip_root/usr/lib/aarch64-linux-gnu/dri" >> "$GITHUB_ENV"
       - name: Report phone runner toolchain
         run: |
           uname -a
@@ -37,17 +58,22 @@ jobs:
         run: >
           cmake -S . -B "$BUILD_DIR" -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DIZANAGI_BACKEND=VULKAN_NATIVE
+          -DIZANAGI_VK_PROFILE=BINDLESS
           -DIZANAGI_WSI=HEADLESS
           -DIZANAGI_BUILD_TESTS=ON
           -DIZANAGI_BUILD_EXAMPLES=OFF
-          -DIZANAGI_BUILD_CAPABILITY_REPORT=OFF
+          -DIZANAGI_BUILD_CAPABILITY_REPORT=ON
       - name: Build Izanagi and common tests
         run: cmake --build "$BUILD_DIR" --parallel 2
       - name: Run GPU-independent common tests
         run: ./bin/izanagi_common_tests
         working-directory: ${{ env.BUILD_DIR }}
-      - name: Run Vulkan API tests on phone (opt-in)
-        if: ${{ inputs.run_gpu_tests }}
+      - name: Verify Turnip Vulkan capability
+        run: ./bin/izanagi_capability_report
+        working-directory: ${{ env.BUILD_DIR }}
+      - name: Run Vulkan API tests on Turnip (push or opt-in)
+        if: ${{ github.event_name == 'push' || inputs.run_gpu_tests }}
         run: ./bin/izanagi_tests
         working-directory: ${{ env.BUILD_DIR }}
       - name: Remove build outputs

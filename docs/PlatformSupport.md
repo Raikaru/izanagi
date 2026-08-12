@@ -9,7 +9,7 @@ only when the required conformance passes on physical hardware.
 |---|---|---|---|
 | Windows | Vulkan Native | `IZANAGI_VK_NATIVE_1` + `IZANAGI_VK_BINDLESS_1` | Certified baseline on the RTX 4080: full suite (37 tests) passes on both profiles; CI. |
 | Linux | Vulkan Native | — | Builds + common tests on CI; headless Vulkan conformance pending a GPU runner. |
-| Android | Vulkan Bindless (experimental) | `IZANAGI_VK_BINDLESS_1` | Arm64 NDK cross-build on CI; optional common-test execution through either a self-hosted wireless-ADB runner or the phone-hosted GitHub runner. Physical Vulkan conformance and Android WSI remain experimental. |
+| Android | Vulkan Bindless via Mesa Turnip (experimental) | `IZANAGI_VK_BINDLESS_1` | Arm64 NDK cross-build on CI; phone-hosted CI runs the bindless build and Vulkan suite through pinned Turnip/KGSL. Stock Qualcomm Vulkan remains a capability-rejection path. Physical Android support is experimental. |
 | macOS | Metal (planned) | — | Build boundary in place; backend in a later phase. |
 | iOS | Metal (planned) | — | Declared; simulator/device phases planned. |
 
