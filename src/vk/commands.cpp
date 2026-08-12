@@ -8,29 +8,34 @@
 namespace gpu {
 
 // Vulkan 1.3 commands are available on 1.2 devices only through their KHR/EXT
-// extensions. Under the bindless profile the core-1.3 names are aliased to
-// the extension entry points (enabled extensions guarantee the functions
-// resolve; on 1.3+ devices the extension entry points are the same code).
-#if defined(IZ_VK_PROFILE_BINDLESS)
-#    define vkQueueSubmit2             vkQueueSubmit2KHR
-#    define vkCmdPipelineBarrier2      vkCmdPipelineBarrier2KHR
-#    define vkCmdBeginRendering        vkCmdBeginRenderingKHR
-#    define vkCmdEndRendering          vkCmdEndRenderingKHR
-#    define vkCmdCopyBuffer2           vkCmdCopyBuffer2KHR
-#    define vkCmdCopyBufferToImage2    vkCmdCopyBufferToImage2KHR
-#    define vkCmdCopyImageToBuffer2    vkCmdCopyImageToBuffer2KHR
-#    define vkCmdBlitImage2            vkCmdBlitImage2KHR
-#    define vkCmdSetDepthWriteEnable       vkCmdSetDepthWriteEnableEXT
-#    define vkCmdSetDepthTestEnable        vkCmdSetDepthTestEnableEXT
-#    define vkCmdSetDepthCompareOp         vkCmdSetDepthCompareOpEXT
-#    define vkCmdSetDepthBoundsTestEnable  vkCmdSetDepthBoundsTestEnableEXT
-#    define vkCmdSetStencilTestEnable      vkCmdSetStencilTestEnableEXT
-#    define vkCmdSetStencilOp              vkCmdSetStencilOpEXT
-#    define vkCmdSetViewportWithCount      vkCmdSetViewportWithCountEXT
-#    define vkCmdSetScissorWithCount       vkCmdSetScissorWithCountEXT
-#    define vkCmdSetFrontFace              vkCmdSetFrontFaceEXT
-#    define vkCmdSetCullMode               vkCmdSetCullModeEXT
-#endif
+// extensions. There are NO compile-time aliases: dispatch is route-aware
+// (core symbols on 1.3+, extension symbols on 1.2), because promoted-but-
+// unadvertised extension names must never be enabled and the core symbols do
+// not resolve on 1.2 devices.
+static inline bool route_is_core13(const DeviceImpl* d) {
+    return d->dispatch.effective_api_version >= VK_API_VERSION_1_3;
+}
+
+// --- Route-aware dispatch helpers ----------------------------------------------------
+// Core-1.3 symbols on 1.3+, KHR/EXT symbols on the 1.2 extension route.
+
+static void backend_pipeline_barrier2(DeviceImpl* d, VkCommandBuffer cmd, const VkDependencyInfo* info) {
+    if (route_is_core13(d)) { vkCmdPipelineBarrier2(cmd, info); } else { vkCmdPipelineBarrier2KHR(cmd, info); }
+}
+
+static VkResult backend_queue_submit2(DeviceImpl* d, VkQueue q, uint32_t count,
+                                      const VkSubmitInfo2* info, VkFence fence) {
+    if (route_is_core13(d)) { return vkQueueSubmit2(q, count, info, fence); }
+    return vkQueueSubmit2KHR(q, count, info, fence);
+}
+
+static void backend_begin_rendering(DeviceImpl* d, VkCommandBuffer cmd, const VkRenderingInfo* info) {
+    if (route_is_core13(d)) { vkCmdBeginRendering(cmd, info); } else { vkCmdBeginRenderingKHR(cmd, info); }
+}
+
+static void backend_end_rendering(DeviceImpl* d, VkCommandBuffer cmd) {
+    if (route_is_core13(d)) { vkCmdEndRendering(cmd); } else { vkCmdEndRenderingKHR(cmd); }
+}
 
 // --- Descriptor heap binding ---------------------------------------------------------
 
@@ -459,7 +464,7 @@ Submission queue_submit(Queue                     q,
             .imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size()),
             .pImageMemoryBarriers     = image_barriers.data(),
         };
-                vkCmdPipelineBarrier2(internal_cmd->buffer, &dependency_info);
+                backend_pipeline_barrier2(d, internal_cmd->buffer, &dependency_info);
         cmd_finalize(internal_cmd);
         command_info = concat(arena, command_info,
                               VkCommandBufferSubmitInfo{
@@ -639,7 +644,7 @@ Submission queue_submit(Queue                     q,
         .pSignalSemaphoreInfos    = signal_info.data(),
     };
 
-    const VkResult result =         vkQueueSubmit2(q->queue, 1, &submit_info, VK_NULL_HANDLE);
+    const VkResult result =         backend_queue_submit2(d, q->queue, 1, &submit_info, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) {
         atomic_fetch_add(&d->stat_failed_submits, 1);
         log_vk_impl(d, result, "queue_submit: vkQueueSubmit2 failed", __LINE__, "commands.cpp"_sv);
@@ -789,6 +794,48 @@ int64_t debug_pool_resets(DeviceImpl* d) {
     return atomic_load(&d->stat_pool_resets);
 }
 
+// Extended-dynamic-state setters: core-1.3 symbols on 1.3+, EXT symbols on
+// the 1.2 route. Only called when the dynamic-state path is selected (not on
+// the static-variant fallback).
+#define IZ_BACKEND_EDS_HELPER(name)                                                        \
+    static void backend_##name(DeviceImpl* d, VkCommandBuffer cmd, auto... args) {         \
+        if (route_is_core13(d)) { vk##name(cmd, args...); } else { vk##name##EXT(cmd, args...); } \
+    }
+
+static void backend_set_front_face(DeviceImpl* d, VkCommandBuffer cmd, VkFrontFace face) {
+    if (route_is_core13(d)) { vkCmdSetFrontFace(cmd, face); } else { vkCmdSetFrontFaceEXT(cmd, face); }
+}
+static void backend_set_cull_mode(DeviceImpl* d, VkCommandBuffer cmd, VkCullModeFlags mode) {
+    if (route_is_core13(d)) { vkCmdSetCullMode(cmd, mode); } else { vkCmdSetCullModeEXT(cmd, mode); }
+}
+static void backend_set_depth_write_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    if (route_is_core13(d)) { vkCmdSetDepthWriteEnable(cmd, b); } else { vkCmdSetDepthWriteEnableEXT(cmd, b); }
+}
+static void backend_set_depth_test_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    if (route_is_core13(d)) { vkCmdSetDepthTestEnable(cmd, b); } else { vkCmdSetDepthTestEnableEXT(cmd, b); }
+}
+static void backend_set_depth_compare_op(DeviceImpl* d, VkCommandBuffer cmd, VkCompareOp op) {
+    if (route_is_core13(d)) { vkCmdSetDepthCompareOp(cmd, op); } else { vkCmdSetDepthCompareOpEXT(cmd, op); }
+}
+static void backend_set_depth_bounds_test_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    if (route_is_core13(d)) { vkCmdSetDepthBoundsTestEnable(cmd, b); } else { vkCmdSetDepthBoundsTestEnableEXT(cmd, b); }
+}
+static void backend_set_stencil_test_enable(DeviceImpl* d, VkCommandBuffer cmd, VkBool32 b) {
+    if (route_is_core13(d)) { vkCmdSetStencilTestEnable(cmd, b); } else { vkCmdSetStencilTestEnableEXT(cmd, b); }
+}
+static void backend_set_stencil_op(DeviceImpl* d, VkCommandBuffer cmd, VkStencilFaceFlags face,
+                                   VkStencilOp fail, VkStencilOp pass, VkStencilOp depth_fail,
+                                   VkCompareOp compare) {
+    if (route_is_core13(d)) { vkCmdSetStencilOp(cmd, face, fail, pass, depth_fail, compare); }
+    else { vkCmdSetStencilOpEXT(cmd, face, fail, pass, depth_fail, compare); }
+}
+static void backend_set_viewport_with_count(DeviceImpl* d, VkCommandBuffer cmd, uint32_t n, const VkViewport* v) {
+    if (route_is_core13(d)) { vkCmdSetViewportWithCount(cmd, n, v); } else { vkCmdSetViewportWithCountEXT(cmd, n, v); }
+}
+static void backend_set_scissor_with_count(DeviceImpl* d, VkCommandBuffer cmd, uint32_t n, const VkRect2D* r) {
+    if (route_is_core13(d)) { vkCmdSetScissorWithCount(cmd, n, r); } else { vkCmdSetScissorWithCountEXT(cmd, n, r); }
+}
+
 // --- Backend copy dispatch -----------------------------------------------------------
 // Selects the modern (VK_KHR_copy_commands2) or legacy copy/blit command from
 // the device's dispatch capabilities. Region conversions use stack storage for
@@ -852,7 +899,7 @@ void backend_copy_buffer(CommandBufferImpl* cb, const VkCopyBufferInfo2& info) {
     auto* d = cb->device;
     if (!d->dispatch.use_legacy_copy_commands) {
         atomic_fetch_add(&d->stat_copy2_calls, 1);
-        vkCmdCopyBuffer2(cb->buffer, &info);
+        if (route_is_core13(d)) { vkCmdCopyBuffer2(cb->buffer, &info); } else { vkCmdCopyBuffer2KHR(cb->buffer, &info); }
         return;
     }
     atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
@@ -878,7 +925,7 @@ void backend_copy_buffer_to_image(CommandBufferImpl* cb, const VkCopyBufferToIma
     auto* d = cb->device;
     if (!d->dispatch.use_legacy_copy_commands) {
         atomic_fetch_add(&d->stat_copy2_calls, 1);
-        vkCmdCopyBufferToImage2(cb->buffer, &info);
+        if (route_is_core13(d)) { vkCmdCopyBufferToImage2(cb->buffer, &info); } else { vkCmdCopyBufferToImage2KHR(cb->buffer, &info); }
         return;
     }
     atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
@@ -905,7 +952,7 @@ void backend_copy_image_to_buffer(CommandBufferImpl* cb, const VkCopyImageToBuff
     auto* d = cb->device;
     if (!d->dispatch.use_legacy_copy_commands) {
         atomic_fetch_add(&d->stat_copy2_calls, 1);
-        vkCmdCopyImageToBuffer2(cb->buffer, &info);
+        if (route_is_core13(d)) { vkCmdCopyImageToBuffer2(cb->buffer, &info); } else { vkCmdCopyImageToBuffer2KHR(cb->buffer, &info); }
         return;
     }
     atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
@@ -932,7 +979,7 @@ void backend_blit_image(CommandBufferImpl* cb, const VkBlitImageInfo2& info) {
     auto* d = cb->device;
     if (!d->dispatch.use_legacy_copy_commands) {
         atomic_fetch_add(&d->stat_copy2_calls, 1);
-        vkCmdBlitImage2(cb->buffer, &info);
+        if (route_is_core13(d)) { vkCmdBlitImage2(cb->buffer, &info); } else { vkCmdBlitImage2KHR(cb->buffer, &info); }
         return;
     }
     atomic_fetch_add(&d->stat_legacy_copy_calls, 1);
@@ -1110,7 +1157,7 @@ void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
         .imageMemoryBarrierCount  = 0,
         .pImageMemoryBarriers     = nullptr,
     };
-            vkCmdPipelineBarrier2(cmd->buffer, &info);
+            backend_pipeline_barrier2(d, cmd->buffer, &info);
 }
 
 void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
@@ -1193,18 +1240,18 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
     auto* d = cmd->device;
     auto& desc = d->depth_stencil_pool[state].desc;
 
-    vkCmdSetDepthWriteEnable(cmd->buffer, bool(desc.depth_mode & DepthFlags::Write));
-    vkCmdSetDepthTestEnable(cmd->buffer, bool(desc.depth_mode & DepthFlags::Read));
-    vkCmdSetDepthCompareOp(cmd->buffer, bridge(desc.depth_test));
+    backend_set_depth_write_enable(d, cmd->buffer, bool(desc.depth_mode & DepthFlags::Write));
+    backend_set_depth_test_enable(d, cmd->buffer, bool(desc.depth_mode & DepthFlags::Read));
+    backend_set_depth_compare_op(d, cmd->buffer, bridge(desc.depth_test));
     vkCmdSetDepthBias(cmd->buffer, desc.depth_bias, desc.depth_bias_clamp,
                       desc.depth_bias_slope_factor);
 
-    vkCmdSetStencilTestEnable(cmd->buffer, true);
-    vkCmdSetStencilOp(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT,
+    backend_set_stencil_test_enable(d, cmd->buffer, true);
+    backend_set_stencil_op(d, cmd->buffer, VK_STENCIL_FACE_FRONT_BIT,
                       bridge(desc.stencil_front.fail_op), bridge(desc.stencil_front.pass_op),
                       bridge(desc.stencil_front.depth_fail_op), bridge(desc.stencil_front.test));
     vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_FRONT_BIT, desc.stencil_front.reference);
-    vkCmdSetStencilOp(cmd->buffer, VK_STENCIL_FACE_BACK_BIT,
+    backend_set_stencil_op(d, cmd->buffer, VK_STENCIL_FACE_BACK_BIT,
                       bridge(desc.stencil_back.fail_op), bridge(desc.stencil_back.pass_op),
                       bridge(desc.stencil_back.depth_fail_op), bridge(desc.stencil_back.test));
     vkCmdSetStencilReference(cmd->buffer, VK_STENCIL_FACE_BACK_BIT, desc.stencil_back.reference);
@@ -1213,6 +1260,7 @@ void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> st
 }
 
 void cmd_set_viewport(CommandBuffer cmd, const Rect2D& rect) {
+    auto* d = cmd->device;
     VkViewport viewport{
         .x        = static_cast<float>(rect.offset_x),
         .y        = static_cast<float>(rect.offset_y + rect.height),
@@ -1221,25 +1269,28 @@ void cmd_set_viewport(CommandBuffer cmd, const Rect2D& rect) {
         .minDepth = 0,
         .maxDepth = 1.0,
     };
-    vkCmdSetViewportWithCount(cmd->buffer, 1, &viewport);
+    backend_set_viewport_with_count(d, cmd->buffer, 1, &viewport);
 }
 
 void cmd_set_scissor_rect(CommandBuffer cmd, const Rect2D& rect) {
+    auto* d = cmd->device;
     const VkRect2D vk_rect{
         .offset = {.x = (int32_t)rect.offset_x, .y = (int32_t)rect.offset_y},
         .extent = {.width = rect.width, .height = rect.height},
     };
-    vkCmdSetScissorWithCount(cmd->buffer, 1, &vk_rect);
+    backend_set_scissor_with_count(d, cmd->buffer, 1, &vk_rect);
 }
 
 void cmd_set_front_face(CommandBuffer cmd, FrontFace front) {
-    vkCmdSetFrontFace(cmd->buffer,
-                      front == FrontFace::CCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE
-                                              : VK_FRONT_FACE_CLOCKWISE);
+    auto* d = cmd->device;
+    backend_set_front_face(d, cmd->buffer,
+                           front == FrontFace::CCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                   : VK_FRONT_FACE_CLOCKWISE);
 }
 
 void cmd_set_cull_mode(CommandBuffer cmd, Cull cull) {
-    vkCmdSetCullMode(cmd->buffer, bridge(cull));
+    auto* d = cmd->device;
+    backend_set_cull_mode(d, cmd->buffer, bridge(cull));
 }
 
 // --- Push data (root arguments) ------------------------------------------------------
@@ -1442,14 +1493,14 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
     };
 
     auto buf = cmd->buffer;
-            vkCmdBeginRendering(buf, &rendering_info);
+            backend_begin_rendering(d, buf, &rendering_info);
 
     // Default dynamic state
-    vkCmdSetDepthWriteEnable(buf, false);
-    vkCmdSetDepthTestEnable(buf, false);
-    vkCmdSetDepthCompareOp(buf, VK_COMPARE_OP_ALWAYS);
-    vkCmdSetDepthBoundsTestEnable(buf, false);
-    vkCmdSetStencilTestEnable(buf, false);
+    backend_set_depth_write_enable(d, buf, false);
+    backend_set_depth_test_enable(d, buf, false);
+    backend_set_depth_compare_op(d, buf, VK_COMPARE_OP_ALWAYS);
+    backend_set_depth_bounds_test_enable(d, buf, false);
+    backend_set_stencil_test_enable(d, buf, false);
     vkCmdSetStencilOp(buf, VK_STENCIL_FACE_FRONT_AND_BACK,
                       VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
                       VK_COMPARE_OP_ALWAYS);
@@ -1462,14 +1513,15 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         .minDepth = 0,
         .maxDepth = 1.0,
     };
-    vkCmdSetViewportWithCount(buf, 1, &viewport);
-    vkCmdSetScissorWithCount(buf, 1, &render_rect);
+    backend_set_viewport_with_count(d, buf, 1, &viewport);
+    backend_set_scissor_with_count(d, buf, 1, &render_rect);
     cmd_set_front_face(cmd, FrontFace::CCW);
     cmd_set_cull_mode(cmd, Cull::None);
 }
 
 void cmd_end_render_pass(CommandBuffer cmd) {
-            vkCmdEndRendering(cmd->buffer);
+    auto* d = cmd->device;
+    backend_end_rendering(d, cmd->buffer);
 }
 
 void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
@@ -1585,7 +1637,7 @@ void cmd_wait_for_surface_texture(CommandBuffer cmd) {
         .imageMemoryBarrierCount  = 1,
         .pImageMemoryBarriers     = &image_barrier,
     };
-            vkCmdPipelineBarrier2(cmd->buffer, &info);
+            backend_pipeline_barrier2(d, cmd->buffer, &info);
 }
 
 void cmd_signal_surface_texture(CommandBuffer cmd) {
@@ -1624,7 +1676,7 @@ void cmd_signal_surface_texture(CommandBuffer cmd) {
         .imageMemoryBarrierCount  = 1,
         .pImageMemoryBarriers     = &image_barrier,
     };
-            vkCmdPipelineBarrier2(cmd->buffer, &info);
+            backend_pipeline_barrier2(d, cmd->buffer, &info);
 }
 
 // --- Debug groups ----------------------------------------------------------------------
