@@ -77,9 +77,11 @@ static void init(Device device, void* userdata) {
 
     // Sampler
     SamplerDesc sampler_desc{
-        .coord   = SamplerCoords::Normalized,
-        .filter  = SamplerFilter::Linear,
-        .address = SamplerAddressing::ClampToEdge,
+        .coord       = SamplerCoords::Normalized,
+        .min_filter  = SamplerFilter::Linear,
+        .mag_filter  = SamplerFilter::Linear,
+        .mip_filter  = SamplerFilter::Linear,
+        .address     = SamplerAddressing::ClampToEdge,
     };
     state->sampler = create_sampler(device, sampler_desc);
 

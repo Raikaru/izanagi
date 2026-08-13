@@ -213,6 +213,7 @@ install(FILES
 )
 
 # --- Shader toolchain ---------------------------------------------------------
+include(cmake/IzanagiCompileShader.cmake)
 if(IZANAGI_BUILD_TESTS OR IZANAGI_BUILD_EXAMPLES)
     include(cmake/CompileSlangShader.cmake)
 endif()

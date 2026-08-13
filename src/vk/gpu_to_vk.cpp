@@ -198,6 +198,8 @@ VkPrimitiveTopology bridge(Topology topo) {
     switch (topo) {
         case Topology::TriangleList: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         case Topology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        case Topology::LineList: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        case Topology::LineStrip: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
         default: return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     }
 }
@@ -297,6 +299,7 @@ VkBlendFactor bridge(Factor factor) {
         case Factor::DstColor: return VK_BLEND_FACTOR_DST_COLOR;
         case Factor::OneMinusDstColor: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
         case Factor::SrcAlpha: return VK_BLEND_FACTOR_SRC_ALPHA;
+        case Factor::SrcAlphaSaturate: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
         case Factor::OneMinusSrcAlpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         case Factor::DstAlpha: return VK_BLEND_FACTOR_DST_ALPHA;
         case Factor::OneMinusDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;

@@ -1076,6 +1076,7 @@ static void test_msaa_resolve() {
     ShaderSource fragment_src{.source = spirv, .entry_point = "fragment_main"_sv};
     ColorTarget color_target{.format = Format::BGRA8Unorm};
     RasterDesc raster_desc{
+        .alpha_to_coverage = true,
         .sample_count  = 4,
         .color_targets = Span<const ColorTarget>(&color_target, 1),
     };
@@ -1086,6 +1087,16 @@ static void test_msaa_resolve() {
         free(d, resolve_tex);
         destroy_device(d);
         return;
+    }
+    RasterDesc line_raster_desc = raster_desc;
+    line_raster_desc.alpha_to_coverage = false;
+    line_raster_desc.polygon_mode = PolygonMode::Line;
+    Handle<Pipeline> line_pipeline{};
+    if (device_limits(d).non_solid_fill) {
+        line_pipeline =
+            create_graphics_pipeline(d, vertex_src, fragment_src, line_raster_desc);
+        CHECK(line_pipeline.h != 0,
+              "create_graphics_pipeline (non-solid fill) failed despite advertised support");
     }
 
     RenderAttachment color_att{
@@ -1123,6 +1134,7 @@ static void test_msaa_resolve() {
     CHECK(rb[2] == 0 && rb[1] == 0 && rb[0] == 0, "corner pixel not black after MSAA resolve");
 
     free(d, readback);
+    if (line_pipeline.h != 0) { free(d, line_pipeline); }
     free(d, pipeline);
     free(d, msaa_tex);
     free(d, resolve_tex);
@@ -1381,6 +1393,16 @@ static void test_pipeline_dedup() {
     }
     {
         RasterDesc rd = raster_desc;
+        rd.topology = Topology::LineList;
+        variants.push_back(make(rd));
+    }
+    {
+        RasterDesc rd = raster_desc;
+        rd.topology = Topology::LineStrip;
+        variants.push_back(make(rd));
+    }
+    {
+        RasterDesc rd = raster_desc;
         rd.sample_count = 4;
         variants.push_back(make(rd));
     }
@@ -1398,6 +1420,13 @@ static void test_pipeline_dedup() {
     {
         ColorTarget ct{.format = Format::BGRA8Unorm,
                        .blendstate = BlendDesc{.src_color_factor = Factor::SrcAlpha}};
+        RasterDesc rd = raster_desc;
+        rd.color_targets = Span<const ColorTarget>(&ct, 1);
+        variants.push_back(make(rd));
+    }
+    {
+        ColorTarget ct{.format = Format::BGRA8Unorm,
+                       .blendstate = BlendDesc{.src_color_factor = Factor::SrcAlphaSaturate}};
         RasterDesc rd = raster_desc;
         rd.color_targets = Span<const ColorTarget>(&ct, 1);
         variants.push_back(make(rd));
@@ -2296,6 +2325,8 @@ static void test_descriptor_handles_and_limits() {
     DeviceLimits lim = device_limits(d);
     CHECK(lim.max_sampled_textures > 0 && lim.max_storage_textures > 0 && lim.max_samplers > 0,
           "device limits nonzero");
+    CHECK((lim.framebuffer_sample_counts & 1u) != 0,
+          "framebuffer sample-count mask includes single-sample support");
     CHECK(lim.non_coherent_atom_size >= 1, "non-coherent atom size valid");
     CHECK(lim.min_uniform_alignment >= 1 && lim.min_storage_alignment >= 1, "alignments valid");
 
@@ -2318,9 +2349,25 @@ static void test_descriptor_handles_and_limits() {
     CHECK(v1 != v2, "distinct views carry distinct handles");
     CHECK((v1 & 0xFFFFFFFFull) != 0 && (v2 & 0xFFFFFFFFull) != 0, "descriptor index 0 is reserved");
     CHECK(((v1 >> 48) & 0xFF) == 1, "sampled-view type metadata");
-    SamplerId sampler = create_sampler(d, SamplerDesc{});
-    CHECK(sampler != 0, "sampler nonzero");
+    SamplerDesc sampler_desc{
+        .min_filter   = SamplerFilter::Linear,
+        .mag_filter   = SamplerFilter::Nearest,
+        .mip_filter   = SamplerFilter::Linear,
+        .mip_lod_bias = -2.2f,
+    };
+    SamplerId sampler = create_sampler(d, sampler_desc);
+    CHECK(sampler != 0, "sampler with LOD bias nonzero");
     CHECK(((sampler >> 48) & 0xFF) == 3, "sampler type metadata");
+    SamplerId default_sampler = create_sampler(d, SamplerDesc{});
+    CHECK(default_sampler != 0, "default sampler nonzero");
+    CHECK(default_sampler != sampler, "samplers with different LOD biases do not alias");
+    SamplerDesc split_filter_desc{
+        .min_filter = SamplerFilter::Nearest,
+        .mag_filter = SamplerFilter::Linear,
+        .mip_filter = SamplerFilter::Nearest,
+    };
+    SamplerId split_filter_sampler = create_sampler(d, split_filter_desc);
+    CHECK(split_filter_sampler != 0, "sampler with independent filters nonzero");
 
     Queue q = get_queue(d);   // needed for deferred slot retirement below
 
@@ -2340,6 +2387,8 @@ static void test_descriptor_handles_and_limits() {
     TextureView v4 = create_texture_view(d, TextureViewDesc{.texture = tex, .format = Format::RGBA8Unorm});
     free_sampler(d, v4);   // type mismatch -> no-op; slot intentionally leaked to device teardown
     free_sampler(d, sampler);
+    free_sampler(d, default_sampler);
+    free_sampler(d, split_filter_sampler);
     free(d, tex);
 
     // Depth bias is applied via dynamic state (no longer silently ignored).

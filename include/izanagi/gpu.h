@@ -202,9 +202,17 @@ enum class Factor : uint8_t {
     OneMinusSrc1Color,
     Src1Alpha,
     OneMinusSrc1Alpha,
+    SrcAlphaSaturate,
 };
 
-enum class Topology : uint8_t { TriangleList, TriangleStrip };
+enum class Topology : uint8_t {
+    TriangleList  = 0,
+    TriangleStrip = 1,
+    LineList      = 2,
+    LineStrip     = 3,
+};
+enum class PolygonMode : uint8_t { Fill, Line };
+
 
 enum class TextureType : uint8_t { Tex1D, Tex2D, Tex3D, TexCube, Tex2DArray, TexCubeArray };
 
@@ -408,11 +416,16 @@ struct Stencil {
     StencilOp depth_fail_op = StencilOp::Keep;
     uint8_t   reference     = 0;
 };
+// Minification, magnification, and mip-level interpolation are independent.
+// max_anisotropy is clamped by the backend; 1 disables anisotropic filtering.
 struct SamplerDesc {
     SamplerCoords     coord          = SamplerCoords::Normalized;
-    SamplerFilter     filter         = SamplerFilter::Nearest;
+    SamplerFilter     min_filter     = SamplerFilter::Nearest;
+    SamplerFilter     mag_filter     = SamplerFilter::Nearest;
+    SamplerFilter     mip_filter     = SamplerFilter::Nearest;
     SamplerAddressing address        = SamplerAddressing::ClampToEdge;
     float             max_anisotropy = 1.0f;
+    float             mip_lod_bias   = 0.0f;
 };
 // Opaque identity of the device's native pipeline cache. Use it to key
 // persistent storage per backend/driver/GPU. The cache blob is NOT
@@ -483,6 +496,7 @@ struct ColorTarget {
 };
 struct RasterDesc {
     Topology                topology          = Topology::TriangleList;
+    PolygonMode             polygon_mode      = PolygonMode::Fill;
     bool                    alpha_to_coverage = false;
     uint8_t                 sample_count      = 1;
     Format                  depth_format      = Format::None;
@@ -545,11 +559,15 @@ struct SurfaceCapabilities {
     Span<const Format>      formats;
     Span<const PresentMode> present_modes;
 };
-// Actual device limits (clamped backend capacities + driver alignment limits).
+// Actual device limits and optional raster capabilities.
+// framebuffer_sample_counts is a bit mask whose set bits are the supported
+// sample counts (1, 2, 4, 8, ...). non_solid_fill gates PolygonMode::Line.
 struct DeviceLimits {
     uint32_t max_sampled_textures;
     uint32_t max_storage_textures;
     uint32_t max_samplers;
+    uint32_t framebuffer_sample_counts;
+    bool     non_solid_fill;
     uint64_t min_uniform_alignment;
     uint64_t min_storage_alignment;
     uint64_t non_coherent_atom_size;

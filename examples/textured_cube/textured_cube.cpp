@@ -142,9 +142,11 @@ static void init(Device device, void* userdata) {
     state->checker_view = create_texture_view(device, view_desc);
 
     SamplerDesc sampler_desc{
-        .coord   = SamplerCoords::Normalized,
-        .filter  = SamplerFilter::Nearest,
-        .address = SamplerAddressing::Repeat,
+        .coord       = SamplerCoords::Normalized,
+        .min_filter  = SamplerFilter::Nearest,
+        .mag_filter  = SamplerFilter::Nearest,
+        .mip_filter  = SamplerFilter::Nearest,
+        .address     = SamplerAddressing::Repeat,
     };
     state->sampler = create_sampler(device, sampler_desc);
 
