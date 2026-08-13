@@ -1992,6 +1992,46 @@ static void test_async_shutdown_with_pending() {
 }
 
 // --- Test 23: Submission tokens ---------------------------------------------------------------
+static void test_gpu_timers() {
+    printf("gpu timers...");
+    DeviceDesc desc{
+        .log_level = LogLevel::Warning,
+        .enable_validation = true,
+    };
+    Device d = create_device(desc);
+    CHECK(d != nullptr, "create_device returned null");
+    const DeviceLimits limits = device_limits(d);
+    if (!limits.gpu_timestamps) {
+        CHECK(!create_gpu_timer(d), "unsupported timer creation must fail");
+        destroy_device(d);
+        printf(" SKIP (unsupported)\n");
+        return;
+    }
+
+    Handle<GpuTimer> timer = create_gpu_timer(d);
+    CHECK(timer.h != 0, "GPU timer creation failed");
+    uint64_t elapsed_ns = UINT64_MAX;
+    CHECK(!get_gpu_timer_result(d, timer, elapsed_ns),
+          "new timer has no result before recording");
+
+    Queue q = get_queue(d);
+    CommandBuffer cmd = queue_start_command_recording(q);
+    CHECK(cmd != nullptr, "recording failed");
+    cmd_begin_gpu_timer(cmd, timer);
+    cmd_end_gpu_timer(cmd, timer);
+    cmd_finalize(cmd);
+    Submission submission = queue_submit(q, {&cmd, 1});
+    CHECK(submission.status == SubmitStatus::Success, "timer submission failed");
+    CHECK(wait_submission(submission), "timer submission wait failed");
+    CHECK(get_gpu_timer_result(d, timer, elapsed_ns),
+          "timer result unavailable after submission completion");
+    CHECK(elapsed_ns != UINT64_MAX, "timer duration was not written");
+
+    free(d, timer);
+    destroy_device(d);
+    printf(" PASS\n");
+}
+
 static void test_submission_tokens() {
     printf("--- Test: submission tokens ---\n");
     DeviceDesc desc{
@@ -3998,6 +4038,7 @@ int main() {
     test_async_dedup_concurrent();
     test_async_shutdown_with_pending();
     test_submission_tokens();
+    test_gpu_timers();
     test_headless_pool_retirement();
     test_free_after();
     test_texture_cb_retention();

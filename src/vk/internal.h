@@ -97,6 +97,10 @@ struct TextureImpl {
     Vector<AttachmentView> attachment_views;
 };
 
+struct GpuTimerImpl {
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    double timestamp_period_ns = 0.0;
+};
 struct DepthStencilState {
     DepthStencilDesc desc;
 };
@@ -345,7 +349,9 @@ struct DeviceImpl {
     bool               dual_src_blend  = false;   // VkPhysicalDeviceFeatures.dualSrcBlend
     bool               non_solid_fill = false;   // VkPhysicalDeviceFeatures.fillModeNonSolid
     uint32_t           framebuffer_sample_counts = 1;
+    bool gpu_timestamps = false;
 
+    double gpu_timestamp_period_ns = 0.0;
     // Surface
     Surface surface;
 
@@ -482,6 +488,7 @@ struct DeviceImpl {
     Vector<uint8_t>  sampled_state;
     Vector<uint8_t>  storage_state;
     Vector<uint8_t>  sampler_state;
+    SlotMap<GpuTimerImpl> gpu_timer_pool;
     // Owner texture records retained by sampled/storage descriptors (keeps
     // the underlying image alive until the slot retires).
     Vector<TextureImpl*> sampled_owner;

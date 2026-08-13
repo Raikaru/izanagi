@@ -119,6 +119,7 @@ struct Pipeline;
 struct Texture;
 struct DepthStencilState;
 struct Semaphore;
+struct GpuTimer;
 
 using GpuPtr      = uint64_t;   // Device address; 0 = null
 using TextureView = uint64_t;   // Heap slot handle (low 32 = heap index)
@@ -568,6 +569,7 @@ struct DeviceLimits {
     uint32_t max_samplers;
     uint32_t framebuffer_sample_counts;
     bool     non_solid_fill;
+    bool     gpu_timestamps;
     uint64_t min_uniform_alignment;
     uint64_t min_storage_alignment;
     uint64_t non_coherent_atom_size;
@@ -752,6 +754,14 @@ void                      free_depth_stencil_state(Device, Handle<DepthStencilSt
 Handle<Semaphore> create_semaphore(Device, uint64_t init);
 void              wait_semaphore(Device, Handle<Semaphore>, uint64_t value);
 void              free(Device, Handle<Semaphore>);
+// Full-command-range GPU timer. A timer may be recorded into only one
+// in-flight command buffer at a time and must not be freed until that work
+// completes. cmd_begin_gpu_timer must be called outside a render pass. Results
+// are non-blocking and become available after the containing submission
+// completes. The returned duration is in nanoseconds.
+Handle<GpuTimer> create_gpu_timer(Device);
+void             free(Device, Handle<GpuTimer>);
+bool             get_gpu_timer_result(Device, Handle<GpuTimer>, uint64_t& duration_ns);
 Queue             get_queue(Device, QueueType = QueueType::Default);
 CommandBuffer     queue_start_command_recording(Queue);
 // Submits command buffers, serialized per queue. Returns a Submission that
@@ -802,6 +812,8 @@ void cmd_draw_indexed_instanced_indirect(CommandBuffer, const DrawIndexedIndirec
 void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer, const MultiDrawIndirectInfo&);
 void cmd_wait_for_surface_texture(CommandBuffer);
 void cmd_signal_surface_texture(CommandBuffer);
+void cmd_begin_gpu_timer(CommandBuffer, Handle<GpuTimer>);
+void cmd_end_gpu_timer(CommandBuffer, Handle<GpuTimer>);
 void cmd_push_debug_group(CommandBuffer, Span<const char>);
 void cmd_pop_debug_group(CommandBuffer);
 void cmd_finalize(CommandBuffer);

@@ -2002,6 +2002,44 @@ void cmd_signal_surface_texture(CommandBuffer cmd) {
             backend_pipeline_barrier2(d, cmd->buffer, &info);
 }
 
+// --- GPU timers ------------------------------------------------------------------------
+
+static GpuTimerImpl* resolve_gpu_timer(CommandBuffer cmd, Handle<GpuTimer> timer,
+                                       const char* operation) {
+    const char* why = nullptr;
+    GpuTimerImpl* rec =
+        cmd->device->gpu_timer_pool.try_get_ex(handle_cast<GpuTimerImpl>(timer), &why);
+    if (rec == nullptr) {
+        log_fmt(cmd->device, LogLevel::Error, __LINE__, __FILE__,
+                "command #%u: %s invalid GPU timer handle 0x%016llx (%s)",
+                cmd->command_index, operation, (unsigned long long)timer.h,
+                why ? why : "rejected");
+        cmd_record_fail(cmd, operation);
+    }
+    return rec;
+}
+
+void cmd_begin_gpu_timer(CommandBuffer cmd, Handle<GpuTimer> timer) {
+    cmd->command_index++;
+    GpuTimerImpl* rec = resolve_gpu_timer(cmd, timer, "cmd_begin_gpu_timer");
+    if (rec == nullptr) {
+        return;
+    }
+    vkCmdResetQueryPool(cmd->buffer, rec->query_pool, 0, 2);
+    vkCmdWriteTimestamp(cmd->buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        rec->query_pool, 0);
+}
+
+void cmd_end_gpu_timer(CommandBuffer cmd, Handle<GpuTimer> timer) {
+    cmd->command_index++;
+    GpuTimerImpl* rec = resolve_gpu_timer(cmd, timer, "cmd_end_gpu_timer");
+    if (rec == nullptr) {
+        return;
+    }
+    vkCmdWriteTimestamp(cmd->buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        rec->query_pool, 1);
+}
+
 // --- Debug groups ----------------------------------------------------------------------
 
 void cmd_push_debug_group(CommandBuffer cmd, Span<const char> label) {
