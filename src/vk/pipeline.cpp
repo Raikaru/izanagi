@@ -133,7 +133,8 @@ static bool graphics_key_equal(const PipelineRecord& rec, ShaderSource vertex, S
         return false;
     }
     if (!spec_equal(rec, spec)) { return false; }
-    if (rec.topology != desc.topology || rec.sample_count != desc.sample_count ||
+    if (rec.topology != desc.topology || rec.polygon_mode != desc.polygon_mode ||
+        rec.sample_count != desc.sample_count ||
         rec.alpha_to_coverage != desc.alpha_to_coverage ||
         rec.depth_format != desc.depth_format || rec.stencil_format != desc.stencil_format ||
         rec.color_target_count != desc.color_targets.size()) {
@@ -247,6 +248,7 @@ static bool build_key(DeviceImpl* d, PipelineRecord* rec, ShaderSource vertex, S
 
     if (desc) {
         rec->topology          = desc->topology;
+        rec->polygon_mode       = desc->polygon_mode;
         rec->sample_count      = desc->sample_count;
         rec->alpha_to_coverage = desc->alpha_to_coverage;
         rec->depth_format      = desc->depth_format;
@@ -528,6 +530,18 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .primitiveRestartEnable = false,
     };
 
+    if (rec->polygon_mode == PolygonMode::Line && !d->non_solid_fill) {
+        IZ_LOG(d, LogLevel::Error,
+               "create_graphics_pipeline: line polygon mode requested but the "
+               "device does not support non-solid fill");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if ((d->framebuffer_sample_counts & rec->sample_count) == 0) {
+        IZ_LOG(d, LogLevel::Error,
+               "create_graphics_pipeline: unsupported framebuffer sample count");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
     // Color blend + attachment formats. Dual-source factors are optional:
     // reject deterministically when unsupported (no silent fallback).
     const bool needs_dual_src = [&]() {
@@ -577,7 +591,9 @@ static VkResult compile_graphics(DeviceImpl* d, Arena* arena, PipelineRecord* re
         .flags                   = 0,
         .depthClampEnable        = false,
         .rasterizerDiscardEnable = false,
-        .polygonMode             = VK_POLYGON_MODE_FILL,
+        .polygonMode             = rec->polygon_mode == PolygonMode::Line
+                                       ? VK_POLYGON_MODE_LINE
+                                       : VK_POLYGON_MODE_FILL,
         // Static path: front face + cull are baked (not dynamic).
         .cullMode                = static_state ? bridge(gs.cull) : VK_CULL_MODE_BACK_BIT,
         .frontFace               = static_state ? (gs.front_face == FrontFace::CCW
@@ -1107,7 +1123,7 @@ Handle<Pipeline> request_compute_pipeline(Device                             dev
     if (atomic_load(&d->device_destroying)) { return {}; }
 
     Arena* arena = get_thread_local_arena(d);
-    ScratchScope scope(*arena);
+    if (arena == nullptr) { return {}; }
     const VkSpecializationInfo spec_info = construct_specialization_info(constants, arena);
     if (arena->overflowed()) {
         IZ_LOG(d, LogLevel::Error, "request_compute_pipeline: scratch arena overflow");
@@ -1160,7 +1176,7 @@ Handle<Pipeline> request_graphics_pipeline(Device                             de
     if (atomic_load(&d->device_destroying)) { return {}; }
 
     Arena* arena = get_thread_local_arena(d);
-    ScratchScope scope(*arena);
+    if (arena == nullptr) { return {}; }
     const VkSpecializationInfo spec_info = construct_specialization_info(constants, arena);
     if (arena->overflowed()) {
         IZ_LOG(d, LogLevel::Error, "request_graphics_pipeline: scratch arena overflow");
@@ -1204,7 +1220,9 @@ Handle<Pipeline> request_graphics_pipeline(Device                             de
 
 PipelineStatus get_pipeline_status(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) { return PipelineStatus::Failed; }
+    PipelineRecord* rec = impl->record;
     switch (rec->state.load(std::memory_order_acquire)) {
         case InternalPipelineState::Ready:  return PipelineStatus::Ready;
         case InternalPipelineState::Failed: return PipelineStatus::Failed;
@@ -1246,7 +1264,9 @@ static bool wait_record_state(Rec* rec, uint64_t timeout_ms) {
 
 bool wait_pipeline(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) { return false; }
+    PipelineRecord* rec = impl->record;
     const double t0 = monotonic_seconds();
 
     const bool ready = wait_record_state(rec, /*timeout_ms=*/0);
@@ -1311,7 +1331,9 @@ static PipelineStatus record_status(const PipelineRecord* rec) {
 PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
                                       const GraphicsStateDesc& desc) {
     auto* d = reinterpret_cast<DeviceImpl*>(device);
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) { return PipelineStatus::Failed; }
+    PipelineRecord* rec = impl->record;
     if (!d->dispatch.use_static_graphics_state ||
         rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
         return record_status(rec);
@@ -1320,7 +1342,9 @@ PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
     gs.front_face = desc.front_face;
     gs.cull       = desc.cull;
     if (desc.depth_stencil.h != 0) {
-        apply_depth_stencil_to_shadow(d->depth_stencil_pool[desc.depth_stencil].desc, gs);
+        DepthStencilState* ds = d->depth_stencil_pool.try_get(desc.depth_stencil);
+        if (ds == nullptr) { return PipelineStatus::Failed; }
+        apply_depth_stencil_to_shadow(ds->desc, gs);
     }
     if (is_default_baked_state(gs)) { return record_status(rec); }   // base IS the variant
     StaticVariantRecord* v = find_or_request_static_variant(d, rec, gs);
@@ -1336,7 +1360,9 @@ PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
 bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const GraphicsStateDesc& desc,
                          uint64_t timeout_ms) {
     auto* d = reinterpret_cast<DeviceImpl*>(device);
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) { return false; }
+    PipelineRecord* rec = impl->record;
     if (!d->dispatch.use_static_graphics_state ||
         rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
         return wait_record_state(rec, timeout_ms);
@@ -1345,7 +1371,9 @@ bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const Graphic
     gs.front_face = desc.front_face;
     gs.cull       = desc.cull;
     if (desc.depth_stencil.h != 0) {
-        apply_depth_stencil_to_shadow(d->depth_stencil_pool[desc.depth_stencil].desc, gs);
+        DepthStencilState* ds = d->depth_stencil_pool.try_get(desc.depth_stencil);
+        if (ds == nullptr) { return false; }
+        apply_depth_stencil_to_shadow(ds->desc, gs);
     }
     if (is_default_baked_state(gs)) { return wait_record_state(rec, timeout_ms); }
     StaticVariantRecord* v = find_or_request_static_variant(d, rec, gs);
@@ -1413,7 +1441,12 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
 
 void free(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "free(pipeline): invalid or stale handle");
+        return;
+    }
+    PipelineRecord* rec = impl->record;
     release_pipeline_ref(d, rec);   // user reference only
     d->pipeline_pool.erase(handle_cast<PipelineImpl>(pipeline));
 }
@@ -1423,7 +1456,12 @@ void free_after(Device dev, Handle<Pipeline> pipeline, Submission s) {
     QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
     if (q == nullptr) { return; }
     const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "free_after(pipeline): invalid or stale handle");
+        return;
+    }
+    PipelineRecord* rec = impl->record;
     // The user reference (and the native pipeline with it) is released when
     // the target submission completes. The public handle is invalidated
     // immediately by erasing its slot (the record survives via the deferred
@@ -1461,6 +1499,10 @@ Handle<DepthStencilState> create_depth_stencil_state(Device dev, const DepthSten
 
 void free_depth_stencil_state(Device dev, Handle<DepthStencilState> state) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (d->depth_stencil_pool.try_get(state) == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "free_depth_stencil_state: invalid or stale handle");
+        return;
+    }
     d->depth_stencil_pool.erase(state);
 }
 

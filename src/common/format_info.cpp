@@ -62,7 +62,11 @@ static constexpr auto check_table = []() {
 static_assert(check_table());
 
 FormatInfo get_format_info(Format f) {
-    return kFormatInfo[static_cast<uint32_t>(f) - 1];
+    const uint32_t idx = static_cast<uint32_t>(f);
+    if (idx == 0 || idx >= static_cast<uint32_t>(Format::ValidCount)) {
+        return {};   // Format::None or out-of-range: no block info
+    }
+    return kFormatInfo[idx - 1];
 }
 
 }  // namespace gpu

@@ -152,18 +152,48 @@ Buffer* find_buffer_for_ptr(DeviceImpl* d, GpuPtr ptr, VkDeviceSize* out_offset)
     return &buf;
 }
 
-BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr) {
-    VkDeviceSize offset = 0;
-    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
-    if (buf == nullptr) {
-        return {.buffer = VK_NULL_HANDLE, .offset = 0, .alloc = VK_NULL_HANDLE};
+// Resolves ptr and validates [ptr, ptr+size) against the allocation's
+// user-visible range (overflow-safe: subtraction, never addition). On
+// success one buffer reference is taken BEFORE the map lock is released, so
+// the record cannot be destroyed while the caller uses it — the caller owns
+// that reference and must release_buffer_ref it. A null handle means the
+// pointer is unknown, stale, or the range exceeds the allocation.
+BufferRange find_buffer_range(DeviceImpl* d, GpuPtr ptr, VkDeviceSize size) {
+    rwlock_lock_read(&d->ptr_map_lock);
+    uint32_t lo = 0, hi = d->ptr_map.size();
+    uint32_t best = ~0u;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (d->ptr_map[mid].ptr <= ptr) {
+            best = mid;
+            lo   = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    return {
-        .buffer = buf->vk_buffer,
-        .offset = offset,
-        .alloc  = buf->vk_allocation,
-    };
+    if (best == ~0u) {
+        rwlock_unlock_read(&d->ptr_map_lock);
+        return {};
+    }
+    auto& entry = d->ptr_map[best];
+    auto& buf   = d->buffer_pool[entry.buffer];
+    // Overflow-safe bounds check (exclusive end; subtraction only).
+    const VkDeviceSize rel = ptr - buf.user_address;
+    if (rel < buf.user_size && size <= buf.user_size - rel) {
+        atomic_fetch_add(&buf.refs, 1);   // taken under the read lock
+        const BufferRange out{
+            .handle     = entry.buffer,
+            .vk_buffer  = buf.vk_buffer,
+            .offset     = buf.user_offset + rel,
+            .allocation = buf.vk_allocation,
+        };
+        rwlock_unlock_read(&d->ptr_map_lock);
+        return out;
+    }
+    rwlock_unlock_read(&d->ptr_map_lock);
+    return {};
 }
+
 
 // --- Instance creation -------------------------------------------------------------------
 
@@ -226,11 +256,11 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
     for (uint32_t i = 0; i < num_wsi_extensions; ++i) { ext_ptrs[ext_count++] = wsi_extensions[i]; }
 
     if (desc.enable_validation) {
-        uint32_t avail_layer_count = 0;
-        vkEnumerateInstanceLayerProperties(&avail_layer_count, nullptr);
-        if (avail_layer_count > 0) {
-            VkLayerProperties avail[32];
+        VkLayerProperties avail[32];
+        uint32_t        avail_layer_count = static_cast<uint32_t>(sizeof(avail) / sizeof(avail[0]));
+        const VkResult  layer_result =
             vkEnumerateInstanceLayerProperties(&avail_layer_count, avail);
+        if ((layer_result == VK_SUCCESS || layer_result == VK_INCOMPLETE) && avail_layer_count > 0) {
             for (uint32_t i = 0; i < avail_layer_count; ++i) {
                 if (strcmp(avail[i].layerName, "VK_LAYER_KHRONOS_validation") == 0) {
                     layer_count = 1;
@@ -535,6 +565,8 @@ static VkResult create_logical_device(DeviceImpl* d) {
 #endif
     device_features.features.multiDrawIndirect = VK_TRUE;
     d->dual_src_blend = device_features.features.dualSrcBlend == VK_TRUE;
+    d->non_solid_fill = device_features.features.fillModeNonSolid == VK_TRUE;
+    device_features.features.fillModeNonSolid = d->non_solid_fill ? VK_TRUE : VK_FALSE;
     if (d->dual_src_blend) {
         device_features.features.dualSrcBlend = VK_TRUE;
     }
@@ -1268,6 +1300,9 @@ Device create_device(const DeviceDesc& desc) {
         d->non_coherent_atom_size = props2.properties.limits.nonCoherentAtomSize;
         d->min_uniform_alignment  = props2.properties.limits.minUniformBufferOffsetAlignment;
         d->min_storage_alignment  = props2.properties.limits.minStorageBufferOffsetAlignment;
+        d->framebuffer_sample_counts =
+            static_cast<uint32_t>(props2.properties.limits.framebufferColorSampleCounts
+                                  & props2.properties.limits.framebufferDepthSampleCounts);
 
         d->cache_callbacks = desc.pipeline_cache_callbacks;
         if (d->cache_callbacks.load || d->cache_callbacks.store) {
@@ -1420,6 +1455,7 @@ Device create_device(const DeviceDesc& desc) {
             .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .mipLodBias   = 0.0f,
         };
         if (!write_sampler_descriptor(d, 0, sampler_info)) {
             IZ_LOG(d, LogLevel::Error, "bindless: dummy slot-0 sampler write failed");
@@ -1441,15 +1477,63 @@ Device create_device(const DeviceDesc& desc) {
     return d;
 
 fail:
-    if (d->surface.surface != VK_NULL_HANDLE) {
-        vkDestroySurfaceKHR(d->instance, d->surface.surface, nullptr);
+    // Partial teardown mirrors destroy_device's ordering for the subset of
+    // objects that were created. DeviceImpl's destructor releases every pool
+    // entry and host allocation while the device and VMA allocator are still
+    // alive (destructor callbacks only fire for entries created after the
+    // device existed — pools are populated strictly after device creation).
+    // Hoist every plain handle the teardown needs before the destructor runs
+    // (no post-destructor member reads).
+    const VmaAllocator  vma_alloc           = d->vma;
+    const VkBuffer      heap_sampler        = d->heap.sampler_buffer;
+    const VmaAllocation heap_sampler_alloc  = d->heap.sampler_allocation;
+    const VkBuffer      heap_resource       = d->heap.resource_buffer;
+    const VmaAllocation heap_resource_alloc = d->heap.resource_allocation;
+    const VkPipelineCache vk_cache          = d->vk_pipeline_cache;
+    const VkDebugUtilsMessengerEXT messenger = d->debug_messenger;
+    const VkSurfaceKHR vk_surface           = d->surface.surface;
+    const VkDevice    vk_device             = d->device;
+    const VkInstance  vk_instance           = d->instance;
+    const tls_key     tls_k                 = d->thread_local_key;
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    const VkDescriptorPool      bl_pool   = d->bindless_pool;
+    const VkDescriptorSetLayout bl_layout = d->bindless_set_layout;
+    const VkPipelineLayout      bl_pl     = d->bindless_pipeline_layout;
+    // Descriptor sidecars reference the dummy texture image: destroy them
+    // BEFORE the texture pool tears the image down.
+    for (VkImageView v : d->bindless_sampled_views) {
+        if (v != VK_NULL_HANDLE) { vkDestroyImageView(vk_device, v, nullptr); }
     }
-    if (d->vk_pipeline_cache != VK_NULL_HANDLE) {
-        vkDestroyPipelineCache(d->device, d->vk_pipeline_cache, nullptr);
+    for (VkImageView v : d->bindless_storage_views) {
+        if (v != VK_NULL_HANDLE) { vkDestroyImageView(vk_device, v, nullptr); }
     }
-    if (d->device != VK_NULL_HANDLE) { vkDestroyDevice(d->device, nullptr); }
-    if (d->instance != VK_NULL_HANDLE) { vkDestroyInstance(d->instance, nullptr); }
-    tls_free(d->thread_local_key);
+    for (VkSampler smp : d->bindless_sampler_handles) {
+        if (smp != VK_NULL_HANDLE) { vkDestroySampler(vk_device, smp, nullptr); }
+    }
+#endif
+    d->~DeviceImpl();
+#if defined(IZ_VK_PROFILE_BINDLESS)
+    if (bl_pool != VK_NULL_HANDLE) { vkDestroyDescriptorPool(vk_device, bl_pool, nullptr); }
+    if (bl_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(vk_device, bl_layout, nullptr); }
+    if (bl_pl != VK_NULL_HANDLE) { vkDestroyPipelineLayout(vk_device, bl_pl, nullptr); }
+#else
+    if (heap_sampler != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(vma_alloc, heap_sampler, heap_sampler_alloc);
+    }
+    if (heap_resource != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(vma_alloc, heap_resource, heap_resource_alloc);
+    }
+#endif
+    if (vma_alloc != VK_NULL_HANDLE) { vmaDestroyAllocator(vma_alloc); }
+    if (vk_cache != VK_NULL_HANDLE) { vkDestroyPipelineCache(vk_device, vk_cache, nullptr); }
+    if (messenger != VK_NULL_HANDLE && vkDestroyDebugUtilsMessengerEXT) {
+        vkDestroyDebugUtilsMessengerEXT(vk_instance, messenger, nullptr);
+    }
+    if (vk_surface != VK_NULL_HANDLE) { vkDestroySurfaceKHR(vk_instance, vk_surface, nullptr); }
+    if (vk_device != VK_NULL_HANDLE) { vkDestroyDevice(vk_device, nullptr); }
+    if (vk_instance != VK_NULL_HANDLE) { vkDestroyInstance(vk_instance, nullptr); }
+    if (!g_external_vk_loader) { volkFinalize(); }
+    tls_free(tls_k);
     alloc.free({.ptr = d, .len = sizeof(DeviceImpl)});
     return nullptr;
 }
@@ -1608,6 +1692,8 @@ DeviceLimits device_limits(Device dev) {
         .max_sampled_textures = sampled,
         .max_storage_textures = storage,
         .max_samplers         = sampler,
+        .framebuffer_sample_counts = d->framebuffer_sample_counts,
+        .non_solid_fill       = d->non_solid_fill,
         .min_uniform_alignment = d->min_uniform_alignment,
         .min_storage_alignment = d->min_storage_alignment,
         .non_coherent_atom_size = d->non_coherent_atom_size,
@@ -1633,10 +1719,27 @@ GpuPtr malloc(Device dev, size_t bytes, Memory memory) {
 GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
 
-    // Validate alignment: must be a power of two (0 = no specific alignment).
+    // Validate alignment: must be a power of two (0 = no specific alignment),
+    // within an implementation limit, and overflow-safe when combined with
+    // the requested size.
     if (align == 0) { align = 1; }
     if ((align & (align - 1)) != 0) {
         IZ_LOG(d, LogLevel::Error, "malloc: alignment must be a power of two");
+        return 0;
+    }
+    constexpr size_t kMaxBufferAlignment = 1ull << 24;   // 16 MiB: far beyond any real device requirement
+    if (align > kMaxBufferAlignment) {
+        IZ_LOG(d, LogLevel::Error, "malloc: alignment exceeds implementation limit");
+        return 0;
+    }
+    if (bytes == 0) {
+        IZ_LOG(d, LogLevel::Error, "malloc: zero-size allocation");
+        return 0;
+    }
+    const VkDeviceSize sz = static_cast<VkDeviceSize>(bytes);
+    const VkDeviceSize al = static_cast<VkDeviceSize>(align);
+    if (sz > UINT64_MAX - (al - 1)) {
+        IZ_LOG(d, LogLevel::Error, "malloc: size + alignment overflow");
         return 0;
     }
 
@@ -1647,8 +1750,7 @@ GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 
     // Overallocate by (align - 1) so the user address can be aligned inside.
-    const VkDeviceSize backing_size =
-        static_cast<VkDeviceSize>(bytes) + static_cast<VkDeviceSize>(align - 1);
+    const VkDeviceSize backing_size = sz + (al - 1);
 
     VkBufferCreateInfo create_info{
         .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1709,10 +1811,19 @@ GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
     };
     const VkDeviceAddress backing_address = vkGetBufferDeviceAddress(d->device, &addr_info);
 
-    // Align the user address inside the backing allocation.
-    const GpuPtr user_address =
-        (backing_address + align - 1) & ~(static_cast<VkDeviceAddress>(align) - 1);
+    // Align the user address inside the backing allocation (overflow-safe).
+    if (backing_address > UINT64_MAX - (al - 1)) {
+        vmaDestroyBuffer(d->vma, vk_buffer, vk_allocation);
+        IZ_LOG(d, LogLevel::Error, "malloc: device address overflow aligning allocation");
+        return 0;
+    }
+    const GpuPtr user_address = (backing_address + (al - 1)) & ~(al - 1);
     const VkDeviceSize user_offset = user_address - backing_address;
+    if (user_offset > backing_size || sz > backing_size - user_offset) {
+        vmaDestroyBuffer(d->vma, vk_buffer, vk_allocation);
+        IZ_LOG(d, LogLevel::Error, "malloc: aligned user range exceeds backing allocation");
+        return 0;
+    }
 
     VkMemoryPropertyFlags props = 0;
     vmaGetMemoryTypeProperties(d->vma, alloc_result.memoryType, &props);
@@ -1813,61 +1924,65 @@ void* get_host_pointer(Device dev, GpuPtr ptr) {
 bool flush_host_memory(Device dev, GpuPtr ptr, size_t size) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     if (size == 0) { return true; }
-    VkDeviceSize offset = 0;
-    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
-    if (buf == nullptr) {
+    // Range-validated lookup takes a reference under the map lock: a
+    // concurrent free cannot destroy the record mid-flush.
+    BufferRange r = find_buffer_range(d, ptr, static_cast<VkDeviceSize>(size));
+    if (r.handle.h == 0) {
         IZ_LOG(d, LogLevel::Error, "flush_host_memory: pointer is not in a live allocation");
         return false;
     }
-    if (offset + size > buf->user_offset + buf->user_size) {
-        IZ_LOG(d, LogLevel::Error, "flush_host_memory: range exceeds allocation bounds");
-        return false;
+    auto& buf = d->buffer_pool[handle_cast<Buffer>(r.handle)];
+    if (buf.coherent || buf.memory == VK_NULL_HANDLE) {
+        release_buffer_ref(d, r.handle);
+        return true;
     }
-    if (buf->coherent || buf->memory == VK_NULL_HANDLE) { return true; }
 
-    const VkDeviceSize atom       = d->non_coherent_atom_size;
-    const VkDeviceSize range_begin = buf->memory_offset + offset;
-    const VkDeviceSize range_end   = range_begin + size;
+    const VkDeviceSize atom         = d->non_coherent_atom_size;
+    const VkDeviceSize range_begin  = buf.memory_offset + r.offset;
+    const VkDeviceSize range_end    = range_begin + size;
     const VkDeviceSize aligned_begin = range_begin & ~(atom - 1);
     const VkDeviceSize aligned_end   = (range_end + atom - 1) & ~(atom - 1);
     const VkMappedMemoryRange range{
         .sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
         .pNext  = nullptr,
-        .memory = buf->memory,
+        .memory = buf.memory,
         .offset = aligned_begin,
         .size   = aligned_end - aligned_begin,
     };
-    return vkFlushMappedMemoryRanges(d->device, 1, &range) == VK_SUCCESS;
+    const bool ok = vkFlushMappedMemoryRanges(d->device, 1, &range) == VK_SUCCESS;
+    release_buffer_ref(d, r.handle);
+    return ok;
 }
 
 bool invalidate_host_memory(Device dev, GpuPtr ptr, size_t size) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     if (size == 0) { return true; }
-    VkDeviceSize offset = 0;
-    Buffer* buf = find_buffer_for_ptr(d, ptr, &offset);
-    if (buf == nullptr) {
+    BufferRange r = find_buffer_range(d, ptr, static_cast<VkDeviceSize>(size));
+    if (r.handle.h == 0) {
         IZ_LOG(d, LogLevel::Error, "invalidate_host_memory: pointer is not in a live allocation");
         return false;
     }
-    if (offset + size > buf->user_offset + buf->user_size) {
-        IZ_LOG(d, LogLevel::Error, "invalidate_host_memory: range exceeds allocation bounds");
-        return false;
+    auto& buf = d->buffer_pool[handle_cast<Buffer>(r.handle)];
+    if (buf.coherent || buf.memory == VK_NULL_HANDLE) {
+        release_buffer_ref(d, r.handle);
+        return true;
     }
-    if (buf->coherent || buf->memory == VK_NULL_HANDLE) { return true; }
 
-    const VkDeviceSize atom       = d->non_coherent_atom_size;
-    const VkDeviceSize range_begin = buf->memory_offset + offset;
-    const VkDeviceSize range_end   = range_begin + size;
+    const VkDeviceSize atom         = d->non_coherent_atom_size;
+    const VkDeviceSize range_begin  = buf.memory_offset + r.offset;
+    const VkDeviceSize range_end    = range_begin + size;
     const VkDeviceSize aligned_begin = range_begin & ~(atom - 1);
     const VkDeviceSize aligned_end   = (range_end + atom - 1) & ~(atom - 1);
     const VkMappedMemoryRange range{
         .sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
         .pNext  = nullptr,
-        .memory = buf->memory,
+        .memory = buf.memory,
         .offset = aligned_begin,
         .size   = aligned_end - aligned_begin,
     };
-    return vkInvalidateMappedMemoryRanges(d->device, 1, &range) == VK_SUCCESS;
+    const bool ok = vkInvalidateMappedMemoryRanges(d->device, 1, &range) == VK_SUCCESS;
+    release_buffer_ref(d, r.handle);
+    return ok;
 }
 
 // --- Semaphores ---------------------------------------------------------------------------
@@ -1898,13 +2013,17 @@ Handle<Semaphore> create_semaphore(Device dev, uint64_t init_value) {
 
 void wait_semaphore(Device dev, Handle<Semaphore> sema, uint64_t value) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    VkSemaphore s = d->semaphore_pool[handle_cast<SemaphoreImpl>(sema)].vk_semaphore;
+    SemaphoreImpl* rec = d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(sema));
+    if (rec == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "wait_semaphore: invalid or stale semaphore handle");
+        return;
+    }
     VkSemaphoreWaitInfo wait_info{
         .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .pNext          = nullptr,
         .flags          = 0,
         .semaphoreCount = 1,
-        .pSemaphores    = &s,
+        .pSemaphores    = &rec->vk_semaphore,
         .pValues        = &value,
     };
     IZ_CHK(d, vkWaitSemaphores(d->device, &wait_info, UINT64_MAX), "wait_semaphore failed");
@@ -1912,6 +2031,10 @@ void wait_semaphore(Device dev, Handle<Semaphore> sema, uint64_t value) {
 
 void free(Device dev, Handle<Semaphore> sema) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(sema)) == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "free(semaphore): invalid or stale handle");
+        return;
+    }
     d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(sema));
 }
 
@@ -1927,6 +2050,10 @@ Queue get_queue(Device dev, QueueType type) {
         auto timeline = create_semaphore_internal(d, 0);
 
         auto blk = d->allocator.alloc(sizeof(QueueImpl));
+        if (blk.ptr == nullptr) {
+            IZ_LOG(d, LogLevel::Error, "get_queue: allocator out of memory");
+            return nullptr;
+        }
         auto* q  = ::new (blk.ptr) QueueImpl();
         q->device         = d;
         q->queue          = queue;

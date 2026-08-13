@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <new>
 
+#include "common/format_info.h"
 #include "internal.h"
 
 namespace gpu {
+
+static void cmd_record_fail(CommandBufferImpl* cb, const char* reason);
 
 // Vulkan 1.3 commands are available on 1.2 devices only through their KHR/EXT
 // extensions. There are NO compile-time aliases: dispatch is route-aware
@@ -108,31 +111,44 @@ static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
 // Retains a texture explicitly named by a command until the command buffer is
 // submitted (or abandoned), so freeing the user handle cannot destroy a native
 // image the recorded commands still reference. Retains the stable record, not
-// the public handle.
-static void retain_texture(CommandBufferImpl* cmd, Handle<Texture> tex) {
-    TextureImpl* rec = &cmd->device->texture_pool[handle_cast<TextureImpl>(tex)];
+// the public handle. Returns null (and marks the recording failed) for
+// invalid or stale handles.
+static TextureImpl* retain_texture(CommandBufferImpl* cmd, Handle<Texture> tex) {
+    TextureImpl* rec = cmd->device->texture_pool.try_get(handle_cast<TextureImpl>(tex));
+    if (rec == nullptr) {
+        cmd_record_fail(cmd, "command references an invalid or stale texture handle");
+        return nullptr;
+    }
     for (TextureImpl* r : cmd->retained_textures) {
-        if (r == rec) { return; }   // already retained
+        if (r == rec) { return rec; }   // already retained
     }
     atomic_fetch_add(&rec->refs, 1);
     cmd->retained_textures.push_back(rec);
+    return rec;
 }
 
-// Retains a buffer explicitly named by a command (memory copies, index and
-// indirect operands). Resolves the allocation; invalid pointers are not
-// retained (the command will fail at submit).
-static void retain_buffer(CommandBufferImpl* cmd, GpuPtr ptr) {
-    if (ptr == 0) { return; }
-    VkDeviceSize offset = 0;
-    Buffer* buf = find_buffer_for_ptr(cmd->device, ptr, &offset);
-    if (buf == nullptr) { return; }
-    Handle<Buffer> h = cmd->device->buffer_pool.find_handle(buf);
-    if (h.h == 0) { return; }
-    for (Handle<Buffer> b : cmd->retained_buffers) {
-        if (b.h == h.h) { return; }   // already retained
+// Resolves [ptr, ptr+size) against the live allocations (size == 0 validates
+// the pointer only) and retains the buffer until submission. The range is
+// validated under the map lock while the reference is taken, so a concurrent
+// free cannot destroy the record. Marks the recording failed when the
+// pointer/range is invalid; fills out (buffer/offset) for Vulkan commands.
+static bool retain_buffer(CommandBufferImpl* cmd, GpuPtr ptr, VkDeviceSize size, BufferRange* out) {
+    if (ptr == 0) { return size == 0; }   // zero is a legal "no data" pointer only when no range is required
+    BufferRange r = find_buffer_range(cmd->device, ptr, size);
+    if (r.handle.h == 0) {
+        cmd_record_fail(cmd, "command references a pointer outside a live allocation");
+        return false;
     }
-    atomic_fetch_add(&buf->refs, 1);
-    cmd->retained_buffers.push_back(h);
+    for (Handle<Buffer> b : cmd->retained_buffers) {
+        if (b.h == r.handle.h) {
+            release_buffer_ref(cmd->device, r.handle);   // drop the resolver's extra reference
+            if (out) { *out = r; }
+            return true;
+        }
+    }
+    cmd->retained_buffers.push_back(r.handle);
+    if (out) { *out = r; }
+    return true;
 }
 
 CommandPool* get_command_pool(QueueImpl* queue) {
@@ -412,7 +428,24 @@ Submission queue_submit(Queue                     q,
         }
     }
 
-    // Serialize submission (and presentation) per queue. The serialized region
+    // Validate public semaphore handles up front (before anything is claimed)
+    // so stale or garbage handles fail the submission deterministically. The
+    // handles are re-resolved at use inside the serialized region; freeing a
+    // semaphore concurrently with a submit that uses it remains an
+    // application lifetime error.
+    for (uint32_t i = 0; i < wait_semaphores.size(); ++i) {
+        if (d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(wait_semaphores[i].semaphore)) == nullptr) {
+            IZ_LOG(d, LogLevel::Error, "queue_submit: invalid or stale wait semaphore handle");
+            return Submission{.queue = q, .value = q->timeline_value + 1, .status = SubmitStatus::Error};
+        }
+    }
+    for (uint32_t i = 0; i < signal_semaphores.size(); ++i) {
+        if (d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(signal_semaphores[i].semaphore)) == nullptr) {
+            IZ_LOG(d, LogLevel::Error, "queue_submit: invalid or stale signal semaphore handle");
+            return Submission{.queue = q, .value = q->timeline_value + 1, .status = SubmitStatus::Error};
+        }
+    }
+
     // covers the entire stateful sequence: claim texture initialization
     // records, record the optional internal transition command buffer, reserve
     // retirement storage, submit, and commit/roll back every participant.
@@ -1069,13 +1102,46 @@ void backend_blit_image(CommandBufferImpl* cb, const VkBlitImageInfo2& info) {
 }
 
 // --- Commands -------------------------------------------------------------------------
+// Byte count of the buffer region a buffer<->image copy touches, per
+// Vulkan's buffer-image copy layout rules. Strides and row counts are
+// measured in texel BLOCKS for compressed formats (VkBufferImageCopy
+// semantics); for uncompressed formats a block is one texel, so one formula
+// covers both. Uses the full mip-0 extent (an over-approximation for mip > 0
+// — safe for range checks). Every multiply is overflow-checked.
+static bool texture_copy_buffer_bytes(const BufferTextureCopyInfo& info, Format format,
+                                      uint64_t* out_bytes) {
+    if (info.image_extent.x == 0 || info.image_extent.y == 0 || info.image_extent.z == 0) {
+        return false;
+    }
+    const FormatInfo fi = get_format_info(format);
+    if (fi.block_size_bytes == 0) { return false; }
+    const uint32_t row_px =
+        info.buffer_row_pixels_stride != 0 ? info.buffer_row_pixels_stride : info.image_extent.x;
+    const uint64_t blocks_per_row =
+        (static_cast<uint64_t>(row_px) + fi.block_width - 1) / fi.block_width;
+    if (blocks_per_row > UINT64_MAX / fi.block_size_bytes) { return false; }
+    const uint64_t row_bytes = blocks_per_row * fi.block_size_bytes;
+    const uint64_t plane_rows =
+        info.buffer_plane_rows_stride != 0
+            ? info.buffer_plane_rows_stride
+            : (static_cast<uint64_t>(info.image_extent.y) + fi.block_height - 1) / fi.block_height;
+    if (plane_rows > UINT64_MAX / row_bytes) { return false; }
+    const uint64_t plane_bytes = plane_rows * row_bytes;
+    if (info.image_extent.z > UINT64_MAX / plane_bytes) { return false; }
+    *out_bytes = static_cast<uint64_t>(info.image_extent.z) * plane_bytes;
+    return true;
+}
 
 void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
-    auto* d = cmd->device;
-    retain_buffer(cmd, destGpu);
-    retain_buffer(cmd, srcGpu);
-    auto src = buffer_and_offset_from_ptr(d, srcGpu);
-    auto dst = buffer_and_offset_from_ptr(d, destGpu);
+
+    if (srcGpu == 0 || destGpu == 0) {
+        cmd_record_fail(cmd, "cmd_memcpy: null source/destination pointer");
+        return;
+    }
+    BufferRange src{};
+    BufferRange dst{};
+    if (!retain_buffer(cmd, srcGpu, static_cast<VkDeviceSize>(size), &src)) { return; }
+    if (!retain_buffer(cmd, destGpu, static_cast<VkDeviceSize>(size), &dst)) { return; }
     VkBufferCopy2 region{
         .sType     = VK_STRUCTURE_TYPE_BUFFER_COPY_2,
         .srcOffset = src.offset,
@@ -1084,8 +1150,8 @@ void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
     };
     VkCopyBufferInfo2 copy_info{
         .sType       = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
-        .srcBuffer   = src.buffer,
-        .dstBuffer   = dst.buffer,
+        .srcBuffer   = src.vk_buffer,
+        .dstBuffer   = dst.vk_buffer,
         .regionCount = 1,
         .pRegions    = &region,
     };
@@ -1096,11 +1162,17 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
                          GpuPtr                       srcPtr,
                          Handle<Texture>              texture,
                          const BufferTextureCopyInfo& info) {
-    auto* d = cmd->device;
-    retain_buffer(cmd, srcPtr);
-    retain_texture(cmd, texture);
-    auto src = buffer_and_offset_from_ptr(d, srcPtr);
-    auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
+
+    TextureImpl* tex = retain_texture(cmd, texture);
+    if (tex == nullptr) { return; }
+    uint64_t bytes = 0;
+    if (info.base_mip >= tex->mip_count ||
+        !texture_copy_buffer_bytes(info, tex->format, &bytes)) {
+        cmd_record_fail(cmd, "copy_to_texture: invalid copy region or mip level");
+        return;
+    }
+    BufferRange src{};
+    if (!retain_buffer(cmd, srcPtr, bytes, &src)) { return; }
 
     VkBufferImageCopy2 region{
         .sType             = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -1109,7 +1181,7 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
         .bufferRowLength   = info.buffer_row_pixels_stride,
         .bufferImageHeight = info.buffer_plane_rows_stride,
         .imageSubresource  = {
-             .aspectMask     = aspects_for_format(tex.format),
+             .aspectMask     = aspects_for_format(tex->format),
              .mipLevel       = info.base_mip,
              .baseArrayLayer = info.base_layer,
              .layerCount     = 1,
@@ -1128,8 +1200,8 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
     VkCopyBufferToImageInfo2 copy_info{
         .sType          = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
         .pNext          = nullptr,
-        .srcBuffer      = src.buffer,
-        .dstImage       = tex.vk_image,
+        .srcBuffer      = src.vk_buffer,
+        .dstImage       = tex->vk_image,
         .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
         .regionCount    = 1,
         .pRegions       = &region,
@@ -1141,11 +1213,17 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
                            Handle<Texture>              texture,
                            GpuPtr                       destGpu,
                            const BufferTextureCopyInfo& info) {
-    auto* d = cmd->device;
-    retain_buffer(cmd, destGpu);
-    retain_texture(cmd, texture);
-    auto dst = buffer_and_offset_from_ptr(d, destGpu);
-    auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
+
+    TextureImpl* tex = retain_texture(cmd, texture);
+    if (tex == nullptr) { return; }
+    uint64_t bytes = 0;
+    if (info.base_mip >= tex->mip_count ||
+        !texture_copy_buffer_bytes(info, tex->format, &bytes)) {
+        cmd_record_fail(cmd, "copy_from_texture: invalid copy region or mip level");
+        return;
+    }
+    BufferRange dst{};
+    if (!retain_buffer(cmd, destGpu, bytes, &dst)) { return; }
 
     VkBufferImageCopy2 region{
         .sType             = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -1154,7 +1232,7 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
         .bufferRowLength   = info.buffer_row_pixels_stride,
         .bufferImageHeight = info.buffer_plane_rows_stride,
         .imageSubresource  = {
-             .aspectMask     = aspects_for_format(tex.format),
+             .aspectMask     = aspects_for_format(tex->format),
              .mipLevel       = info.base_mip,
              .baseArrayLayer = info.base_layer,
              .layerCount     = 1,
@@ -1173,9 +1251,9 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
     VkCopyImageToBufferInfo2 copy_info{
         .sType          = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
         .pNext          = nullptr,
-        .srcImage       = tex.vk_image,
+        .srcImage       = tex->vk_image,
         .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .dstBuffer      = dst.buffer,
+        .dstBuffer      = dst.vk_buffer,
         .regionCount    = 1,
         .pRegions       = &region,
     };
@@ -1227,16 +1305,16 @@ void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
 }
 
 void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
-    auto* d   = cmd->device;
-    retain_texture(cmd, texture);
-    auto& tex = d->texture_pool[handle_cast<TextureImpl>(texture)];
 
-    const uint32_t aspect = aspects_for_format(tex.format);
-    const uint32_t w      = tex.dimensions.x;
-    const uint32_t h      = tex.dimensions.y;
+    TextureImpl* tex = retain_texture(cmd, texture);
+    if (tex == nullptr) { return; }
+
+    const uint32_t aspect = aspects_for_format(tex->format);
+    const uint32_t w      = tex->dimensions.x;
+    const uint32_t h      = tex->dimensions.y;
 
     // Successive linear blits: mip i-1 -> mip i, layer 0 only.
-    for (uint32_t i = 1; i < tex.mip_count; ++i) {
+    for (uint32_t i = 1; i < tex->mip_count; ++i) {
         const VkImageBlit2 region{
             .sType          = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
             .pNext          = nullptr,
@@ -1266,9 +1344,9 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
         const VkBlitImageInfo2 info{
             .sType          = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
             .pNext          = nullptr,
-            .srcImage       = tex.vk_image,
+            .srcImage       = tex->vk_image,
             .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .dstImage       = tex.vk_image,
+            .dstImage       = tex->vk_image,
             .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
             .regionCount    = 1,
             .pRegions       = &region,
@@ -1277,7 +1355,7 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
         backend_blit_image(cmd, info);
 
         // Serialize blit write (mip i) vs next blit read (mip i).
-        if (i + 1 < tex.mip_count) {
+        if (i + 1 < tex->mip_count) {
             cmd_barrier(cmd, StageFlags::Transfer, StageFlags::Transfer);
         }
     }
@@ -1285,7 +1363,9 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
 
 bool cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
     auto* d = cmd->device;
-    PipelineRecord* rec = d->pipeline_pool[handle_cast<PipelineImpl>(pipeline)].record;
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr) { return false; }
+    PipelineRecord* rec = impl->record;
     // Pending or Failed: record nothing so the application can explicitly
     // bind a fallback or skip the operation. Never blocks on compilation.
     if (rec->state.load(std::memory_order_acquire) != InternalPipelineState::Ready) {
@@ -1355,7 +1435,12 @@ bool prepare_static_graphics(CommandBufferImpl* cb) {
 
 void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> state) {
     auto* d = cmd->device;
-    auto& desc = d->depth_stencil_pool[state].desc;
+    DepthStencilState* ds = d->depth_stencil_pool.try_get(state);
+    if (ds == nullptr) {
+        cmd_record_fail(cmd, "invalid or stale depth-stencil state handle");
+        return;
+    }
+    auto& desc = ds->desc;
 
     // Update the logical shadow (baked members -> variant key on the static
     // fallback; core-dynamic members are applied on every path).
@@ -1486,18 +1571,17 @@ static void push_graphics_ptrs(DeviceImpl* d, VkCommandBuffer buf, GpuPtr vertex
 }
 
 void cmd_dispatch(CommandBuffer cmd, GpuPtr dataGpu, const Dimension3D& gridDimensions) {
-    retain_buffer(cmd, dataGpu);
+    if (!retain_buffer(cmd, dataGpu, 0, nullptr)) { return; }
     push_compute_ptr(cmd->device, cmd->buffer, dataGpu);
     vkCmdDispatch(cmd->buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
 void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensionsGpu) {
-    auto* d = cmd->device;
-    retain_buffer(cmd, dataGpu);
-    retain_buffer(cmd, gridDimensionsGpu);
-    auto dim = buffer_and_offset_from_ptr(d, gridDimensionsGpu);
+    if (!retain_buffer(cmd, dataGpu, 0, nullptr)) { return; }
+    BufferRange dim{};
+    if (!retain_buffer(cmd, gridDimensionsGpu, sizeof(VkDispatchIndirectCommand), &dim)) { return; }
     push_compute_ptr(cmd->device, cmd->buffer, dataGpu);
-    vkCmdDispatchIndirect(cmd->buffer, dim.buffer, dim.offset);
+    vkCmdDispatchIndirect(cmd->buffer, dim.vk_buffer, dim.offset);
 }
 
 // --- Render pass ----------------------------------------------------------------------
@@ -1505,29 +1589,29 @@ void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensi
 // Returns (creating on first use) a native image view for the attachment
 // subresource (texture, mip, layer). Views are cached per texture and
 // destroyed with it; the caller must have retained the texture.
-static VkImageView get_attachment_view(DeviceImpl* d, Handle<Texture> tex, uint16_t mip, uint16_t layer) {
-    auto& t = d->texture_pool[handle_cast<TextureImpl>(tex)];
+static VkImageView get_attachment_view(DeviceImpl* d, TextureImpl* t, uint16_t mip, uint16_t layer) {
+    if (t == nullptr) { return VK_NULL_HANDLE; }
     mutex_lock(&d->attachment_view_lock);
-    for (auto& av : t.attachment_views) {
+    for (auto& av : t->attachment_views) {
         if (av.mip == mip && av.layer == layer) {
             mutex_unlock(&d->attachment_view_lock);
             return av.view;
         }
     }
     // Cube faces use per-face 2D views (a cube view requires 6 layers).
-    const bool is_cube = (t.vk_type == VK_IMAGE_VIEW_TYPE_CUBE ||
-                          t.vk_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
+    const bool is_cube = (t->vk_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                          t->vk_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
     const VkImageViewCreateInfo view_info{
         .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext    = nullptr,
         .flags    = 0,
-        .image    = t.vk_image,
-        .viewType = is_cube ? VK_IMAGE_VIEW_TYPE_2D : t.vk_type,
-        .format   = bridge(t.format),
+        .image    = t->vk_image,
+        .viewType = is_cube ? VK_IMAGE_VIEW_TYPE_2D : t->vk_type,
+        .format   = bridge(t->format),
         .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
         .subresourceRange = {
-            .aspectMask     = aspects_for_format(t.format),
+            .aspectMask     = aspects_for_format(t->format),
             .baseMipLevel   = mip,
             .levelCount     = 1,
             .baseArrayLayer = layer,
@@ -1540,7 +1624,7 @@ static VkImageView get_attachment_view(DeviceImpl* d, Handle<Texture> tex, uint1
         mutex_unlock(&d->attachment_view_lock);
         return VK_NULL_HANDLE;
     }
-    t.attachment_views.push_back(TextureImpl::AttachmentView{mip, layer, view});
+    t->attachment_views.push_back(TextureImpl::AttachmentView{mip, layer, view});
     mutex_unlock(&d->attachment_view_lock);
     return view;
 }
@@ -1556,23 +1640,38 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         cmd_record_fail(cmd, "render pass: depth and stencil attachments must be the same texture");
         return;
     }
-    // Retain every texture named by the pass so freeing the user handle
-    // cannot destroy a native image the recorded commands reference.
-    for (const auto& attachment : desc.color_attachments) {
-        retain_texture(cmd, attachment.texture);
-        if (attachment.resolve_texture.h != 0) { retain_texture(cmd, attachment.resolve_texture); }
+    // Retain every texture named by the pass (invalid handles fail the
+    // recording); the retained records feed the attachment-view lookups.
+    TextureImpl* depth_rec   = nullptr;
+    TextureImpl* stencil_rec = nullptr;
+    if (desc.depth_attachment.texture.h != 0) {
+        depth_rec = retain_texture(cmd, desc.depth_attachment.texture);
+        if (depth_rec == nullptr) { return; }
     }
-    if (desc.depth_attachment.texture.h != 0) { retain_texture(cmd, desc.depth_attachment.texture); }
-    if (desc.stencil_attachment.texture.h != 0) { retain_texture(cmd, desc.stencil_attachment.texture); }
-    Arena*  arena = get_thread_local_arena(d);
+    if (desc.stencil_attachment.texture.h != 0) {
+        stencil_rec = retain_texture(cmd, desc.stencil_attachment.texture);
+        if (stencil_rec == nullptr) { return; }
+    }
+    Arena* arena = get_thread_local_arena(d);
+    if (arena == nullptr) {
+        cmd_record_fail(cmd, "render pass: no scratch arena");
+        return;
+    }
     ScratchScope scope(*arena);
     Span<VkRenderingAttachmentInfo> color_attachments{};
 
     for (const auto& attachment : desc.color_attachments) {
+        TextureImpl* rec = retain_texture(cmd, attachment.texture);
+        if (rec == nullptr) { return; }
+        TextureImpl* resolve_rec = nullptr;
+        if (attachment.resolve_texture.h != 0) {
+            resolve_rec = retain_texture(cmd, attachment.resolve_texture);
+            if (resolve_rec == nullptr) { return; }
+        }
         VkRenderingAttachmentInfo info{
             .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext              = nullptr,
-            .imageView          = get_attachment_view(d, attachment.texture, attachment.mip, attachment.layer),
+            .imageView          = get_attachment_view(d, rec, attachment.mip, attachment.layer),
             .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
             .resolveMode        = VK_RESOLVE_MODE_NONE,
             .resolveImageView   = VK_NULL_HANDLE,
@@ -1584,23 +1683,23 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
                                                           attachment.clear_color.b / 255.0f,
                                                           attachment.clear_color.a / 255.0f}}},
         };
-        if (attachment.resolve_texture.h != 0) {
+        if (resolve_rec != nullptr) {
             // MSAA color resolve (sample_count 1 target); depth/stencil
             // attachments never resolve.
             info.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
-            info.resolveImageView   = get_attachment_view(d, attachment.resolve_texture, attachment.mip, attachment.layer);
+            info.resolveImageView   = get_attachment_view(d, resolve_rec, attachment.mip, attachment.layer);
             info.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
         color_attachments = concat(arena, color_attachments, info);
     }
 
-    const bool has_depth = desc.depth_attachment.texture.h != 0;
+    const bool has_depth = depth_rec != nullptr;
     VkRenderingAttachmentInfo depth_attachment{};
     if (has_depth) {
         depth_attachment = VkRenderingAttachmentInfo{
             .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext              = nullptr,
-            .imageView          = get_attachment_view(d, desc.depth_attachment.texture, desc.depth_attachment.mip, desc.depth_attachment.layer),
+            .imageView          = get_attachment_view(d, depth_rec, desc.depth_attachment.mip, desc.depth_attachment.layer),
             .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
             .resolveMode        = VK_RESOLVE_MODE_NONE,
             .resolveImageView   = VK_NULL_HANDLE,
@@ -1612,13 +1711,13 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         };
     }
 
-    const bool has_stencil = desc.stencil_attachment.texture.h != 0;
+    const bool has_stencil = stencil_rec != nullptr;
     VkRenderingAttachmentInfo stencil_attachment{};
     if (has_stencil) {
         stencil_attachment = VkRenderingAttachmentInfo{
             .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext              = nullptr,
-            .imageView          = get_attachment_view(d, desc.stencil_attachment.texture, desc.stencil_attachment.mip, desc.stencil_attachment.layer),
+            .imageView          = get_attachment_view(d, stencil_rec, desc.stencil_attachment.mip, desc.stencil_attachment.layer),
             .imageLayout        = VK_IMAGE_LAYOUT_GENERAL,
             .resolveMode        = VK_RESOLVE_MODE_NONE,
             .resolveImageView   = VK_NULL_HANDLE,
@@ -1637,7 +1736,7 @@ void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
         .extent = {.width = desc.render_area.width, .height = desc.render_area.height},
     };
     if (arena->overflowed()) {
-        IZ_LOG(d, LogLevel::Error, "cmd_begin_render_pass: scratch arena overflow, pass skipped");
+        cmd_record_fail(cmd, "cmd_begin_render_pass: scratch arena overflow");
         return;
     }
     const VkRenderingInfo rendering_info{
@@ -1696,26 +1795,27 @@ void cmd_end_render_pass(CommandBuffer cmd) {
 void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
               uint32_t vertexCount, uint32_t instanceCount) {
     if (!prepare_static_graphics(cmd)) { return; }
-    retain_buffer(cmd, vertexDataGpu);
-    retain_buffer(cmd, fragmentDataGpu);
+    if (!retain_buffer(cmd, vertexDataGpu, 0, nullptr)) { return; }
+    if (!retain_buffer(cmd, fragmentDataGpu, 0, nullptr)) { return; }
     push_graphics_ptrs(cmd->device, cmd->buffer, vertexDataGpu, fragmentDataGpu);
     vkCmdDraw(cmd->buffer, vertexCount, instanceCount, 0, 0);
 }
 
 void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInfo& args) {
-    auto* d = cmd->device;
     if (!prepare_static_graphics(cmd)) { return; }
-    retain_buffer(cmd, args.vertexDataGpu);
-    retain_buffer(cmd, args.fragmentDataGpu);
-    retain_buffer(cmd, args.indicesGpu);
+    if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
+    if (!retain_buffer(cmd, args.fragmentDataGpu, 0, nullptr)) { return; }
+    const VkDeviceSize index_bytes =
+        static_cast<VkDeviceSize>(args.indexCount) * (args.type == IndexType::UInt16 ? 2 : 4);
+    BufferRange indices{};
+    if (!retain_buffer(cmd, args.indicesGpu, index_bytes, &indices)) { return; }
     push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
-        const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
 #if defined(IZ_VK_PROFILE_BINDLESS)
         // 1.3/no maintenance5: legacy index buffer bind (64-bit offset).
-        vkCmdBindIndexBuffer(cmd->buffer, indices.buffer, indices.offset, bridge(args.type));
+        vkCmdBindIndexBuffer(cmd->buffer, indices.vk_buffer, indices.offset, bridge(args.type));
 #else
-        vkCmdBindIndexBuffer2(cmd->buffer, indices.buffer, indices.offset,
+        vkCmdBindIndexBuffer2(cmd->buffer, indices.vk_buffer, indices.offset,
                               VK_WHOLE_SIZE, bridge(args.type));
 #endif
         cmd->current_idx_buffer = args.indicesGpu;
@@ -1724,53 +1824,53 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
 }
 
 void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedIndirectInfo& args) {
-    auto* d = cmd->device;
     if (!prepare_static_graphics(cmd)) { return; }
-    retain_buffer(cmd, args.vertexDataGpu);
-    retain_buffer(cmd, args.fragmentDataGpu);
-    retain_buffer(cmd, args.indicesGpu);
-    retain_buffer(cmd, args.argsGpu);
+    if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
+    if (!retain_buffer(cmd, args.fragmentDataGpu, 0, nullptr)) { return; }
+    BufferRange indices{};
+    if (!retain_buffer(cmd, args.indicesGpu, 0, &indices)) { return; }
+    BufferRange gpu_args{};
+    if (!retain_buffer(cmd, args.argsGpu, sizeof(VkDrawIndexedIndirectCommand), &gpu_args)) { return; }
     push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
-        const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
 #if defined(IZ_VK_PROFILE_BINDLESS)
         // 1.3/no maintenance5: legacy index buffer bind (64-bit offset).
-        vkCmdBindIndexBuffer(cmd->buffer, indices.buffer, indices.offset, bridge(args.type));
+        vkCmdBindIndexBuffer(cmd->buffer, indices.vk_buffer, indices.offset, bridge(args.type));
 #else
-        vkCmdBindIndexBuffer2(cmd->buffer, indices.buffer, indices.offset,
+        vkCmdBindIndexBuffer2(cmd->buffer, indices.vk_buffer, indices.offset,
                               VK_WHOLE_SIZE, bridge(args.type));
 #endif
         cmd->current_idx_buffer = args.indicesGpu;
     }
-    const auto gpu_args = buffer_and_offset_from_ptr(d, args.argsGpu);
-    vkCmdDrawIndexedIndirect(cmd->buffer, gpu_args.buffer, gpu_args.offset, 1,
+    vkCmdDrawIndexedIndirect(cmd->buffer, gpu_args.vk_buffer, gpu_args.offset, 1,
                              sizeof(VkDrawIndexedIndirectCommand));
 }
 
 void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer cmd, const MultiDrawIndirectInfo& args) {
-    auto* d = cmd->device;
     if (!prepare_static_graphics(cmd)) { return; }
-    retain_buffer(cmd, args.vertexDataGpu);
-    retain_buffer(cmd, args.pixelDataGpu);
-    retain_buffer(cmd, args.indicesGpu);
-    retain_buffer(cmd, args.argsGpu);
-    retain_buffer(cmd, args.drawCountGpu);
+    if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
+    if (!retain_buffer(cmd, args.pixelDataGpu, 0, nullptr)) { return; }
+    BufferRange indices{};
+    if (!retain_buffer(cmd, args.indicesGpu, 0, &indices)) { return; }
+    BufferRange gpu_args{};
+    if (!retain_buffer(cmd, args.argsGpu,
+                       static_cast<VkDeviceSize>(sizeof(VkDrawIndexedIndirectCommand)) * args.maxDraws,
+                       &gpu_args)) { return; }
+    BufferRange count{};
+    if (!retain_buffer(cmd, args.drawCountGpu, sizeof(uint32_t), &count)) { return; }
     push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.pixelDataGpu);
     if (args.indicesGpu != cmd->current_idx_buffer) {
-        const auto indices = buffer_and_offset_from_ptr(d, args.indicesGpu);
 #if defined(IZ_VK_PROFILE_BINDLESS)
         // 1.3/no maintenance5: legacy index buffer bind (64-bit offset).
-        vkCmdBindIndexBuffer(cmd->buffer, indices.buffer, indices.offset, bridge(args.type));
+        vkCmdBindIndexBuffer(cmd->buffer, indices.vk_buffer, indices.offset, bridge(args.type));
 #else
-        vkCmdBindIndexBuffer2(cmd->buffer, indices.buffer, indices.offset,
+        vkCmdBindIndexBuffer2(cmd->buffer, indices.vk_buffer, indices.offset,
                               VK_WHOLE_SIZE, bridge(args.type));
 #endif
         cmd->current_idx_buffer = args.indicesGpu;
     }
-    const auto gpu_args = buffer_and_offset_from_ptr(d, args.argsGpu);
-    const auto count    = buffer_and_offset_from_ptr(d, args.drawCountGpu);
-    vkCmdDrawIndexedIndirectCount(cmd->buffer, gpu_args.buffer, gpu_args.offset,
-                                  count.buffer, count.offset, args.maxDraws,
+    vkCmdDrawIndexedIndirectCount(cmd->buffer, gpu_args.vk_buffer, gpu_args.offset,
+                                  count.vk_buffer, count.offset, args.maxDraws,
                                   sizeof(VkDrawIndexedIndirectCommand));
 }
 
@@ -1780,6 +1880,11 @@ void cmd_wait_for_surface_texture(CommandBuffer cmd) {
     cmd->wait_for_surface_texture = true;
     auto* d = cmd->device;
     const auto current_image = d->surface.swapchain_images[d->surface.current_image_idx];
+    TextureImpl* tex = d->texture_pool.try_get(handle_cast<TextureImpl>(current_image));
+    if (tex == nullptr) {
+        cmd_record_fail(cmd, "wait_for_surface_texture: surface is not configured");
+        return;
+    }
     const VkImageMemoryBarrier2 image_barrier{
         .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .pNext         = nullptr,
@@ -1790,7 +1895,7 @@ void cmd_wait_for_surface_texture(CommandBuffer cmd) {
         .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
         .oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED,
         .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
-        .image         = d->texture_pool[handle_cast<TextureImpl>(current_image)].vk_image,
+        .image         = tex->vk_image,
         .subresourceRange = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel   = 0,
@@ -1817,6 +1922,11 @@ void cmd_signal_surface_texture(CommandBuffer cmd) {
     cmd->signal_surface_texture = true;
     auto* d = cmd->device;
     const auto current_image = d->surface.swapchain_images[d->surface.current_image_idx];
+    TextureImpl* tex = d->texture_pool.try_get(handle_cast<TextureImpl>(current_image));
+    if (tex == nullptr) {
+        cmd_record_fail(cmd, "signal_surface_texture: surface is not configured");
+        return;
+    }
     const VkImageMemoryBarrier2 image_barrier{
         .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .pNext         = nullptr,
@@ -1829,7 +1939,7 @@ void cmd_signal_surface_texture(CommandBuffer cmd) {
         .dstAccessMask = 0,
         .oldLayout     = VK_IMAGE_LAYOUT_GENERAL,
         .newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        .image         = d->texture_pool[handle_cast<TextureImpl>(current_image)].vk_image,
+        .image         = tex->vk_image,
         .subresourceRange = {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel   = 0,
@@ -1858,6 +1968,7 @@ void cmd_push_debug_group(CommandBuffer cmd, Span<const char> label) {
     auto* d = cmd->device;
     if (d->has_debug_markers) {
         Arena* a = get_thread_local_arena(d);
+        if (a == nullptr) { return; }
         const VkDebugUtilsLabelEXT info{
             .sType       = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
             .pNext       = nullptr,

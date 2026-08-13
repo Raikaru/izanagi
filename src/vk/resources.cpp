@@ -417,7 +417,11 @@ void release_texture_ref(DeviceImpl* d, Handle<Texture> tex) {
     // the init-list removal under texture_init_lock: a concurrent submit can
     // claim a still-listed record in that gap, so the list must never hold a
     // pointer to a record whose refs reached zero.
-    TextureImpl* rec = &d->texture_pool[handle_cast<TextureImpl>(tex)];
+    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(tex));
+    if (rec == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "release_texture_ref: stale texture handle");
+        return;
+    }
     mutex_lock(&d->texture_init_lock);
     const bool last = (atomic_fetch_add(&rec->refs, -1) == 1);
     if (last) {
@@ -434,15 +438,19 @@ void release_texture_ref(DeviceImpl* d, Handle<Texture> tex) {
         d->texture_pool.erase(handle_cast<TextureImpl>(tex));
     }
 }
-
 void free(Device dev, Handle<Texture> t) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    TextureImpl* rec = &d->texture_pool[handle_cast<TextureImpl>(t)];
+    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(t));
+    if (rec == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "free(texture): invalid or stale handle");
+        return;
+    }
     remove_uninitialized_texture(d, rec);
     // Invalidate the public handle immediately even when descriptor or
     // command-buffer retentions keep the record alive; the user reference is
-    // released through the record's current-generation handle.
-    d->texture_pool.invalidate(handle_cast<TextureImpl>(t));
+    // released through the record's current-generation handle. A concurrent
+    // double free loses the invalidate race and retires nothing.
+    if (!d->texture_pool.invalidate(handle_cast<TextureImpl>(t))) { return; }
     Handle<Texture> h = handle_cast<Texture>(d->texture_pool.find_handle(rec));
     if (h.h != 0) { release_texture_ref(d, h); }
 }
@@ -456,8 +464,12 @@ void free_after(Device dev, Handle<Texture> tex, Submission s) {
     const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
     // Invalidate the public handle immediately; the stable record survives
     // via the deferred user reference until the submission completes.
-    TextureImpl* rec = &d->texture_pool[handle_cast<TextureImpl>(tex)];
-    d->texture_pool.invalidate(handle_cast<TextureImpl>(tex));
+    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(tex));
+    if (rec == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "free_after(texture): invalid or stale handle");
+        return;
+    }
+    if (!d->texture_pool.invalidate(handle_cast<TextureImpl>(tex))) { return; }
     remove_uninitialized_texture(d, rec);
     enqueue_retire(q, value, RetireItem{RetireKind::Texture, reinterpret_cast<uint64_t>(rec), 0});
 }
@@ -490,8 +502,7 @@ void free_sampler_after(Device dev, SamplerId sampler, Submission s) {
 
 // --- Texture views (object-less, heap-descriptor-only) -----------------------------------
 
-static VkImageViewCreateInfo make_view_info(DeviceImpl* d, const TextureViewDesc& desc) {
-    auto& texture = d->texture_pool[handle_cast<TextureImpl>(desc.texture)];
+static VkImageViewCreateInfo make_view_info(const TextureImpl& texture, const TextureViewDesc& desc) {
     return VkImageViewCreateInfo{
         .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext    = nullptr,
@@ -517,7 +528,11 @@ static VkImageViewCreateInfo make_view_info(DeviceImpl* d, const TextureViewDesc
 // native descriptor write fails.
 static TextureView desc_allocate_image_view(DeviceImpl* d, RetireKind kind, uint64_t type,
                                             const TextureViewDesc& desc) {
-    TextureImpl* owner = &d->texture_pool[handle_cast<TextureImpl>(desc.texture)];
+    TextureImpl* owner = d->texture_pool.try_get(handle_cast<TextureImpl>(desc.texture));
+    if (owner == nullptr) {
+        IZ_LOG(d, LogLevel::Error, "create_texture_view: invalid or stale texture handle");
+        return 0;
+    }
     atomic_fetch_add(&owner->refs, 1);   // descriptor owns the texture until retirement
     mutex_lock(&d->desc_lock);
     uint32_t slot = desc_bitset(d, kind).set_leading_zero();
@@ -536,7 +551,7 @@ static TextureView desc_allocate_image_view(DeviceImpl* d, RetireKind kind, uint
     owners[slot] = owner;
     mutex_unlock(&d->desc_lock);
 
-    auto view_info = make_view_info(d, desc);
+    auto view_info = make_view_info(*owner, desc);
     const bool written = (kind == RetireKind::SampledSlot)
                              ? write_sampled_descriptor(d, slot, view_info)
                              : write_storage_descriptor(d, slot, view_info);
@@ -582,13 +597,13 @@ SamplerId create_sampler(Device dev, const SamplerDesc& desc) {
         .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext            = nullptr,
         .flags            = 0,
-        .magFilter        = bridge(desc.filter),
-        .minFilter        = bridge(desc.filter),
-        .mipmapMode       = bridge_mip_mode(desc.filter),
+        .magFilter        = bridge(desc.mag_filter),
+        .minFilter        = bridge(desc.min_filter),
+        .mipmapMode       = bridge_mip_mode(desc.mip_filter),
         .addressModeU     = bridge(desc.address),
         .addressModeV     = bridge(desc.address),
         .addressModeW     = bridge(desc.address),
-        .mipLodBias       = 0,
+        .mipLodBias       = desc.mip_lod_bias,
         .anisotropyEnable = (desc.max_anisotropy != 1.0f),
         .maxAnisotropy    = desc.max_anisotropy,
         .compareEnable    = VK_FALSE,

@@ -382,11 +382,11 @@ class SlotMap {
     void clear();
 
     Handle<T> emplace(T&& val);
-    void      erase(Handle<T> h);
+    bool      erase(Handle<T> h);
     // Invalidates every handle to this slot WITHOUT destroying the stored
     // record or freeing the slot (used when a refcounted record must survive
     // retirement but its public handle must become stale immediately).
-    void invalidate(Handle<T> h);
+    bool      invalidate(Handle<T> h);
     // Returns the handle with the CURRENT generation for a stored record
     // (used to release refcounted records whose public handle was already
     // invalidated). Returns {} when the record is not in the map.
@@ -394,6 +394,11 @@ class SlotMap {
 
     T&       operator[](Handle<T> h);
     const T& operator[](Handle<T> h) const;
+    // Fallible access: null when the handle is stale, its index is outside
+    // the allocated capacity, or the slot is not currently allocated.
+    // Public-handle-consuming paths MUST use this; operator[] is reserved
+    // for internally trusted handles.
+    T* try_get(Handle<T> h);
 
    private:
     static constexpr uint32_t kSmallSegmentsToSkip = 6;
@@ -573,37 +578,40 @@ Handle<T> SlotMap<T>::emplace(T&& val) {
     // emplace) must never resolve to this slot.
     const Handle<T> handle = create_handle(idx, ++entry->gen);
     mutex_unlock(&m_mutex);
-
     return handle;
 }
 
 template <class T>
-void SlotMap<T>::erase(Handle<T> h) {
+bool SlotMap<T>::erase(Handle<T> h) {
     mutex_lock(&m_mutex);
     const auto [idx, gen] = decompose_handle(h);
-    Entry* entry          = get(idx);
-    assert(entry->gen == gen);
-    if (m_destructor_fn) { m_destructor_fn(&entry->data, m_destructor_userdata); }
-    entry->gen  = entry->gen + 1;   // invalidate every handle to this slot
-    entry->next = m_head;
-    m_head      = idx;
+    bool ok = false;
+    if (idx < capacity_for_segment_count(m_used_segments)) {
+        Entry* entry = get(idx);
+        if (entry->next == kNotInFreelist && entry->gen == gen) {
+            if (m_destructor_fn) { m_destructor_fn(&entry->data, m_destructor_userdata); }
+            entry->gen  = entry->gen + 1;
+            entry->next = m_head;
+            m_head      = idx;
+            ok = true;
+        }
+    }
     mutex_unlock(&m_mutex);
+    return ok;
 }
 
 template <class T>
 T& SlotMap<T>::operator[](Handle<T> h) {
-    const auto [idx, gen] = decompose_handle(h);
-    Entry* e              = get(idx);
-    assert(e && e->gen == gen);
-    return e->data;
+    T* e = try_get(h);
+    assert(e != nullptr);   // operator[] is for internally trusted handles only
+    return *e;
 }
 
 template <class T>
 const T& SlotMap<T>::operator[](Handle<T> h) const {
-    const auto [idx, gen] = decompose_handle(h);
-    Entry* e              = get(idx);
-    assert(e && e->gen == gen);
-    return e->data;
+    T* e = try_get(h);
+    assert(e != nullptr);   // operator[] is for internally trusted handles only
+    return *e;
 }
 
 template <class T>
@@ -647,13 +655,34 @@ Handle<T> SlotMap<T>::find_handle(const T* ptr) {
 }
 
 template <class T>
-void SlotMap<T>::invalidate(Handle<T> h) {
+bool SlotMap<T>::invalidate(Handle<T> h) {
     mutex_lock(&m_mutex);
     const auto [idx, gen] = decompose_handle(h);
-    Entry* entry          = get(idx);
-    assert(entry->gen == gen);
-    entry->gen = entry->gen + 1;   // every old handle to this slot is now stale
+    bool ok = false;
+    if (idx < capacity_for_segment_count(m_used_segments)) {
+        Entry* entry = get(idx);
+        if (entry->next == kNotInFreelist && entry->gen == gen) {
+            entry->gen = entry->gen + 1;
+            ok = true;
+        }
+    }
     mutex_unlock(&m_mutex);
+    return ok;
+}
+
+template <class T>
+T* SlotMap<T>::try_get(Handle<T> h) {
+    mutex_lock(&m_mutex);
+    T* result = nullptr;
+    const auto [idx, gen] = decompose_handle(h);
+    // Bounds-check the decoded index BEFORE get() computes a segment:
+    // a forged 32-bit index can address past the segment array.
+    if (idx < capacity_for_segment_count(m_used_segments)) {
+        Entry* entry = get(idx);
+        if (entry->next == kNotInFreelist && entry->gen == gen) { result = &entry->data; }
+    }
+    mutex_unlock(&m_mutex);
+    return result;
 }
 
 template <class T>

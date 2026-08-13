@@ -56,11 +56,14 @@ struct Buffer {
     int64_t         refs            = 1;   // atomic via platform helpers
 };
 
-// Buffer/offset pair validated against the allocation's user-visible bounds.
-struct BufferAndOffset {
-    VkBuffer      buffer;
-    VkDeviceSize  offset;   // VkBuffer-relative (64-bit)
-    VmaAllocation alloc;
+// Buffer/offset pair resolved and range-validated against the allocation's
+// user-visible bounds. handle is null on failure; a successful lookup holds
+// one buffer reference (release_buffer_ref it when done).
+struct BufferRange {
+    Handle<Buffer> handle;
+    VkBuffer       vk_buffer;
+    VkDeviceSize   offset;   // VkBuffer-relative (64-bit)
+    VmaAllocation  allocation;
 };
 
 // Texture layout initialization state (stored per texture record).
@@ -144,6 +147,7 @@ struct PipelineRecord {
     uint32_t  spec_count = 0;
     // raster state (graphics pipelines)
     Topology topology           = Topology::TriangleList;
+    PolygonMode polygon_mode        = PolygonMode::Fill;
     uint8_t  sample_count       = 1;
     bool     alpha_to_coverage  = false;
     Format   depth_format       = Format::None;
@@ -339,6 +343,8 @@ struct DeviceImpl {
     VkDevice           device          = VK_NULL_HANDLE;
     VmaAllocator       vma             = VK_NULL_HANDLE;
     bool               dual_src_blend  = false;   // VkPhysicalDeviceFeatures.dualSrcBlend
+    bool               non_solid_fill = false;   // VkPhysicalDeviceFeatures.fillModeNonSolid
+    uint32_t           framebuffer_sample_counts = 1;
 
     // Surface
     Surface surface;
@@ -605,7 +611,7 @@ void   log_impl(DeviceImpl* d, LogLevel lvl, Span<const char> msg, uint32_t line
 void   log_vk_impl(DeviceImpl* d, VkResult res, Span<const char> msg, uint32_t line, Span<const char> file);
 
 // --- Internal helpers shared across TUs ------------------------------------------------
-BufferAndOffset buffer_and_offset_from_ptr(DeviceImpl* d, GpuPtr ptr);
+BufferRange find_buffer_range(DeviceImpl* d, GpuPtr ptr, VkDeviceSize size);
 
 // Command pool management (commands.cpp)
 CommandPool*  get_command_pool(QueueImpl* queue);
