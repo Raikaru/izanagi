@@ -13,12 +13,24 @@ changes are permitted in every 0.x release and are always listed under
 - Added `PolygonMode` (Fill/Line) and `RasterDesc::polygon_mode`.
 - `Topology` and `Factor` enum value sets expanded.
 - `DeviceLimits` gained `framebuffer_sample_counts`, `non_solid_fill`,
-  `min_uniform_alignment`, `min_storage_alignment`, `non_coherent_atom_size`.
+  `gpu_timestamps`, `min_uniform_alignment`, `min_storage_alignment`, and
+  `non_coherent_atom_size`.
 - `queue_submit` now returns a `Submission` token (`queue`, timeline
   `value`, `status`); added `submission_complete`/`wait_submission` and the
   `PipelineStatus` request lifecycle.
 - Added `BackendProfile`/`device_backend_profile()`.
 
+### Added
+- Submission-safe GPU duration queries through `GpuTimer`,
+  `cmd_begin_gpu_timer`/`cmd_end_gpu_timer`, and non-blocking
+  `get_gpu_timer_result`.
+
+### Fixed
+
+- Fixed `DrawIndexedIndirectGpuArgs` to use Vulkan's required tightly packed
+  20-byte layout. The previous `alignas(8)` made arrays use a 24-byte C++
+  stride while Vulkan consumed a 20-byte stride, corrupting every indirect
+  command after the first and potentially causing device loss.
 ### Security & robustness
 - Runtime-validated handles everywhere: `SlotMap::try_get`/`erase`/
   `invalidate` verify index bounds, generation, and slot allocation before

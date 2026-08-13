@@ -608,6 +608,8 @@ struct DrawIndexedInstancedInfo {
     GpuPtr    indicesGpu;
     uint32_t  indexCount;
     uint32_t  instanceCount = 1;
+    uint32_t  firstIndex    = 0;
+    int32_t   vertexOffset  = 0;
     IndexType type          = IndexType::UInt16;
 };
 struct DrawIndexedIndirectInfo {
@@ -626,13 +628,14 @@ struct MultiDrawIndirectInfo {
     uint32_t  maxDraws;
     IndexType type = IndexType::UInt16;
 };
-struct alignas(8) DrawIndexedIndirectGpuArgs {
+struct DrawIndexedIndirectGpuArgs {
     uint32_t index_count;
     uint32_t instance_count;
     uint32_t first_index;
     int32_t  vertex_offset;
     uint32_t first_instance;
 };
+static_assert(sizeof(DrawIndexedIndirectGpuArgs) == 20);
 
 // --- API functions --------------------------------------------------------------
 

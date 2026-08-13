@@ -755,29 +755,40 @@ static void test_draw_indirect() {
         return;
     }
 
-    // Index buffer + indirect args + draw-count buffer
-    GpuPtr idx_buf   = malloc(d, sizeof(uint16_t) * 3, Memory::Default);
-    GpuPtr args_buf  = malloc(d, sizeof(DrawIndexedIndirectGpuArgs), Memory::Default);
+    // Index buffer + two tightly packed indirect args + draw-count buffer
+    GpuPtr idx_buf   = malloc(d, sizeof(uint16_t) * 6, Memory::Default);
+    GpuPtr args_buf  = malloc(d, sizeof(DrawIndexedIndirectGpuArgs) * 2, Memory::Default);
     GpuPtr count_buf = malloc(d, sizeof(uint32_t), Memory::Default);
     CHECK(idx_buf != 0 && args_buf != 0 && count_buf != 0, "malloc failed");
     auto* idx_host = reinterpret_cast<uint16_t*>(get_host_pointer(d, idx_buf));
     idx_host[0] = 0;
     idx_host[1] = 1;
     idx_host[2] = 2;
+    idx_host[3] = 0;
+    idx_host[4] = 1;
+    idx_host[5] = 2;
     auto* args_host = reinterpret_cast<DrawIndexedIndirectGpuArgs*>(get_host_pointer(d, args_buf));
-    *args_host = DrawIndexedIndirectGpuArgs{
+    args_host[0] = DrawIndexedIndirectGpuArgs{
         .index_count    = 3,
         .instance_count = 1,
         .first_index    = 0,
         .vertex_offset  = 0,
         .first_instance = 0,
     };
-    *reinterpret_cast<uint32_t*>(get_host_pointer(d, count_buf)) = 1;
+    args_host[1] = DrawIndexedIndirectGpuArgs{
+        .index_count    = 3,
+        .instance_count = 1,
+        .first_index    = 3,
+        .vertex_offset  = 0,
+        .first_instance = 0,
+    };
+    *reinterpret_cast<uint32_t*>(get_host_pointer(d, count_buf)) = 2;
 
     Queue q = get_queue(d);
     GpuPtr readback_a = malloc(d, kTexBytes, Memory::Readback);
     GpuPtr readback_b = malloc(d, kTexBytes, Memory::Readback);
-    CHECK(readback_a != 0 && readback_b != 0, "readback malloc failed");
+    GpuPtr readback_c = malloc(d, kTexBytes, Memory::Readback);
+    CHECK(readback_a != 0 && readback_b != 0 && readback_c != 0, "readback malloc failed");
 
     RenderAttachment color_att{
         .texture     = color_tex,
@@ -815,7 +826,8 @@ static void test_draw_indirect() {
           "pass A: center pixel not red");
     CHECK(rb_a[2] == 0 && rb_a[1] == 0 && rb_a[0] == 0, "pass A: corner pixel not black");
 
-    // Pass B: multi indirect indexed draw (drawCountGpu = 1, maxDraws = 1)
+    // Pass B: execute the second command in a tightly packed multi-draw array.
+    args_host[0].index_count = 0;
     cmd = queue_start_command_recording(q);
     cmd_begin_render_pass(cmd, pass_desc);
     cmd_set_pipeline(cmd, pipeline);
@@ -825,7 +837,7 @@ static void test_draw_indirect() {
         .indicesGpu    = idx_buf,
         .argsGpu       = args_buf,
         .drawCountGpu  = count_buf,
-        .maxDraws      = 1,
+        .maxDraws      = 2,
         .type          = IndexType::UInt16,
     });
     cmd_end_render_pass(cmd);
@@ -840,8 +852,35 @@ static void test_draw_indirect() {
           "pass B: center pixel not red");
     CHECK(rb_b[2] == 0 && rb_b[1] == 0 && rb_b[0] == 0, "pass B: corner pixel not black");
 
+    // Pass C: direct indexed draw from the second triangle in the shared index buffer.
+    cmd = queue_start_command_recording(q);
+    cmd_begin_render_pass(cmd, pass_desc);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw_indexed_instanced(cmd, DrawIndexedInstancedInfo{
+        .vertexDataGpu   = 0,
+        .fragmentDataGpu = 0,
+        .indicesGpu      = idx_buf,
+        .indexCount      = 3,
+        .instanceCount   = 1,
+        .firstIndex      = 3,
+        .vertexOffset    = 0,
+        .type            = IndexType::UInt16,
+    });
+    cmd_end_render_pass(cmd);
+    cmd_barrier(cmd, StageFlags::RasterColorOut, StageFlags::Transfer);
+    cmd_copy_from_texture(cmd, color_tex, readback_c, copy_info);
+    cmd_finalize(cmd);
+    queue_submit(q, {&cmd, 1});
+    device_wait_for_idle(d);
+
+    auto* rb_c = reinterpret_cast<uint8_t*>(get_host_pointer(d, readback_c));
+    CHECK(rb_c[(32 * kSize + 32) * 4 + 2] == 255 && rb_c[(32 * kSize + 32) * 4 + 1] == 0,
+          "pass C: center pixel not red");
+    CHECK(rb_c[2] == 0 && rb_c[1] == 0 && rb_c[0] == 0, "pass C: corner pixel not black");
+
     free(d, readback_a);
     free(d, readback_b);
+    free(d, readback_c);
     free(d, idx_buf);
     free(d, args_buf);
     free(d, count_buf);

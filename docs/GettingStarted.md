@@ -146,6 +146,8 @@ Vulkan SDK validation layer installed).
 - [PortingFromVulkan.md](PortingFromVulkan.md) — the mental-model map.
 - [Architecture.md](Architecture.md) — retirement, pools, the compiler
   worker.
+- [IntegrationPatterns.md](IntegrationPatterns.md) — renderer-owned frame
+  transactions, transient rings, and indirect resource lifetimes.
 - [PipelineCompilation.md](PipelineCompilation.md) — async compile and the
   persistent cache.
 - [ShaderABI.md](ShaderABI.md) — the shader side of the pointer model.

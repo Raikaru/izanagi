@@ -1841,8 +1841,9 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
     if (!prepare_static_graphics(cmd)) { return; }
     if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
     if (!retain_buffer(cmd, args.fragmentDataGpu, 0, nullptr)) { return; }
+    const VkDeviceSize index_size = args.type == IndexType::UInt16 ? 2 : 4;
     const VkDeviceSize index_bytes =
-        static_cast<VkDeviceSize>(args.indexCount) * (args.type == IndexType::UInt16 ? 2 : 4);
+        (static_cast<VkDeviceSize>(args.firstIndex) + args.indexCount) * index_size;
     BufferRange indices{};
     if (!retain_buffer(cmd, args.indicesGpu, index_bytes, &indices)) { return; }
     push_graphics_ptrs(cmd->device, cmd->buffer, args.vertexDataGpu, args.fragmentDataGpu);
@@ -1856,7 +1857,8 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
 #endif
         cmd->current_idx_buffer = args.indicesGpu;
     }
-    vkCmdDrawIndexed(cmd->buffer, args.indexCount, args.instanceCount, 0, 0, 0);
+    vkCmdDrawIndexed(cmd->buffer, args.indexCount, args.instanceCount,
+                     args.firstIndex, args.vertexOffset, 0);
 }
 
 void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedIndirectInfo& args) {

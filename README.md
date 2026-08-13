@@ -75,7 +75,8 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   textures, pipelines, and descriptor slots are retired by queue timeline —
   never by presentation frame counters. `free_after` retires pointer-reachable
   resources against a submission; command buffers auto-retain the objects they
-  name. See [docs/Architecture.md](docs/Architecture.md).
+  name. See [docs/Architecture.md](docs/Architecture.md) and
+  [docs/IntegrationPatterns.md](docs/IntegrationPatterns.md).
 
 ## Requirements
 

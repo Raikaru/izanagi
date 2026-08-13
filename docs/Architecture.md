@@ -51,6 +51,10 @@ dropped.
 `submission_complete(s)` polls the timeline; `wait_submission(s)` blocks
 (loading screens and shutdown — not frame recording).
 
+For a complete renderer-owned acquire/record/submit/present transaction,
+submission-safe transient rings, and indirect resource tracking, see
+[IntegrationPatterns.md](IntegrationPatterns.md).
+
 ## Immediate vs deferred destruction
 
 - **Immediate `free`** is valid only when the application guarantees no
