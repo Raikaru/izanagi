@@ -5,7 +5,7 @@
 #include "internal.h"
 
 #include <cstdarg>
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 #include "common/dispatch_capabilities.h"
@@ -414,6 +414,20 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
     if (best == VK_NULL_HANDLE) { return VK_ERROR_INITIALIZATION_FAILED; }
     d->physical_device      = best;
     d->graphics_queue_family = best_family;
+    VkPhysicalDeviceProperties selected_props{};
+    vkGetPhysicalDeviceProperties(best, &selected_props);
+    uint32_t selected_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(best, &selected_family_count, nullptr);
+    VkQueueFamilyProperties selected_families[16];
+    if (selected_family_count > 16) { selected_family_count = 16; }
+    vkGetPhysicalDeviceQueueFamilyProperties(best, &selected_family_count, selected_families);
+    d->gpu_timestamps =
+        best_family < selected_family_count &&
+        selected_families[best_family].timestampValidBits != 0 &&
+        selected_props.limits.timestampComputeAndGraphics == VK_TRUE &&
+        selected_props.limits.timestampPeriod > 0.0f;
+    d->gpu_timestamp_period_ns =
+        d->gpu_timestamps ? double(selected_props.limits.timestampPeriod) : 0.0;
     return VK_SUCCESS;
 }
 
@@ -1407,6 +1421,10 @@ Device create_device(const DeviceDesc& desc) {
         // last reference and destroy_device cleans up leaked handles.
     }, d);
     d->depth_stencil_pool = SlotMap<DepthStencilState>(d->allocator, [](DepthStencilState*, void*) {});
+    d->gpu_timer_pool = SlotMap<GpuTimerImpl>(d->allocator, [](GpuTimerImpl* timer, void* ud) {
+        auto* dd = reinterpret_cast<DeviceImpl*>(ud);
+        vkDestroyQueryPool(dd->device, timer->query_pool, nullptr);
+    }, d);
 
     // Initialize ptr_map and other vectors
     d->ptr_map                = Vector<GpuPtrMap>(d->allocator);
@@ -1641,6 +1659,7 @@ void destroy_device(Device dev) {
     d->semaphore_pool.clear();
     d->pipeline_pool.clear();
     d->depth_stencil_pool.clear();
+    d->gpu_timer_pool.clear();
 
 #if defined(IZ_VK_PROFILE_BINDLESS)
     if (d->bindless_pool != VK_NULL_HANDLE) { vkDestroyDescriptorPool(d->device, d->bindless_pool, nullptr); }
@@ -1705,6 +1724,7 @@ DeviceLimits device_limits(Device dev) {
         .max_samplers         = sampler,
         .framebuffer_sample_counts = d->framebuffer_sample_counts,
         .non_solid_fill       = d->non_solid_fill,
+        .gpu_timestamps        = d->gpu_timestamps,
         .min_uniform_alignment = d->min_uniform_alignment,
         .min_storage_alignment = d->min_storage_alignment,
         .non_coherent_atom_size = d->non_coherent_atom_size,
@@ -2053,6 +2073,71 @@ void free(Device dev, Handle<Semaphore> sema) {
         return;
     }
     d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(sema));
+}
+
+// --- GPU timers ---------------------------------------------------------------------------
+
+Handle<GpuTimer> create_gpu_timer(Device dev) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (!d->gpu_timestamps) {
+        IZ_LOG(d, LogLevel::Error, "create_gpu_timer: GPU timestamps are unsupported");
+        return {};
+    }
+    const VkQueryPoolCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 2,
+        .pipelineStatistics = 0,
+    };
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (!IZ_CHK(d, vkCreateQueryPool(d->device, &info, nullptr, &pool),
+                "create_gpu_timer: vkCreateQueryPool failed")) {
+        return {};
+    }
+    return handle_cast<GpuTimer>(d->gpu_timer_pool.emplace(
+        GpuTimerImpl{.query_pool = pool, .timestamp_period_ns = d->gpu_timestamp_period_ns}));
+}
+
+void free(Device dev, Handle<GpuTimer> timer) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    const char* why = nullptr;
+    if (d->gpu_timer_pool.try_get_ex(handle_cast<GpuTimerImpl>(timer), &why) == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free(gpu timer): invalid handle 0x%016llx (%s)",
+                (unsigned long long)timer.h, why ? why : "rejected");
+        return;
+    }
+    d->gpu_timer_pool.erase(handle_cast<GpuTimerImpl>(timer));
+}
+
+bool get_gpu_timer_result(Device dev, Handle<GpuTimer> timer, uint64_t& duration_ns) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    const char* why = nullptr;
+    GpuTimerImpl* rec =
+        d->gpu_timer_pool.try_get_ex(handle_cast<GpuTimerImpl>(timer), &why);
+    if (rec == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "get_gpu_timer_result: invalid handle 0x%016llx (%s)",
+                (unsigned long long)timer.h, why ? why : "rejected");
+        return false;
+    }
+    uint64_t ticks[2] = {};
+    const VkResult result = vkGetQueryPoolResults(
+        d->device, rec->query_pool, 0, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT);
+    if (result == VK_NOT_READY) {
+        return false;
+    }
+    if (result != VK_SUCCESS) {
+        log_vk_impl(d, result, "get_gpu_timer_result failed", __LINE__, "device.cpp"_sv);
+        return false;
+    }
+    const double elapsed_ns = double(ticks[1] - ticks[0]) * rec->timestamp_period_ns;
+    duration_ns = elapsed_ns >= double(UINT64_MAX) ? UINT64_MAX
+                                                   : static_cast<uint64_t>(elapsed_ns + 0.5);
+    return true;
 }
 
 // --- Queue -------------------------------------------------------------------------------
