@@ -94,60 +94,50 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
 
-  linux-lavapipe-bindless:
-    # Hardware-light validation: the full Bindless suite on Lavapipe (CPU
-    # Vulkan, no GPU needed). NON-AUTHORITATIVE: the capability probe runs
-    # first and the job SKIPS (never fails) when Lavapipe cannot run the
-    # profile — real-hardware qualification is the separate
-    # tools/run_hardware_qualification.sh bundle + issue template.
+  linux-llvmpipe-native:
+    # Hardware-light validation: the full Native suite on Mesa's llvmpipe CPU
+    # Vulkan device. The pinned openSUSE Tumbleweed image supplies Mesa 26.2+,
+    # whose descriptor heap, untyped-pointer, and unified-layout features cross
+    # the Native profile gate. This is software-device CI coverage, not physical
+    # hardware qualification.
     runs-on: ubuntu-latest
+    container:
+      image: opensuse/tumbleweed@sha256:4de0634db8e74bc01d203dfb19b62a834d33a6d1f9803b6d138f9bb94822300c
     steps:
+      - name: Install build tools and latest llvmpipe
+        run: >
+          zypper --non-interactive install
+          git cmake ninja gcc-c++ libvulkan_lvp vulkan-tools
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Install Lavapipe
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers
-      - name: Configure (Bindless, headless, Debug)
+      - name: Configure (Native, headless, Debug)
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
-          -DIZANAGI_WSI=HEADLESS -DIZANAGI_VK_PROFILE=BINDLESS
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_VK_PROFILE=NATIVE
           -DIZANAGI_BUILD_EXAMPLES=OFF
       - name: Build
         run: cmake --build build
-      - name: Probe (capability report; non-authoritative)
+      - name: Select llvmpipe and verify Native capability
+        shell: bash
         run: |
           set -euo pipefail
-          icd=$(find /usr/share/vulkan/icd.d /usr/lib/x86_64-linux-gnu -name 'lvp_icd*.json' 2>/dev/null | head -n 1)
-          if [ -z "$icd" ]; then
-            echo "ERROR: Lavapipe ICD not found (mesa-vulkan-drivers install?). Available ICDs:" >&2
-            ls -l /usr/share/vulkan/icd.d/ 2>&1 >&2 || true
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          if [ ${#icds[@]} -ne 1 ]; then
+            echo "ERROR: expected one llvmpipe ICD, found ${#icds[@]}:" >&2
+            printf '  %s\n' "${icds[@]}" >&2
             exit 1
           fi
-          # Pin the Lavapipe ICD so the probe and the suite use Lavapipe, not
-          # whatever ICD the loader would otherwise pick on the runner.
-          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
-          set +e
-          ./build/bin/izanagi_capability_report > /tmp/lavapipe-cap.json 2>/tmp/lavapipe-cap.err
-          status=$?
-          set -e
-          cat /tmp/lavapipe-cap.json
-          if [ $status -ne 0 ]; then
-            if grep -q '"profile_supported": false' /tmp/lavapipe-cap.json; then
-              echo "Lavapipe cannot run the bindless profile — skipping (non-authoritative)."
-              exit 0
-            fi
-            echo "ERROR: capability probe failed ($status) without a profile_supported:false" >&2
-            echo "       decision — malformed JSON or tool crash. Probe stderr:" >&2
-            cat /tmp/lavapipe-cap.err >&2
+          echo "VK_ICD_FILENAMES=${icds[0]}" >> "$GITHUB_ENV"
+          rpm -q libvulkan_lvp
+          VK_ICD_FILENAMES="${icds[0]}" vulkaninfo --summary
+          VK_ICD_FILENAMES="${icds[0]}" \
+            ./build/bin/izanagi_capability_report > /tmp/llvmpipe-native-cap.json
+          cat /tmp/llvmpipe-native-cap.json
+          if ! grep -q '"profile_supported": true' /tmp/llvmpipe-native-cap.json; then
+            echo "ERROR: current llvmpipe does not satisfy the Native profile" >&2
             exit 1
           fi
-          if ! grep -q '"profile_supported": true' /tmp/lavapipe-cap.json; then
-            echo "ERROR: probe exited 0 without profile_supported:true (malformed JSON?)" >&2
-            exit 1
-          fi
-          echo "PROFILE_QUALIFIED=1" >> "$GITHUB_ENV"
-      - name: Test (full suite on Lavapipe)
-        if: env.PROFILE_QUALIFIED == '1'
+      - name: Test (full Native suite on llvmpipe)
         env:
           IZANAGI_TESTS_ALLOW_SKIP: 1
         run: ctest --test-dir build --output-on-failure
@@ -155,8 +145,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
         with:
-          name: lavapipe-capability
-          path: /tmp/lavapipe-cap.json
+          name: llvmpipe-native-capability
+          path: /tmp/llvmpipe-native-cap.json
 
   android-arm64-cross-build:
     runs-on: ubuntu-latest
