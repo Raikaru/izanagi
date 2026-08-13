@@ -29,7 +29,7 @@ profile. If you see a missing-requirement list, that is the complete answer
 Never build from `main` (see [Stability.md](Stability.md)):
 
 ```sh
-git clone --branch v0.1.0 https://github.com/Raikaru/izanagi.git
+git clone --branch v0.2.0 https://github.com/Raikaru/izanagi.git
 cd izanagi
 ```
 
@@ -54,6 +54,28 @@ Keys: `M`/`N` cycle examples, `ESC` quits. Headless verification:
 
 ```sh
 build/bin/Debug/izanagi_examples.exe --example hello_triangle --screenshot out.png --frames 30
+```
+
+Presentation controls are available directly in the Win32 harness:
+
+```sh
+build/bin/Debug/izanagi_examples.exe --no-vsync --frame-latency 1
+build/bin/Debug/izanagi_examples.exe --vsync --frame-latency 2
+```
+
+Applications use the same policy explicitly:
+
+```cpp
+SurfaceCapabilities caps = get_surface_capabilities(device);
+SurfaceConfiguration surface{
+    .format        = caps.formats[0],
+    .usages        = UsageFlags::ColorAttachment,
+    .width         = width,
+    .height        = height,
+    .present_mode  = choose_present_mode(caps.present_modes, vsync),
+    .frame_latency = 2,
+};
+configure_surface(device, surface);
 ```
 
 ## 4. Your first app
@@ -110,6 +132,12 @@ code:
    the resource; `free_after(resource, submission)` is the normal path for
    anything reachable by GPU pointers.
 
+For streaming uploads, request `get_queue(device, QueueType::Transfer)`.
+It returns a transfer-only queue when the device exposes one and otherwise
+aliases the default queue. Pass the upload `Submission` back to a graphics
+`queue_submit` as a `SubmissionWait`; this performs the GPU-side ownership
+and memory handoff without blocking the CPU.
+
 The examples (`examples/hello_triangle`, `examples/compute_texture`,
 `examples/textured_cube`) are the reference for every pattern above.
 
@@ -127,6 +155,11 @@ Every message carries `file:line`. Handle failures report the handle value
 and the generation mismatch. `enable_validation = true` additionally
 forwards driver validation messages through the same callback (requires the
 Vulkan SDK validation layer installed).
+
+Use `set_debug_name` on buffers, textures, and pipelines, and bracket passes
+with `cmd_push_debug_group` / `cmd_pop_debug_group`. Izanagi retains the
+names for deterministic errors and forwards them to RenderDoc through
+`VK_EXT_debug_utils` when available.
 
 ## Troubleshooting
 

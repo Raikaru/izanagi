@@ -15,6 +15,7 @@ template class Span<const Format>;
 template class Span<const PresentMode>;
 template class Span<const CommandBuffer>;
 template class Span<const SemaphoreInfo>;
+template class Span<const SubmissionWait>;
 template class Span<const SpecializationConstant>;
 
 Allocator::Allocator() {

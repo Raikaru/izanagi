@@ -23,31 +23,31 @@ Items are ordered by measured cost and expected consumer payoff.
 The current Arx profile attributes about **0.2 ms/frame** to presentation,
 the largest measured Izanagi-side frame cost.
 
-- [ ] Select FIFO, mailbox, or immediate presentation, with deterministic
+- [x] Select FIFO, mailbox, or immediate presentation, with deterministic
       fallback when the requested mode is unavailable.
-- [ ] Expose a vsync control an application can put directly in player-facing
+- [x] Expose a vsync control an application can put directly in player-facing
       settings.
-- [ ] Expose frame-latency control rather than fixing the number of frames in
+- [x] Expose frame-latency control rather than fixing the number of frames in
       flight inside the backend.
 - [ ] Benchmark CPU presentation cost and end-to-end frame latency with the
       existing Arx harness when this lands.
 
 ### 2. Debug labels and object names
 
-- [ ] Public command-buffer label regions and resource/pipeline names.
-- [ ] Forward names to `VK_EXT_debug_utils` when available, with zero feature
+- [x] Public command-buffer label regions and resource/pipeline names.
+- [x] Forward names to `VK_EXT_debug_utils` when available, with zero feature
       dependency when it is absent.
-- [ ] Include known object names in deterministic-failure diagnostics.
+- [x] Include known object names in deterministic-failure diagnostics.
 - [ ] Verify in a RenderDoc capture that renderer passes and batches are named,
       not anonymous Vulkan handles.
 
 ### 3. Dedicated transfer queue
 
-- [ ] Use a dedicated transfer-capable queue for uploads when hardware exposes
+- [x] Use a dedicated transfer-capable queue for uploads when hardware exposes
       one; retain the graphics-queue fallback.
-- [ ] Keep the initial scope to copies/uploads and the ownership/synchronization
+- [x] Keep the initial scope to copies/uploads and the ownership/synchronization
       needed to consume them on graphics.
-- [ ] Prove that streaming submissions no longer ride the graphics timeline.
+- [x] Prove that streaming submissions no longer ride the graphics timeline.
       Full async compute remains deferred until a real consumer requires it.
 
 ### 4. Multi-draw indirect completion
@@ -56,10 +56,10 @@ the largest measured Izanagi-side frame cost.
 backend already records `vkCmdDrawIndexedIndirectCount`. This item is a
 correctness and validation pass, not a second primitive.
 
-- [ ] Fix the current multi-draw-indirect failure.
-- [ ] Validate argument- and count-buffer synchronization, lifetime, alignment,
+- [x] Fix the current multi-draw-indirect failure.
+- [x] Validate argument- and count-buffer synchronization, lifetime, alignment,
       offsets, bounds, and zero/max draw counts in the same pass.
-- [ ] Exercise GPU-written count buffers so the GPU genuinely decides the draw
+- [x] Exercise GPU-written count buffers so the GPU genuinely decides the draw
       count.
 
 ## Linux desktop qualification

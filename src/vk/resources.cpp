@@ -312,6 +312,10 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc) {
     }
 
     const bool is_cubemap = (desc.type == TextureType::TexCube || desc.type == TextureType::TexCubeArray);
+    const uint32_t queue_families[2] = {
+        d->graphics_queue_family,
+        d->transfer_queue_family,
+    };
     const VkImageCreateInfo info{
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext         = nullptr,
@@ -326,9 +330,11 @@ Handle<Texture> create_texture(Device dev, const TextureDesc& desc) {
         .samples       = static_cast<VkSampleCountFlagBits>(desc.sample_count == 0 ? 1 : desc.sample_count),
         .tiling        = VK_IMAGE_TILING_OPTIMAL,
         .usage         = bridge_usage_flags(desc.usage),
-        .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices   = nullptr,
+        .sharingMode = d->dedicated_transfer_queue
+                           ? VK_SHARING_MODE_CONCURRENT
+                           : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = d->dedicated_transfer_queue ? 2u : 0u,
+        .pQueueFamilyIndices   = d->dedicated_transfer_queue ? queue_families : nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 

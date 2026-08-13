@@ -46,13 +46,22 @@ Design reference: [rkevingibson/loon_gpu](https://github.com/rkevingibson/loon_g
   into resources on either profile.
 - **Stage-mask barriers only.** `cmd_barrier(StageFlags, StageFlags)` is the
   entire sync model — no image layout transitions in the public API.
-- **Timeline-semaphore sync.** Queue submissions carry optional wait/signal
-  timeline values; `queue_on_submitted_work_completed` runs callbacks.
+- **Timeline-semaphore sync, including cross-queue handoff.** Queue
+  submissions carry optional semaphore and prior-`Submission` waits.
+  `QueueType::Transfer` selects a transfer-only upload queue when available
+  and aliases graphics otherwise.
 - **Minimal PSOs, dynamic rendering.** No render-pass objects, no pipeline
   layouts. Graphics pipelines are created from a `RasterDesc` (color targets +
   optional depth format) and use dynamic rendering (`vkCmdBeginRendering`).
 - **MSAA render targets with resolve.** A color attachment may name a
   sample-count-1 resolve target; the pass resolves into it at end (average).
+- **Explicit presentation control.** Surface capabilities report FIFO,
+  mailbox, immediate, and FIFO-relaxed modes. Applications select a mode
+  directly or use `choose_present_mode(..., vsync)`, and set one or two
+  frames of CPU presentation latency.
+- **Names survive abstraction.** Buffer, texture, and pipeline names appear
+  in deterministic diagnostics and Vulkan debug-utils tooling; command debug
+  groups label RenderDoc regions.
 - **`cmd_generate_mipmaps`.** Successive linear blits build mips 1..N-1 from
   mip 0 in one command (layer 0 only).
 - **Transparent pipeline dedup + persistent native cache.** Identical
@@ -134,7 +143,7 @@ own directory (no CWD dependence).
 include(FetchContent)
 FetchContent_Declare(izanagi
     GIT_REPOSITORY https://github.com/Raikaru/izanagi.git
-    GIT_TAG        v0.1.0)   # pin a tag — never main (see docs/Stability.md)
+    GIT_TAG        v0.2.0)   # pin a tag — never main (see docs/Stability.md)
 FetchContent_MakeAvailable(izanagi)
 
 target_link_libraries(your_app PRIVATE Izanagi::izanagi)

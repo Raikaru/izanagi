@@ -803,6 +803,12 @@ static void process_record(DeviceImpl* d, PipelineRecord* rec) {
     if (result == VK_SUCCESS) {
         atomic_fetch_add(&d->stat_full_compiles, 1);
         rec->vk_pipeline = pipeline;   // publish before the Ready store (release)
+        char debug_name[kMaxDebugNameBytes];
+        mutex_lock(&d->pipeline_lock);
+        memcpy(debug_name, rec->debug_name, sizeof(debug_name));
+        mutex_unlock(&d->pipeline_lock);
+        set_vk_object_name(d, VK_OBJECT_TYPE_PIPELINE, (uint64_t)pipeline,
+                           debug_name);
         rec->state.store(InternalPipelineState::Ready, std::memory_order_release);
         log_fmt(d, LogLevel::Info, __LINE__, "pipeline.cpp",
                 "compiled %s pipeline in %.2f ms",
@@ -963,6 +969,12 @@ void process_static_variant(DeviceImpl* d, StaticVariantRecord* rec) {
     mutex_lock(&rec->wait_mutex);
     if (result == VK_SUCCESS) {
         rec->vk_pipeline = pipeline;
+        char debug_name[kMaxDebugNameBytes];
+        mutex_lock(&d->pipeline_lock);
+        memcpy(debug_name, rec->base->debug_name, sizeof(debug_name));
+        mutex_unlock(&d->pipeline_lock);
+        set_vk_object_name(d, VK_OBJECT_TYPE_PIPELINE, (uint64_t)pipeline,
+                           debug_name);
         rec->state.store(InternalPipelineState::Ready, std::memory_order_release);
     } else {
         rec->failure_result = result;

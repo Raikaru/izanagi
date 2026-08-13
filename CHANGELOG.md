@@ -5,6 +5,41 @@ All notable changes to Izanagi are documented here. The format follows
 the versioning policy in [docs/Stability.md](docs/Stability.md): breaking
 changes are permitted in every 0.x release and are always listed under
 `### Breaking`.
+
+## [Unreleased]
+
+### Breaking
+- `DrawIndexedIndirectGpuArgs` now has Vulkan's required tightly packed
+  20-byte layout; arrays created with the former 24-byte C++ stride must be
+  rebuilt.
+- `DeviceLimits` gained `gpu_timestamps`, `dedicated_transfer_queue`, and
+  `max_draw_indirect_count`.
+- `SurfaceCapabilities` now reports supported presentation modes;
+  `SurfaceConfiguration` gained `present_mode` and `frame_latency`.
+- `get_queue` accepts a `QueueType`, and `queue_submit` accepts
+  `SubmissionWait` dependencies for GPU-side cross-queue handoff.
+
+### Added
+- FIFO/mailbox/immediate/FIFO-relaxed presentation selection,
+  `choose_present_mode` for player-facing vsync toggles, and configurable
+  one-to-`kMaxFramesInFlight` frame latency.
+- Public buffer, texture, and pipeline names plus command-buffer debug groups.
+  Names are retained for deterministic diagnostics and forwarded through
+  `VK_EXT_debug_utils` when the loader exposes it.
+- A dedicated transfer queue when the device exposes a transfer-only family,
+  with a graphics-queue fallback and submission-to-submission timeline waits.
+- Submission-safe GPU duration queries through `GpuTimer`,
+  `cmd_begin_gpu_timer`/`cmd_end_gpu_timer`, and non-blocking
+  `get_gpu_timer_result`.
+- Installed-package consumer CI now builds a standalone `find_package`
+  application, including enforcement of the exported C++20 requirement.
+
+### Fixed
+- Multi-draw indirect count now validates device limits, count/argument/index
+  alignment, complete buffer ranges, and zero draw limits before recording.
+- Swapchain reconfiguration creates a fresh frame-pacing timeline, avoiding
+  non-monotonic timeline values after `frame_idx` resets.
+
 ## [0.2.0] — 2026-08-13
 
 ### Breaking (from 0.1.0)
@@ -13,24 +48,13 @@ changes are permitted in every 0.x release and are always listed under
 - Added `PolygonMode` (Fill/Line) and `RasterDesc::polygon_mode`.
 - `Topology` and `Factor` enum value sets expanded.
 - `DeviceLimits` gained `framebuffer_sample_counts`, `non_solid_fill`,
-  `gpu_timestamps`, `min_uniform_alignment`, `min_storage_alignment`, and
+  `min_uniform_alignment`, `min_storage_alignment`, and
   `non_coherent_atom_size`.
 - `queue_submit` now returns a `Submission` token (`queue`, timeline
   `value`, `status`); added `submission_complete`/`wait_submission` and the
   `PipelineStatus` request lifecycle.
 - Added `BackendProfile`/`device_backend_profile()`.
 
-### Added
-- Submission-safe GPU duration queries through `GpuTimer`,
-  `cmd_begin_gpu_timer`/`cmd_end_gpu_timer`, and non-blocking
-  `get_gpu_timer_result`.
-
-### Fixed
-
-- Fixed `DrawIndexedIndirectGpuArgs` to use Vulkan's required tightly packed
-  20-byte layout. The previous `alignas(8)` made arrays use a 24-byte C++
-  stride while Vulkan consumed a 20-byte stride, corrupting every indirect
-  command after the first and potentially causing device loss.
 ### Security & robustness
 - Runtime-validated handles everywhere: `SlotMap::try_get`/`erase`/
   `invalidate` verify index bounds, generation, and slot allocation before

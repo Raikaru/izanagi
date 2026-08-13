@@ -754,12 +754,24 @@ static void test_draw_indirect() {
         destroy_device(d);
         return;
     }
+    CHECK(set_debug_name(d, pipeline, "opaque room pass"_sv),
+          "pipeline debug naming failed");
+    PipelineImpl* named_pipeline =
+        reinterpret_cast<DeviceImpl*>(d)->pipeline_pool.try_get(
+            handle_cast<PipelineImpl>(pipeline));
+    CHECK(named_pipeline != nullptr &&
+              strcmp(named_pipeline->record->debug_name, "opaque room pass") == 0,
+          "pipeline debug name was not retained");
 
-    // Index buffer + two tightly packed indirect args + draw-count buffer
-    GpuPtr idx_buf   = malloc(d, sizeof(uint16_t) * 6, Memory::Default);
-    GpuPtr args_buf  = malloc(d, sizeof(DrawIndexedIndirectGpuArgs) * 2, Memory::Default);
-    GpuPtr count_buf = malloc(d, sizeof(uint32_t), Memory::Default);
-    CHECK(idx_buf != 0 && args_buf != 0 && count_buf != 0, "malloc failed");
+    // Index buffer + two tightly packed indirect args + GPU-only draw-count
+    // buffer. count_upload is copied by the GPU immediately before the draw,
+    // proving the count path does not rely on CPU visibility.
+    GpuPtr idx_buf      = malloc(d, sizeof(uint16_t) * 6, Memory::Default);
+    GpuPtr args_buf     = malloc(d, sizeof(DrawIndexedIndirectGpuArgs) * 2, Memory::Default);
+    GpuPtr count_buf    = malloc(d, sizeof(uint32_t), Memory::Gpu);
+    GpuPtr count_upload = malloc(d, sizeof(uint32_t), Memory::Default);
+    CHECK(idx_buf != 0 && args_buf != 0 && count_buf != 0 && count_upload != 0,
+          "malloc failed");
     auto* idx_host = reinterpret_cast<uint16_t*>(get_host_pointer(d, idx_buf));
     idx_host[0] = 0;
     idx_host[1] = 1;
@@ -782,7 +794,8 @@ static void test_draw_indirect() {
         .vertex_offset  = 0,
         .first_instance = 0,
     };
-    *reinterpret_cast<uint32_t*>(get_host_pointer(d, count_buf)) = 2;
+    *reinterpret_cast<uint32_t*>(get_host_pointer(d, count_upload)) = 2;
+    flush_host_memory(d, count_upload, sizeof(uint32_t));
 
     Queue q = get_queue(d);
     GpuPtr readback_a = malloc(d, kTexBytes, Memory::Readback);
@@ -829,6 +842,8 @@ static void test_draw_indirect() {
     // Pass B: execute the second command in a tightly packed multi-draw array.
     args_host[0].index_count = 0;
     cmd = queue_start_command_recording(q);
+    cmd_memcpy(cmd, count_buf, count_upload, sizeof(uint32_t));
+    cmd_barrier(cmd, StageFlags::Transfer, StageFlags::IndirectArguments);
     cmd_begin_render_pass(cmd, pass_desc);
     cmd_set_pipeline(cmd, pipeline);
     cmd_draw_indexed_instanced_indirect_multi(cmd, MultiDrawIndirectInfo{
@@ -878,12 +893,27 @@ static void test_draw_indirect() {
           "pass C: center pixel not red");
     CHECK(rb_c[2] == 0 && rb_c[1] == 0 && rb_c[0] == 0, "pass C: corner pixel not black");
 
+    // Invalid maxDraws is rejected before Vulkan records an indirect command.
+    cmd = queue_start_command_recording(q);
+    cmd_set_pipeline(cmd, pipeline);
+    cmd_draw_indexed_instanced_indirect_multi(cmd, MultiDrawIndirectInfo{
+        .indicesGpu   = idx_buf,
+        .argsGpu      = args_buf,
+        .drawCountGpu = count_buf,
+        .maxDraws     = 0,
+    });
+    cmd_finalize(cmd);
+    Submission invalid_count = queue_submit(q, {&cmd, 1});
+    CHECK(invalid_count.status == SubmitStatus::Error,
+          "zero maxDraws must reject the command buffer");
+
     free(d, readback_a);
     free(d, readback_b);
     free(d, readback_c);
     free(d, idx_buf);
     free(d, args_buf);
     free(d, count_buf);
+    free(d, count_upload);
     free(d, pipeline);
     free(d, color_tex);
     destroy_device(d);
@@ -4039,6 +4069,136 @@ static void test_baked_state_readback() {
 }
 
 
+static void test_presentation_debug_names_and_transfer_queue() {
+    printf("--- Test: presentation selection, debug names, transfer queue ---\n");
+
+    const PresentMode fifo_mailbox[] = {PresentMode::Fifo, PresentMode::Mailbox};
+    CHECK(choose_present_mode({fifo_mailbox, 2}, true) == PresentMode::Fifo,
+          "vsync must select FIFO");
+    CHECK(choose_present_mode({fifo_mailbox, 2}, false) == PresentMode::Mailbox,
+          "no-vsync must fall back from Immediate to Mailbox");
+    const PresentMode all_modes[] = {
+        PresentMode::Fifo, PresentMode::Mailbox, PresentMode::Immediate,
+    };
+    CHECK(choose_present_mode({all_modes, 3}, false) == PresentMode::Immediate,
+          "no-vsync must prefer Immediate");
+    CHECK(kDefaultFrameLatency >= 1 &&
+              kDefaultFrameLatency <= kMaxFramesInFlight,
+          "default frame latency must be valid");
+
+    Device d = create_device(DeviceDesc{
+        .log_callback = test_log_callback,
+        .log_level    = LogLevel::Warning,
+    });
+    CHECK(d != nullptr, "create_device returned null");
+    if (d == nullptr) { return; }
+
+    const DeviceLimits limits = device_limits(d);
+    CHECK(limits.max_draw_indirect_count > 0,
+          "max_draw_indirect_count must be reported");
+    Queue graphics = get_queue(d, QueueType::Default);
+    Queue transfer = get_queue(d, QueueType::Transfer);
+    CHECK(graphics != nullptr && transfer != nullptr, "queue lookup failed");
+    CHECK(limits.dedicated_transfer_queue ? transfer != graphics
+                                           : transfer == graphics,
+          "transfer queue alias does not match reported capability");
+
+    GpuPtr src = malloc(d, sizeof(uint32_t), Memory::Default);
+    GpuPtr uploaded = malloc(d, sizeof(uint32_t), Memory::Gpu);
+    GpuPtr dst = malloc(d, sizeof(uint32_t), Memory::Readback);
+    CHECK(src != 0 && uploaded != 0 && dst != 0,
+          "transfer buffers allocation failed");
+    *reinterpret_cast<uint32_t*>(get_host_pointer(d, src)) = 0x1234abcd;
+    flush_host_memory(d, src, sizeof(uint32_t));
+
+    CHECK(set_debug_name(d, src, "streaming upload batch 214"_sv),
+          "buffer debug naming failed");
+    BufferRange named_range = find_buffer_range(reinterpret_cast<DeviceImpl*>(d),
+                                                src, sizeof(uint32_t));
+    CHECK(named_range.handle.h != 0, "named buffer lookup failed");
+    if (named_range.handle.h != 0) {
+        Buffer* named = reinterpret_cast<DeviceImpl*>(d)->buffer_pool.try_get(named_range.handle);
+        CHECK(named != nullptr &&
+                  strcmp(named->debug_name, "streaming upload batch 214") == 0,
+              "buffer debug name was not retained");
+        release_buffer_ref(reinterpret_cast<DeviceImpl*>(d), named_range.handle);
+    }
+
+    TextureDesc texture_desc{
+        .type       = TextureType::Tex2D,
+        .dimensions = {1, 1, 1},
+        .format     = Format::RGBA8Unorm,
+        .usage      = UsageFlags::TransferDst | UsageFlags::Sampled,
+    };
+    Handle<Texture> named_texture = create_texture(d, texture_desc);
+    CHECK(set_debug_name(d, named_texture, "opaque room color"_sv),
+          "texture debug naming failed");
+    TextureImpl* named_texture_impl =
+        reinterpret_cast<DeviceImpl*>(d)->texture_pool.try_get(
+            handle_cast<TextureImpl>(named_texture));
+    CHECK(named_texture_impl != nullptr &&
+              strcmp(named_texture_impl->debug_name, "opaque room color") == 0,
+          "texture debug name was not retained");
+
+    const uint64_t graphics_before =
+        reinterpret_cast<QueueImpl*>(graphics)->timeline_value;
+    CommandBuffer cmd = queue_start_command_recording(transfer);
+    cmd_push_debug_group(cmd, "streaming uploads"_sv);
+    cmd_memcpy(cmd, uploaded, src, sizeof(uint32_t));
+    cmd_pop_debug_group(cmd);
+    cmd_finalize(cmd);
+    Submission upload = queue_submit(transfer, {&cmd, 1});
+    CHECK(upload.status == SubmitStatus::Success, "transfer submission failed");
+    if (limits.dedicated_transfer_queue) {
+        CHECK(reinterpret_cast<QueueImpl*>(graphics)->timeline_value == graphics_before,
+              "transfer submission advanced the graphics timeline");
+    }
+
+    cmd = queue_start_command_recording(graphics);
+    cmd_memcpy(cmd, dst, uploaded, sizeof(uint32_t));
+    cmd_finalize(cmd);
+    Submission future_upload = upload;
+    future_upload.value++;
+    const SubmissionWait future_wait{
+        .submission = future_upload,
+        .stage      = StageFlags::Transfer,
+    };
+    Submission rejected =
+        queue_submit(graphics, {&cmd, 1}, {}, {}, {&future_wait, 1});
+    CHECK(rejected.status == SubmitStatus::Error,
+          "unpublished submission timeline value must be rejected");
+    Submission foreign_upload = upload;
+    foreign_upload.queue = reinterpret_cast<Queue>(uintptr_t{1});
+    const SubmissionWait foreign_wait{
+        .submission = foreign_upload,
+        .stage      = StageFlags::Transfer,
+    };
+    rejected = queue_submit(graphics, {&cmd, 1}, {}, {}, {&foreign_wait, 1});
+    CHECK(rejected.status == SubmitStatus::Error,
+          "foreign submission queue must be rejected without dereferencing it");
+    const SubmissionWait upload_wait{
+        .submission = upload,
+        .stage      = StageFlags::Transfer,
+    };
+    Submission consume =
+        queue_submit(graphics, {&cmd, 1}, {}, {}, {&upload_wait, 1});
+    CHECK(consume.status == SubmitStatus::Success,
+          "graphics consumption submission failed");
+    CHECK(wait_submission(consume), "graphics consumption did not complete");
+    invalidate_host_memory(d, dst, sizeof(uint32_t));
+    CHECK(*reinterpret_cast<uint32_t*>(get_host_pointer(d, dst)) == 0x1234abcd,
+          "transfer-to-graphics handoff produced the wrong value");
+
+
+    free(d, named_texture);
+    free(d, src);
+    free(d, uploaded);
+    free(d, dst);
+    destroy_device(d);
+    printf("  PASS\n");
+}
+
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);   // crash/hang diagnostics: no buffering
     if (!load_custom_android_driver()) { return 2; }
@@ -4056,6 +4216,7 @@ int main() {
         destroy_device(probe);
     }
 
+    test_presentation_debug_names_and_transfer_queue();
     test_device_create_destroy();
     test_malloc_host_pointer();
     test_compute();

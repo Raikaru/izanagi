@@ -44,7 +44,8 @@ namespace gpu {
 inline constexpr uint32_t kMaxSampledTextures = 65536;
 inline constexpr uint32_t kMaxStorageTextures = 65536;
 inline constexpr uint32_t kMaxSamplers        = 4096;
-inline constexpr uint32_t kMaxFramesInFlight  = 2;
+inline constexpr uint32_t kDefaultFrameLatency = 2;
+inline constexpr uint32_t kMaxFramesInFlight   = 4;
 
 // --- Span ---------------------------------------------------------------------
 // Cross-const conversion trait: Span<U> is convertible to Span<T> when
@@ -351,7 +352,10 @@ enum class LoadOp : uint8_t { Undefined, Load, Clear };
 
 enum class StoreOp : uint8_t { Undefined, Store, Discard };
 
-enum class QueueType : uint8_t { Default, ValidCount };
+// Transfer returns a dedicated upload queue when the device exposes a
+// transfer-only family; otherwise it aliases Default. Transfer command buffers
+// accept copy, mip-generation, barrier, and debug-label commands only.
+enum class QueueType : uint8_t { Default, Transfer, ValidCount };
 
 enum class PresentMode : uint8_t { Immediate, Mailbox, Fifo, FifoRelaxed, ValidCount };
 
@@ -366,6 +370,12 @@ struct Submission {
     SubmitStatus status = SubmitStatus::Error;
 
     explicit operator bool() const { return status == SubmitStatus::Success; }
+};
+// GPU-side dependency on a prior queue submission. This is the ownership and
+// memory handoff used by dedicated transfer uploads; it does not block the CPU.
+struct SubmissionWait {
+    Submission submission;
+    StageFlags stage = StageFlags::None;   // None = all commands
 };
 
 enum class SamplerCoords : uint8_t { Normalized, Pixel };
@@ -572,18 +582,23 @@ struct DeviceLimits {
     uint32_t max_storage_textures;
     uint32_t max_samplers;
     uint32_t framebuffer_sample_counts;
+    uint32_t max_draw_indirect_count;
     bool     non_solid_fill;
     bool     gpu_timestamps;
+    bool     dedicated_transfer_queue;
     uint64_t min_uniform_alignment;
     uint64_t min_storage_alignment;
     uint64_t non_coherent_atom_size;
 };
 struct SurfaceConfiguration {
-    Format      format;
-    UsageFlags  usages;
-    uint32_t    width;
-    uint32_t    height;
-    PresentMode present_mode;
+    Format      format       = Format::None;
+    UsageFlags  usages       = UsageFlags::None;
+    uint32_t    width        = 0;
+    uint32_t    height       = 0;
+    PresentMode present_mode = PresentMode::Fifo;
+    // Maximum CPU frames allowed ahead of completed GPU presentation work.
+    // Valid range: [1, kMaxFramesInFlight].
+    uint32_t    frame_latency = kDefaultFrameLatency;
 };
 struct SurfaceTextureInfo {
     SurfaceStatus   status;
@@ -654,11 +669,21 @@ void    device_wait_for_idle(Device);
 bool    device_supports_dual_source_blend(Device);
 
 // Surface
+// Maps a player-facing vsync toggle to a supported native mode. Vsync selects
+// FIFO. No-vsync prefers Immediate, then Mailbox, FifoRelaxed, and FIFO.
+PresentMode        choose_present_mode(Span<const PresentMode> supported, bool vsync);
 SurfaceCapabilities get_surface_capabilities(Device);
 bool                configure_surface(Device, const SurfaceConfiguration&);
 void                unconfigure_surface(Device);
 SurfaceTextureInfo  get_current_texture(Device);
 SurfaceStatus       present(Device, Queue);
+
+// Human-readable names are retained for deterministic diagnostics and
+// forwarded to VK_EXT_debug_utils when available. Names are UTF-8 and may be
+// truncated by the backend; naming is never required for correctness.
+bool set_debug_name(Device, GpuPtr, Span<const char>);
+bool set_debug_name(Device, Handle<Texture>, Span<const char>);
+bool set_debug_name(Device, Handle<Pipeline>, Span<const char>);
 
 // Memory
 GpuPtr malloc(Device, size_t bytes, Memory = Memory::Default);
@@ -778,7 +803,8 @@ CommandBuffer     queue_start_command_recording(Queue);
 Submission        queue_submit(Queue,
                                Span<const CommandBuffer>,
                                Span<const SemaphoreInfo> wait   = {},
-                               Span<const SemaphoreInfo> signal = {});
+                               Span<const SemaphoreInfo> signal = {},
+                               Span<const SubmissionWait> wait_submissions = {});
 // True once the submission's GPU work has completed. False for failed
 // submissions and for incomplete work.
 bool              submission_complete(Submission);
@@ -834,6 +860,7 @@ extern template class Span<const Format>;
 extern template class Span<const PresentMode>;
 extern template class Span<const CommandBuffer>;
 extern template class Span<const SemaphoreInfo>;
+extern template class Span<const SubmissionWait>;
 extern template class Span<const SpecializationConstant>;
 
 }  // namespace gpu

@@ -38,6 +38,8 @@ struct QueueImpl;
 struct CommandBufferImpl;
 
 // --- Internal structs ------------------------------------------------------------
+inline constexpr size_t kMaxDebugNameBytes = 96;
+
 
 struct Buffer {
     VkBuffer        vk_buffer       = VK_NULL_HANDLE;
@@ -54,6 +56,7 @@ struct Buffer {
     // 1 per live allocation + 1 per command-buffer/in-flight retention;
     // the pool slot (and native buffer) is destroyed at zero.
     int64_t         refs            = 1;   // atomic via platform helpers
+    char            debug_name[kMaxDebugNameBytes] = {};
 };
 
 // Buffer/offset pair resolved and range-validated against the allocation's
@@ -95,6 +98,7 @@ struct TextureImpl {
         VkImageView view;
     };
     Vector<AttachmentView> attachment_views;
+    char debug_name[kMaxDebugNameBytes] = {};
 };
 
 struct GpuTimerImpl {
@@ -126,6 +130,7 @@ struct PipelineRecord {
     VkPipelineBindPoint bind_point     = VK_PIPELINE_BIND_POINT_COMPUTE;
     VkResult            failure_result = VK_SUCCESS;
     std::atomic<uint32_t> refs{0};  // user + worker + command-buffer/in-flight
+    char debug_name[kMaxDebugNameBytes] = {};
 
     mutex   wait_mutex = IZ_MUTEX_INIT;  // only wait_pipeline() sleeps on these
     condvar wait_cv;
@@ -203,6 +208,7 @@ struct Surface {
 
     uint32_t current_image_idx = 0;
     uint32_t image_count       = 0;
+    uint32_t frame_latency = kDefaultFrameLatency;
 
     Handle<Texture>  swapchain_images[kMaxSwapchainImages];
     Handle<Semaphore> frame_semaphore;
@@ -344,12 +350,15 @@ struct DeviceImpl {
     VkInstance         instance        = VK_NULL_HANDLE;
     VkPhysicalDevice   physical_device = VK_NULL_HANDLE;
     uint32_t           graphics_queue_family = 0;
+    uint32_t           transfer_queue_family = 0;
+    bool               dedicated_transfer_queue = false;
     VkDevice           device          = VK_NULL_HANDLE;
     VmaAllocator       vma             = VK_NULL_HANDLE;
     bool               dual_src_blend  = false;   // VkPhysicalDeviceFeatures.dualSrcBlend
     bool               non_solid_fill = false;   // VkPhysicalDeviceFeatures.fillModeNonSolid
     uint32_t           framebuffer_sample_counts = 1;
-    bool gpu_timestamps = false;
+    uint32_t           max_draw_indirect_count = 1;
+    bool               gpu_timestamps = false;
 
     double gpu_timestamp_period_ns = 0.0;
     // Surface
@@ -389,6 +398,7 @@ struct DeviceImpl {
     bool                      has_debug_markers   = false;
     bool                      enable_validation   = false;
     VkDebugUtilsMessengerEXT  debug_messenger     = VK_NULL_HANDLE;
+    mutex                    debug_name_lock    = IZ_MUTEX_INIT;
 
     // Memory tracking
     rwlock            ptr_map_lock = IZ_RWLOCK_INIT;
@@ -401,8 +411,9 @@ struct DeviceImpl {
     SlotMap<PipelineImpl>      pipeline_pool;
     SlotMap<DepthStencilState> depth_stencil_pool;
 
-    // Queues (single Default queue in v1)
-    QueueImpl* default_queue = nullptr;
+    // Transfer aliases Default unless a transfer-only family is available.
+    QueueImpl* default_queue  = nullptr;
+    QueueImpl* transfer_queue = nullptr;
 
     // Private static graphics variants (static-graphics-state fallback):
     // dedup map + worker queue, both under pipeline_lock/compiler_lock.
@@ -516,6 +527,7 @@ struct QueueImpl {
     VkQueue          queue         = VK_NULL_HANDLE;
     CommandSuperpool command_superpool = {};
     Handle<Semaphore> timeline;
+    QueueType        type          = QueueType::Default;
     uint32_t         queue_family  = 0;
     uint64_t         timeline_value = 0;   // last successfully submitted value
     // Serializes queue submission and presentation on this queue.
@@ -618,6 +630,11 @@ Arena* get_thread_local_arena(DeviceImpl* d);
 // Bounds-checked buffer lookup (device.cpp)
 Buffer* find_buffer_for_ptr(DeviceImpl* d, GpuPtr ptr, VkDeviceSize* out_offset);
 void   log_impl(DeviceImpl* d, LogLevel lvl, Span<const char> msg, uint32_t line, Span<const char> file);
+// Debug-name helpers. The fixed-size retained copy makes failure diagnostics
+// allocation-free; Vulkan forwarding is optional.
+void set_debug_name_copy(char (&dst)[kMaxDebugNameBytes], Span<const char> name);
+void set_vk_object_name(DeviceImpl* d, VkObjectType type, uint64_t handle,
+                        const char* name);
 void   log_vk_impl(DeviceImpl* d, VkResult res, Span<const char> msg, uint32_t line, Span<const char> file);
 
 // --- Internal helpers shared across TUs ------------------------------------------------

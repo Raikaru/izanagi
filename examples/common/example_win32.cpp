@@ -31,6 +31,8 @@ static const char* g_example_name = nullptr;
 static int         g_max_frames   = -1; // -1 = interactive
 static const char* g_screenshot_path = nullptr;
 static int         g_screenshot_frame = 0; // 0 = last frame
+static bool        g_vsync = true;
+static uint32_t    g_frame_latency = kDefaultFrameLatency;
 
 gpu::Format g_example_surface_format = gpu::Format::BGRA8Unorm;
 static int  g_cycle_request = 0; // +1 next example, -1 previous (M/N)
@@ -126,6 +128,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         } else if (wcscmp(argv[i], L"--cycle-test") == 0 && i + 1 < argc) {
             g_cycle_test = _wtoi(argv[i + 1]);
             i++;
+        } else if (wcscmp(argv[i], L"--no-vsync") == 0) {
+            g_vsync = false;
+        } else if (wcscmp(argv[i], L"--vsync") == 0) {
+            g_vsync = true;
+        } else if (wcscmp(argv[i], L"--frame-latency") == 0 && i + 1 < argc) {
+            g_frame_latency = static_cast<uint32_t>(_wtoi(argv[i + 1]));
+            i++;
         }
     }
     LocalFree(argv);
@@ -205,20 +214,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     bool surface_is_bgra = surface_format == Format::BGRA8UnormSrgb ||
                            surface_format == Format::BGRA8Unorm;
 
-    PresentMode present_mode = PresentMode::Fifo;
-    for (uint32_t i = 0; i < caps.present_modes.size(); ++i) {
-        if (caps.present_modes[i] == PresentMode::Mailbox) {
-            present_mode = PresentMode::Mailbox;
-            break;
-        }
-    }
+    const PresentMode present_mode =
+        choose_present_mode(caps.present_modes, g_vsync);
 
     SurfaceConfiguration surface_config{
-        .format       = surface_format,
-        .usages       = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
-        .width        = g_width,
-        .height       = g_height,
-        .present_mode = present_mode,
+        .format        = surface_format,
+        .usages        = UsageFlags::ColorAttachment | UsageFlags::TransferSrc,
+        .width         = g_width,
+        .height        = g_height,
+        .present_mode  = present_mode,
+        .frame_latency = g_frame_latency,
     };
     g_example_surface_format = surface_format;
 

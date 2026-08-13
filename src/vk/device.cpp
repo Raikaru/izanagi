@@ -114,6 +114,32 @@ void log_fmt(DeviceImpl* d, LogLevel lvl, uint32_t line, const char* file, const
     va_end(args);
     log_impl(d, lvl, Span<const char>(buf, strlen(buf)), line, Span<const char>(file, strlen(file)));
 }
+
+void set_debug_name_copy(char (&dst)[kMaxDebugNameBytes], Span<const char> name) {
+    const size_t count = std::min(name.size(), kMaxDebugNameBytes - 1);
+    if (count > 0) { memcpy(dst, name.data(), count); }
+    dst[count] = '\0';
+}
+
+void set_vk_object_name(DeviceImpl* d, VkObjectType type, uint64_t handle,
+                        const char* name) {
+    if (!d->has_debug_markers || vkSetDebugUtilsObjectNameEXT == nullptr ||
+        handle == 0 || name == nullptr || name[0] == '\0') {
+        return;
+    }
+    const VkDebugUtilsObjectNameInfoEXT info{
+        .sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+        .pNext        = nullptr,
+        .objectType   = type,
+        .objectHandle = handle,
+        .pObjectName  = name,
+    };
+    const VkResult result = vkSetDebugUtilsObjectNameEXT(d->device, &info);
+    if (result != VK_SUCCESS) {
+        log_vk_impl(d, result, "set_debug_name: Vulkan rejected object name",
+                    __LINE__, "device.cpp"_sv);
+    }
+}
 // --- Thread-local arena ----------------------------------------------------------------
 Arena* get_thread_local_arena(DeviceImpl* d) {
     auto state = reinterpret_cast<ThreadLocalState*>(tls_get_data(d->thread_local_key));
@@ -267,23 +293,38 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
     wsi_extensions[num_wsi_extensions++] = VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME;
 #endif
 
-    // Optional validation layer
+    // Debug utils is useful without validation (RenderDoc labels and object
+    // names), so enable it independently whenever the loader exposes it.
     const char* layers[1]     = {"VK_LAYER_KHRONOS_validation"};
     uint32_t    layer_count   = 0;
     const char* ext_ptrs[8];
     uint32_t    ext_count     = 0;
     for (uint32_t i = 0; i < num_wsi_extensions; ++i) { ext_ptrs[ext_count++] = wsi_extensions[i]; }
 
+    uint32_t instance_ext_count = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &instance_ext_count, nullptr) == VK_SUCCESS) {
+        Vector<VkExtensionProperties> instance_exts(d->allocator, {}, instance_ext_count);
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &instance_ext_count,
+                                                   instance_exts.data()) == VK_SUCCESS) {
+            for (uint32_t i = 0; i < instance_ext_count; ++i) {
+                if (strcmp(instance_exts[i].extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                    ext_ptrs[ext_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+                    d->has_debug_markers = true;
+                    break;
+                }
+            }
+        }
+    }
+
     if (desc.enable_validation) {
         VkLayerProperties avail[32];
-        uint32_t        avail_layer_count = static_cast<uint32_t>(sizeof(avail) / sizeof(avail[0]));
-        const VkResult  layer_result =
+        uint32_t avail_layer_count = static_cast<uint32_t>(sizeof(avail) / sizeof(avail[0]));
+        const VkResult layer_result =
             vkEnumerateInstanceLayerProperties(&avail_layer_count, avail);
         if ((layer_result == VK_SUCCESS || layer_result == VK_INCOMPLETE) && avail_layer_count > 0) {
             for (uint32_t i = 0; i < avail_layer_count; ++i) {
                 if (strcmp(avail[i].layerName, "VK_LAYER_KHRONOS_validation") == 0) {
                     layer_count = 1;
-                    ext_ptrs[ext_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
                     break;
                 }
             }
@@ -324,6 +365,7 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
 
     VkPhysicalDevice best         = VK_NULL_HANDLE;
     uint32_t         best_family  = 0;
+    uint32_t         best_transfer_family = UINT32_MAX;
     bool             prefer_integrated = (preference == GpuPreference::Integrated);
 
     for (uint32_t i = 0; i < device_count; ++i) {
@@ -362,6 +404,22 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
         if (graphics_family < 0) {
             IZ_LOG(d, LogLevel::Info, "device skipped: no graphics+compute queue family");
             continue;
+        }
+
+        // Prefer a transfer-only family, then any non-graphics transfer
+        // family. If neither exists, Transfer aliases the graphics queue.
+        uint32_t transfer_family = UINT32_MAX;
+        for (uint32_t f = 0; f < family_count; ++f) {
+            const VkQueueFlags flags = families[f].queueFlags;
+            if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+                !(flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+                transfer_family = f;
+                break;
+            }
+            if (transfer_family == UINT32_MAX &&
+                (flags & VK_QUEUE_TRANSFER_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT)) {
+                transfer_family = f;
+            }
         }
 
         // Check required extensions
@@ -407,23 +465,29 @@ static VkResult select_physical_device(DeviceImpl* d, GpuPreference preference) 
 
         // Select based on preference
         if (best == VK_NULL_HANDLE) {
-            best        = devices[i];
-            best_family = graphics_family;
+            best                 = devices[i];
+            best_family          = graphics_family;
+            best_transfer_family = transfer_family;
         } else {
             const bool is_integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
             const bool is_dedicated  = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
             if ((prefer_integrated && is_integrated) || (!prefer_integrated && is_dedicated)) {
-                best        = devices[i];
-                best_family = graphics_family;
+                best                 = devices[i];
+                best_family          = graphics_family;
+                best_transfer_family = transfer_family;
             }
         }
     }
 
     if (best == VK_NULL_HANDLE) { return VK_ERROR_INITIALIZATION_FAILED; }
-    d->physical_device      = best;
+    d->physical_device       = best;
     d->graphics_queue_family = best_family;
+    d->transfer_queue_family =
+        best_transfer_family != UINT32_MAX ? best_transfer_family : best_family;
+    d->dedicated_transfer_queue = d->transfer_queue_family != d->graphics_queue_family;
     VkPhysicalDeviceProperties selected_props{};
     vkGetPhysicalDeviceProperties(best, &selected_props);
+    d->max_draw_indirect_count = selected_props.limits.maxDrawIndirectCount;
     uint32_t selected_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(best, &selected_family_count, nullptr);
     VkQueueFamilyProperties selected_families[16];
@@ -483,15 +547,27 @@ void capture_device_capabilities(DeviceImpl* d) {
 
 // --- Logical device creation ---------------------------------------------------------------
 static VkResult create_logical_device(DeviceImpl* d) {
-    float queue_priority = 1.0f;
-    VkDeviceQueueCreateInfo queue_create_info{
+    float queue_priorities[2] = {1.0f, 1.0f};
+    VkDeviceQueueCreateInfo queue_create_infos[2] = {{
         .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .pNext            = nullptr,
         .flags            = 0,
         .queueFamilyIndex = d->graphics_queue_family,
         .queueCount       = 1,
-        .pQueuePriorities = &queue_priority,
-    };
+        .pQueuePriorities = &queue_priorities[0],
+    }};
+    uint32_t queue_create_info_count = 1;
+    if (d->dedicated_transfer_queue) {
+        queue_create_infos[1] = VkDeviceQueueCreateInfo{
+            .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .pNext            = nullptr,
+            .flags            = 0,
+            .queueFamilyIndex = d->transfer_queue_family,
+            .queueCount       = 1,
+            .pQueuePriorities = &queue_priorities[1],
+        };
+        queue_create_info_count = 2;
+    }
 
     // Feature chain — query first, then enable
 #if !defined(IZ_VK_PROFILE_BINDLESS)
@@ -702,8 +778,8 @@ static VkResult create_logical_device(DeviceImpl* d) {
         .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext                   = &device_features,
         .flags                   = 0,
-        .queueCreateInfoCount    = 1,
-        .pQueueCreateInfos       = &queue_create_info,
+        .queueCreateInfoCount    = queue_create_info_count,
+        .pQueueCreateInfos       = queue_create_infos,
         .enabledLayerCount       = 0,
         .ppEnabledLayerNames     = nullptr,
         .enabledExtensionCount   = enabled_count,
@@ -715,6 +791,11 @@ static VkResult create_logical_device(DeviceImpl* d) {
     if (result != VK_SUCCESS) { return result; }
 
     volkLoadDevice(d->device);
+    d->has_debug_markers =
+        d->has_debug_markers &&
+        vkSetDebugUtilsObjectNameEXT != nullptr &&
+        vkCmdBeginDebugUtilsLabelEXT != nullptr &&
+        vkCmdEndDebugUtilsLabelEXT != nullptr;
 
     // Verify critical features were enabled
 #if defined(IZ_VK_PROFILE_BINDLESS)
@@ -1607,6 +1688,29 @@ fail:
     return nullptr;
 }
 
+static void drain_queue_retirements(DeviceImpl* d, QueueImpl* q) {
+    if (q == nullptr) { return; }
+    Vector<RetireBatch*> pending(d->allocator);
+    mutex_lock(&q->submit_lock);
+    for (RetireBatch* b : q->retire_queue) { pending.push_back(b); }
+    q->retire_queue.clear();
+    mutex_unlock(&q->submit_lock);
+    for (RetireBatch* b : pending) { process_retire_batch(d, b); }
+}
+
+static void destroy_queue_impl(DeviceImpl* d, QueueImpl* q) {
+    if (q == nullptr) { return; }
+    for (auto& p : q->command_superpool.pools) {
+        if (p.command_pool) {
+            vkDestroyCommandPool(d->device, p.command_pool, nullptr);
+        }
+    }
+    q->pending_events.clear();
+    q->retire_queue.clear();
+    q->~QueueImpl();
+    d->allocator.free({.ptr = q, .len = sizeof(QueueImpl)});
+}
+
 void destroy_device(Device dev) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     device_wait_for_idle(d);
@@ -1626,13 +1730,9 @@ void destroy_device(Device dev) {
     condvar_destroy(&d->compiler_cv);
 
     // Drain all retirement batches (GPU work is complete).
-    if (d->default_queue) {
-        Vector<RetireBatch*> pending(d->allocator);
-        mutex_lock(&d->default_queue->submit_lock);
-        for (RetireBatch* b : d->default_queue->retire_queue) { pending.push_back(b); }
-        d->default_queue->retire_queue.clear();
-        mutex_unlock(&d->default_queue->submit_lock);
-        for (RetireBatch* b : pending) { process_retire_batch(d, b); }
+    drain_queue_retirements(d, d->default_queue);
+    if (d->transfer_queue != d->default_queue) {
+        drain_queue_retirements(d, d->transfer_queue);
     }
 
     // Destroy every remaining record (leaked handles, failed compiles, etc.).
@@ -1666,16 +1766,13 @@ void destroy_device(Device dev) {
         d->vk_pipeline_cache = VK_NULL_HANDLE;
     }
 
-    // Destroy queues
-    if (d->default_queue) {
-        for (auto& p : d->default_queue->command_superpool.pools) {
-            if (p.command_pool) {
-                vkDestroyCommandPool(d->device, p.command_pool, nullptr);
-            }
-        }
-        d->default_queue->pending_events.clear();
-        d->allocator.free({.ptr = d->default_queue, .len = sizeof(QueueImpl)});
+    // Destroy queues.
+    destroy_queue_impl(d, d->default_queue);
+    if (d->transfer_queue != d->default_queue) {
+        destroy_queue_impl(d, d->transfer_queue);
     }
+    d->default_queue = nullptr;
+    d->transfer_queue = nullptr;
 
     // Destroy pools (destructors call the registered destructors)
     d->buffer_pool.clear();
@@ -1759,21 +1856,90 @@ DeviceLimits device_limits(Device dev) {
     uint32_t sampler = d->heap.sampler_capacity;
 #endif
     return DeviceLimits{
-        .max_sampled_textures = sampled,
-        .max_storage_textures = storage,
-        .max_samplers         = sampler,
+        .max_sampled_textures      = sampled,
+        .max_storage_textures      = storage,
+        .max_samplers              = sampler,
         .framebuffer_sample_counts = d->framebuffer_sample_counts,
-        .non_solid_fill       = d->non_solid_fill,
-        .gpu_timestamps        = d->gpu_timestamps,
-        .min_uniform_alignment = d->min_uniform_alignment,
-        .min_storage_alignment = d->min_storage_alignment,
-        .non_coherent_atom_size = d->non_coherent_atom_size,
+        .max_draw_indirect_count   = d->max_draw_indirect_count,
+        .non_solid_fill            = d->non_solid_fill,
+        .gpu_timestamps            = d->gpu_timestamps,
+        .dedicated_transfer_queue  = d->dedicated_transfer_queue,
+        .min_uniform_alignment     = d->min_uniform_alignment,
+        .min_storage_alignment     = d->min_storage_alignment,
+        .non_coherent_atom_size    = d->non_coherent_atom_size,
     };
 }
 
 bool device_supports_dual_source_blend(Device dev) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     return d != nullptr && d->dual_src_blend;
+}
+
+bool set_debug_name(Device dev, GpuPtr ptr, Span<const char> name) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (d == nullptr || ptr == 0) { return false; }
+    BufferRange range = find_buffer_range(d, ptr, 0);
+    if (range.handle.h == 0) { return false; }
+    Buffer* buffer = d->buffer_pool.try_get(range.handle);
+    if (buffer == nullptr) {
+        release_buffer_ref(d, range.handle);
+        return false;
+    }
+    char debug_name[kMaxDebugNameBytes];
+    mutex_lock(&d->debug_name_lock);
+    set_debug_name_copy(buffer->debug_name, name);
+    memcpy(debug_name, buffer->debug_name, sizeof(debug_name));
+    const VkBuffer native = buffer->vk_buffer;
+    mutex_unlock(&d->debug_name_lock);
+    set_vk_object_name(d, VK_OBJECT_TYPE_BUFFER, (uint64_t)native, debug_name);
+    release_buffer_ref(d, range.handle);
+    return true;
+}
+
+bool set_debug_name(Device dev, Handle<Texture> texture, Span<const char> name) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (d == nullptr) { return false; }
+    mutex_lock(&d->texture_init_lock);
+    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(texture));
+    if (rec != nullptr) { atomic_fetch_add(&rec->refs, 1); }
+    mutex_unlock(&d->texture_init_lock);
+    if (rec == nullptr) { return false; }
+    char debug_name[kMaxDebugNameBytes];
+    mutex_lock(&d->debug_name_lock);
+    set_debug_name_copy(rec->debug_name, name);
+    memcpy(debug_name, rec->debug_name, sizeof(debug_name));
+    const VkImage native_image = rec->vk_image;
+    const VkImageView native_view = rec->default_image_view;
+    mutex_unlock(&d->debug_name_lock);
+    set_vk_object_name(d, VK_OBJECT_TYPE_IMAGE, (uint64_t)native_image, debug_name);
+    set_vk_object_name(d, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)native_view,
+                       debug_name);
+    Handle<Texture> retained =
+        handle_cast<Texture>(d->texture_pool.find_handle(rec));
+    if (retained.h != 0) { release_texture_ref(d, retained); }
+    return true;
+}
+
+bool set_debug_name(Device dev, Handle<Pipeline> pipeline, Span<const char> name) {
+    auto* d = reinterpret_cast<DeviceImpl*>(dev);
+    if (d == nullptr) { return false; }
+    mutex_lock(&d->pipeline_lock);
+    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    if (impl == nullptr || impl->record == nullptr) {
+        mutex_unlock(&d->pipeline_lock);
+        return false;
+    }
+    PipelineRecord* rec = impl->record;
+    rec->refs.fetch_add(1, std::memory_order_relaxed);
+    char debug_name[kMaxDebugNameBytes];
+    set_debug_name_copy(rec->debug_name, name);
+    memcpy(debug_name, rec->debug_name, sizeof(debug_name));
+    const VkPipeline native = rec->vk_pipeline;
+    mutex_unlock(&d->pipeline_lock);
+    set_vk_object_name(d, VK_OBJECT_TYPE_PIPELINE, (uint64_t)native,
+                       debug_name);
+    release_pipeline_ref(d, rec);
+    return true;
 }
 
 void device_wait_for_idle(Device dev) {
@@ -1823,15 +1989,21 @@ GpuPtr malloc(Device dev, size_t bytes, size_t align, Memory memory) {
     // Overallocate by (align - 1) so the user address can be aligned inside.
     const VkDeviceSize backing_size = sz + (al - 1);
 
+    const uint32_t queue_families[2] = {
+        d->graphics_queue_family,
+        d->transfer_queue_family,
+    };
     VkBufferCreateInfo create_info{
         .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext                 = nullptr,
         .flags                 = 0,
         .size                  = backing_size,
         .usage                 = kDefaultUsages,
-        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices   = nullptr,
+        .sharingMode = d->dedicated_transfer_queue
+                           ? VK_SHARING_MODE_CONCURRENT
+                           : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = d->dedicated_transfer_queue ? 2u : 0u,
+        .pQueueFamilyIndices   = d->dedicated_transfer_queue ? queue_families : nullptr,
     };
 
     VmaAllocationCreateFlags vma_flags = 0;
@@ -2182,31 +2354,55 @@ bool get_gpu_timer_result(Device dev, Handle<GpuTimer> timer, uint64_t& duration
 
 // --- Queue -------------------------------------------------------------------------------
 
+static QueueImpl* create_queue_wrapper(DeviceImpl* d, QueueType type,
+                                       uint32_t family) {
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(d->device, family, 0, &queue);
+    const auto timeline = create_semaphore_internal(d, 0);
+    if (queue == VK_NULL_HANDLE || timeline.h == 0) {
+        IZ_LOG(d, LogLevel::Error, "get_queue: failed to create queue timeline");
+        return nullptr;
+    }
+
+    auto blk = d->allocator.alloc(sizeof(QueueImpl));
+    if (blk.ptr == nullptr) {
+        d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(timeline));
+        IZ_LOG(d, LogLevel::Error, "get_queue: allocator out of memory");
+        return nullptr;
+    }
+    auto* q = ::new (blk.ptr) QueueImpl();
+    q->device         = d;
+    q->queue          = queue;
+    q->timeline       = timeline;
+    q->type           = type;
+    q->queue_family   = family;
+    q->timeline_value = 0;
+    q->pending_events = Vector<CompletionEvent>(d->allocator);
+    q->retire_queue   = Vector<RetireBatch*>(d->allocator);
+    set_vk_object_name(d, VK_OBJECT_TYPE_QUEUE, (uint64_t)queue,
+                       type == QueueType::Transfer
+                           ? "izanagi transfer queue"
+                           : "izanagi graphics queue");
+    return q;
+}
+
 Queue get_queue(Device dev, QueueType type) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    (void)type; // Only Default queue in v1
-
-    if (d->default_queue == nullptr) {
-        VkQueue queue;
-        vkGetDeviceQueue(d->device, d->graphics_queue_family, 0, &queue);
-        auto timeline = create_semaphore_internal(d, 0);
-
-        auto blk = d->allocator.alloc(sizeof(QueueImpl));
-        if (blk.ptr == nullptr) {
-            IZ_LOG(d, LogLevel::Error, "get_queue: allocator out of memory");
-            return nullptr;
-        }
-        auto* q  = ::new (blk.ptr) QueueImpl();
-        q->device         = d;
-        q->queue          = queue;
-        q->timeline       = timeline;
-        q->queue_family   = d->graphics_queue_family;
-        q->timeline_value = 0;
-        q->pending_events = Vector<CompletionEvent>(d->allocator);
-        q->retire_queue    = Vector<RetireBatch*>(d->allocator);
-        d->default_queue  = q;
+    if (d == nullptr || type >= QueueType::ValidCount) { return nullptr; }
+    if (type == QueueType::Transfer && !d->dedicated_transfer_queue) {
+        return get_queue(dev, QueueType::Default);
     }
-    return d->default_queue;
+
+    QueueImpl** slot = type == QueueType::Transfer
+                           ? &d->transfer_queue
+                           : &d->default_queue;
+    if (*slot == nullptr) {
+        const uint32_t family = type == QueueType::Transfer
+                                    ? d->transfer_queue_family
+                                    : d->graphics_queue_family;
+        *slot = create_queue_wrapper(d, type, family);
+    }
+    return *slot;
 }
 
 void queue_on_submitted_work_completed(Queue q, void (*fn)(void*), void* userdata) {

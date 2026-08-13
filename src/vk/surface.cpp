@@ -5,6 +5,31 @@
 #include "internal.h"
 
 namespace gpu {
+static bool has_present_mode(Span<const PresentMode> modes, PresentMode wanted) {
+    for (size_t i = 0; i < modes.size(); ++i) {
+        if (modes[i] == wanted) { return true; }
+    }
+    return false;
+}
+
+PresentMode choose_present_mode(Span<const PresentMode> supported, bool vsync) {
+    if (vsync) {
+        return has_present_mode(supported, PresentMode::Fifo)
+                   ? PresentMode::Fifo
+                   : (supported.size() > 0 ? supported[0] : PresentMode::Fifo);
+    }
+    constexpr PresentMode preference[] = {
+        PresentMode::Immediate,
+        PresentMode::Mailbox,
+        PresentMode::FifoRelaxed,
+        PresentMode::Fifo,
+    };
+    for (PresentMode mode : preference) {
+        if (has_present_mode(supported, mode)) { return mode; }
+    }
+    return PresentMode::Fifo;
+}
+
 
 SurfaceCapabilities get_surface_capabilities(Device dev) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
@@ -65,6 +90,26 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
         IZ_LOG(d, LogLevel::Error, "No surface — device was created without a window handle");
         return false;
     }
+    if (config.frame_latency == 0 || config.frame_latency > kMaxFramesInFlight) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "configure_surface: frame_latency must be in [1, %u]",
+                kMaxFramesInFlight);
+        return false;
+    }
+
+    const SurfaceCapabilities advertised = get_surface_capabilities(dev);
+    PresentMode selected_present_mode = config.present_mode;
+    if (!has_present_mode(advertised.present_modes, selected_present_mode)) {
+        selected_present_mode = PresentMode::Fifo;
+        if (!has_present_mode(advertised.present_modes, selected_present_mode)) {
+            IZ_LOG(d, LogLevel::Error,
+                   "configure_surface: requested present mode unsupported and FIFO unavailable");
+            return false;
+        }
+        IZ_LOG(d, LogLevel::Warning,
+               "configure_surface: requested present mode unsupported; falling back to FIFO");
+    }
+
 
     // 1. Retire old swapchain use before touching anything.
     vkDeviceWaitIdle(d->device);
@@ -73,8 +118,7 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
     VkSurfaceCapabilitiesKHR vk_caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(d->physical_device, s.surface, &vk_caps);
 
-    uint32_t image_count = vk_caps.minImageCount + 1;
-    if (image_count < 3 && vk_caps.maxImageCount >= 3) { image_count = 3; }
+    uint32_t image_count = std::max(vk_caps.minImageCount, config.frame_latency + 1);
     if (vk_caps.maxImageCount > 0 && image_count > vk_caps.maxImageCount) {
         image_count = vk_caps.maxImageCount;
     }
@@ -105,7 +149,7 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
         .pQueueFamilyIndices   = nullptr,
         .preTransform          = vk_caps.currentTransform,
         .compositeAlpha        = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode           = bridge(config.present_mode),
+        .presentMode           = bridge(selected_present_mode),
         .clipped               = true,
         .oldSwapchain          = s.swapchain,
     };
@@ -126,6 +170,8 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
     Handle<Texture> candidate_textures[Surface::kMaxSwapchainImages] = {};
     uint32_t created_textures = 0;
     VkImage vk_images[Surface::kMaxSwapchainImages];
+    Handle<Semaphore> candidate_frame = create_semaphore_internal(d, 0);
+    if (candidate_frame.h == 0) { goto fail_candidate; }
 
     // 5. Query candidate images.
     image_count = 0;
@@ -214,11 +260,16 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
             s.present_semaphores[i] = {};
         }
     }
+    if (s.frame_semaphore.h != 0) {
+        d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.frame_semaphore));
+    }
 
     s.swapchain        = candidate;
     s.image_count      = image_count;
     s.swapchain_format = bridge(config.format);
     s.swapchain_extent = extent;
+    s.frame_latency    = std::min(config.frame_latency, image_count);
+    s.frame_semaphore  = candidate_frame;
     for (uint32_t i = 0; i < image_count; ++i) {
         s.swapchain_images[i] = candidate_textures[i];
         s.present_semaphores[i] =
@@ -228,10 +279,8 @@ bool configure_surface(Device dev, const SurfaceConfiguration& config) {
         s.acquire_semaphores[i] =
             handle_cast<Semaphore>(d->semaphore_pool.emplace(SemaphoreImpl{.vk_semaphore = candidate_acquire[i]}));
     }
-    if (s.frame_semaphore.h == 0) {
-        s.frame_semaphore = create_semaphore_internal(d, 0);
-    }
     s.frame_idx = 0;
+    s.current_image_idx = 0;
     return true;
 
 fail_candidate:
@@ -250,6 +299,9 @@ fail_candidate:
             vkDestroySemaphore(d->device, candidate_acquire[i], nullptr);
         }
     }
+    if (candidate_frame.h != 0) {
+        d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(candidate_frame));
+    }
     vkDestroySwapchainKHR(d->device, candidate, nullptr);
     return false;
 }
@@ -257,12 +309,16 @@ fail_candidate:
 void unconfigure_surface(Device dev) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
     auto& s = d->surface;
+    if (s.swapchain != VK_NULL_HANDLE || s.frame_semaphore.h != 0) {
+        vkDeviceWaitIdle(d->device);
+    }
 
     if (s.swapchain != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(d->device, s.swapchain, nullptr);
         s.swapchain = VK_NULL_HANDLE;
     }
     s.current_image_idx = 0;
+    s.frame_latency    = kDefaultFrameLatency;
     s.image_count       = 0;
     for (uint32_t i = 0; i < Surface::kMaxSwapchainImages; ++i) {
         if (s.swapchain_images[i].h != 0) {
@@ -282,6 +338,11 @@ void unconfigure_surface(Device dev) {
         }
         s.first_use_command[i] = VK_NULL_HANDLE;
     }
+    if (s.frame_semaphore.h != 0) {
+        d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(s.frame_semaphore));
+        s.frame_semaphore = {};
+    }
+    s.frame_idx = 0;
 }
 
 SurfaceTextureInfo get_current_texture(Device dev) {
@@ -292,9 +353,9 @@ SurfaceTextureInfo get_current_texture(Device dev) {
 
     if (s.swapchain == VK_NULL_HANDLE) { return info; }
 
-    // Wait for the frame slot to be free (timeline wait on the slot's last signal)
-    const uint64_t wait_value = (s.frame_idx >= kMaxFramesInFlight)
-                                    ? s.frame_idx + 1 - kMaxFramesInFlight
+    // Wait for the configured frame-latency slot to be free.
+    const uint64_t wait_value = (s.frame_idx >= s.frame_latency)
+                                    ? s.frame_idx + 1 - s.frame_latency
                                     : 0;
     if (wait_value > 0 && s.frame_semaphore.h != 0) {
         VkSemaphore frame_sem = d->semaphore_pool[handle_cast<SemaphoreImpl>(s.frame_semaphore)].vk_semaphore;
@@ -310,7 +371,7 @@ SurfaceTextureInfo get_current_texture(Device dev) {
     }
 
     // Acquire next image
-    const uint32_t slot = s.frame_idx % kMaxFramesInFlight;
+    const uint32_t slot = static_cast<uint32_t>(s.frame_idx % s.frame_latency);
     VkSemaphore    acquire_sem = d->semaphore_pool[handle_cast<SemaphoreImpl>(s.acquire_semaphores[slot])].vk_semaphore;
 
     VkAcquireNextImageInfoKHR acquire_info{

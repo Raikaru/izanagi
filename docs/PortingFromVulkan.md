@@ -127,6 +127,28 @@ if (!submission_complete(prevFrame)) { /* skip update, present late, etc. */ }
 `submission_complete`/`wait_submission` against your own timeline values —
 the submission token is the fence.
 
+Dedicated uploads are the narrow multi-queue path:
+
+```cpp
+Queue transfer = get_queue(device, QueueType::Transfer);
+Submission uploaded = queue_submit(transfer, uploadCommands);
+SubmissionWait ready{.submission = uploaded, .stage = StageFlags::Transfer};
+Submission drawn = queue_submit(graphics, drawCommands, {}, {}, {&ready, 1});
+```
+
+`QueueType::Transfer` aliases graphics when no transfer-only family exists.
+`SubmissionWait` is a GPU timeline wait; it does not block the CPU.
+Resources are created for both queue families when this path is available,
+so applications do not issue explicit ownership barriers.
+
+## Swapchains and present modes → explicit surface policy
+
+`get_surface_capabilities` reports formats, usage flags, and present modes.
+Set `SurfaceConfiguration::present_mode` directly, or use
+`choose_present_mode(caps.present_modes, vsync)` for a player-facing toggle.
+`frame_latency` bounds the CPU to one or two frames ahead of completed
+presentation work.
+
 ## Resource lifetime → explicit, timeline-retired
 
 | Vulkan | Izanagi |
@@ -164,6 +186,13 @@ if (!cmd_set_pipeline(cmd, p)) {
 
 Blocking creators (`create_*_pipeline`) exist for loading screens. See
 [PipelineCompilation.md](PipelineCompilation.md).
+
+## Debug utils → retained names and command groups
+
+`set_debug_name` names buffers, textures, and pipelines.
+`cmd_push_debug_group` / `cmd_pop_debug_group` label command-buffer regions.
+The Vulkan backend forwards both through `VK_EXT_debug_utils` when available,
+while retaining object names for deterministic errors when it is not.
 
 ## The things that look similar (and are)
 
