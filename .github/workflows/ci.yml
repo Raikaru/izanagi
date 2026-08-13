@@ -107,7 +107,7 @@ jobs:
       - name: Install build tools and latest llvmpipe
         run: >
           zypper --non-interactive install
-          git cmake ninja gcc-c++ libvulkan_lvp vulkan-tools
+          git cmake ninja gcc-c++ libvulkan1 libvulkan_lvp vulkan-tools
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Configure (Native, headless, Debug)
         run: >
