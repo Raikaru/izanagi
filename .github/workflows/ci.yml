@@ -227,3 +227,30 @@ jobs:
                 -DCMAKE_PREFIX_PATH=${{ runner.temp }}/izanagi-prefix
       - name: Build consumer
         run: cmake --build /tmp/consumer/build
+
+  linux-wsi-build:
+    # Compiles the Wayland and XCB surface paths against the real platform
+    # headers. Build-only: no display server on the runner, so no surface is
+    # ever created here — this guards the WSI code against bitrot, not the
+    # presentation path (which needs the qualification rig).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install WSI headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxcb1-dev
+      - name: Configure (Wayland)
+        run: >
+          cmake -S . -B build-wayland -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DIZANAGI_WSI=WAYLAND -DIZANAGI_BUILD_TESTS=OFF
+          -DIZANAGI_BUILD_EXAMPLES=OFF
+      - name: Build (Wayland)
+        run: cmake --build build-wayland
+      - name: Configure (XCB)
+        run: >
+          cmake -S . -B build-xcb -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DIZANAGI_WSI=XCB -DIZANAGI_BUILD_TESTS=OFF
+          -DIZANAGI_BUILD_EXAMPLES=OFF
+      - name: Build (XCB)
+        run: cmake --build build-xcb

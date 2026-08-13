@@ -461,6 +461,10 @@ struct PipelineCacheCallbacks {
 };
 struct DeviceDesc {
     GpuPreference         gpu_preference         = GpuPreference::Discrete;
+    // Surface handles (per compiled WSI; 0 = headless):
+    //   WIN32:   instance = HINSTANCE, window = HWND
+    //   XCB:     instance = xcb_connection_t*, window = xcb_window_t
+    //   WAYLAND: instance = wl_display*, window = wl_surface*
     uintptr_t             native_window_handle   = 0;
     uintptr_t             native_instance_handle = 0;
     ProcLogCallback       log_callback           = nullptr;

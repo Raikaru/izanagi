@@ -15,7 +15,7 @@ namespace gpu {
 // --- Required device extensions ---------------------------------------------------
 // VK_KHR_SWAPCHAIN is required only when a surface-capable WSI is selected;
 // headless builds never request it.
-#if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
+#if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID) || defined(IZ_WSI_XCB) || defined(IZ_WSI_WAYLAND)
 #    define IZ_REQUIRE_SWAPCHAIN 1
 #else
 #    define IZ_REQUIRE_SWAPCHAIN 0
@@ -32,7 +32,7 @@ namespace gpu {
 // the private fallbacks (legacy copy / static graphics state). 1.3+ devices
 // never require the promoted extension names.
 static const char* kRequiredDeviceExtensions[IZ_REQUIRE_SWAPCHAIN + IZ_REQUIRE_HEAP_TRIO * 3 + 4 + 1] = {
-#if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID)
+#if defined(IZ_WSI_WIN32) || defined(IZ_WSI_ANDROID) || defined(IZ_WSI_XCB) || defined(IZ_WSI_WAYLAND)
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 #endif
     // The descriptor-heap trio is native-profile-only; the bindless profile
@@ -257,6 +257,14 @@ static VkResult create_instance(DeviceImpl* d, const DeviceDesc& desc) {
 #if defined(IZ_WSI_ANDROID)
     wsi_extensions[num_wsi_extensions++] = VK_KHR_SURFACE_EXTENSION_NAME;
     wsi_extensions[num_wsi_extensions++] = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
+#endif
+#if defined(IZ_WSI_XCB)
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_SURFACE_EXTENSION_NAME;
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_XCB_SURFACE_EXTENSION_NAME;
+#endif
+#if defined(IZ_WSI_WAYLAND)
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_SURFACE_EXTENSION_NAME;
+    wsi_extensions[num_wsi_extensions++] = VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME;
 #endif
 
     // Optional validation layer
@@ -1201,6 +1209,38 @@ Device create_device(const DeviceDesc& desc) {
         result = vkCreateWin32SurfaceKHR(d->instance, &surface_info, nullptr, &d->surface.surface);
         if (result != VK_SUCCESS) {
             log_vk_impl(d, result, "Failed to create Win32 surface", __LINE__, "device.cpp"_sv);
+            goto fail;
+        }
+    }
+#elif defined(IZ_WSI_XCB)
+    // native_instance_handle = xcb_connection_t*, native_window_handle = xcb_window_t.
+    if (desc.native_window_handle != 0) {
+        VkXcbSurfaceCreateInfoKHR surface_info{
+            .sType      = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
+            .pNext      = nullptr,
+            .flags      = 0,
+            .connection = (xcb_connection_t*)desc.native_instance_handle,
+            .window     = (xcb_window_t)desc.native_window_handle,
+        };
+        result = vkCreateXcbSurfaceKHR(d->instance, &surface_info, nullptr, &d->surface.surface);
+        if (result != VK_SUCCESS) {
+            log_vk_impl(d, result, "Failed to create XCB surface", __LINE__, "device.cpp"_sv);
+            goto fail;
+        }
+    }
+#elif defined(IZ_WSI_WAYLAND)
+    // native_instance_handle = wl_display*, native_window_handle = wl_surface*.
+    if (desc.native_window_handle != 0) {
+        VkWaylandSurfaceCreateInfoKHR surface_info{
+            .sType   = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
+            .pNext   = nullptr,
+            .flags   = 0,
+            .display = (wl_display*)desc.native_instance_handle,
+            .surface = (wl_surface*)desc.native_window_handle,
+        };
+        result = vkCreateWaylandSurfaceKHR(d->instance, &surface_info, nullptr, &d->surface.surface);
+        if (result != VK_SUCCESS) {
+            log_vk_impl(d, result, "Failed to create Wayland surface", __LINE__, "device.cpp"_sv);
             goto fail;
         }
     }
