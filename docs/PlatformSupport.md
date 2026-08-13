@@ -1,30 +1,53 @@
 # Platform support
 
-Status is reported honestly: **builds**, **runs basic tests**, **passes shared
-conformance**, **passes WSI/lifecycle tests**, and **certified on named
-physical hardware** are distinct claims. A platform is listed as supported
-only when the required conformance passes on physical hardware.
+Support claims use five distinct levels:
 
-| Platform | Backend | VK profile | Status |
-|---|---|---|---|
-| Windows | Vulkan Native | `IZANAGI_VK_NATIVE_1` + `IZANAGI_VK_BINDLESS_1` | Certified baseline on the RTX 4080: full suite (43 tests) passes on both profiles, including the forced legacy-copy and forced static-graphics-state configurations; CI. |
-| Linux | Vulkan Bindless | `IZANAGI_VK_BINDLESS_1` | WSL dzn rig (mesa 26.2.0 dzn, RTX 4080 via D3D12): full suite (43/43, Debug + Release) passes with the private copy + static-state fallbacks; capability JSON + suite logs archived. Headless CI: builds + common tests; Lavapipe probe job added (qualification pending first green run). |
-| Android | Vulkan Bindless via Mesa Turnip | `IZANAGI_VK_BINDLESS_1` | Qualified on the Adreno 650 phone rig two ways: (1) phone-hosted CI runs the full Vulkan suite on pinned Turnip/KGSL (Linux userland) on every `main` push; (2) a native NDK (bionic) test host passes the full suite on an adrenotools-loaded Turnip driver, and the capability-rejection path is verified against the stock Qualcomm Vulkan 1.1 driver and Qualcomm's v615.77 blob (also 1.1 on this GPU). Replacement drivers select at runtime via `IZANAGI_ADRENOTOOLS_*` env (build with `IZANAGI_ADRENOTOOLS_ROOT`). |
-| macOS | Metal (planned) | — | Build boundary in place; backend in a later phase. |
-| iOS | Metal (planned) | — | Declared; simulator/device phases planned. |
+1. **Certified baseline**: the current public contract passes the complete
+   suite on a named physical configuration used as a release baseline.
+2. **Qualified configuration**: a dated device/OS/driver combination passed
+   the complete suite; the claim does not generalize to every device on that
+   platform.
+3. **CI exercised**: the suite runs on a software or hosted CI device.
+4. **Compile-only**: the target builds, but runtime behavior is not claimed.
+5. **Planned**: no usable backend exists.
 
-## Profile matrix
+The exact evidence belongs in [HardwareSupport.md](HardwareSupport.md).
+Vulkan API version or GPU family alone never establishes support.
 
-| Profile | Platforms | Status |
+## Current matrix
+
+| Platform | Implementation | Status |
 |---|---|---|
-| `IZANAGI_VK_NATIVE_1` | Windows, Linux | Implemented; Windows certified (RTX 4080); Linux headless build green on CI. |
-| `IZANAGI_VK_BINDLESS_1` | Windows, Linux (WSL dzn), Android | Implemented; Windows verified (RTX 4080, full suite) and Linux verified (WSL dzn, full suite with the private copy + static-state fallbacks). Remaining gated fallbacks: the snapshot descriptor-set path (update-unused-while-pending-less devices) and the private render-pass fallback (dynamic-rendering-less devices) are not yet provided. Hardware qualification (Maxwell/Polaris/Skylake/GCN, RADV/NVK/ANV) is pending physical hardware. |
-| `IZANAGI_VK_COMPAT_1` (superseded name) | — | Replaced by `IZANAGI_VK_BINDLESS_1` (see docs/VulkanProfiles.md). |
-| `IZANAGI_METAL_1` | macOS, iOS | Declared; rejected at configure until implemented. |
+| Windows | Vulkan Native and Bindless; Win32 WSI | **Certified baseline** on the named RTX 4080 configuration. Both profiles pass the complete suite locally; Windows Debug and Release builds run in CI. |
+| Linux | Vulkan Bindless; headless, XCB, Wayland | The dated WSL dzn configuration is qualified. Bindless runs on Lavapipe in CI when the capability probe accepts the runner. XCB and Wayland compile in CI, but no native Linux RADV/NVK/ANV hardware configuration is qualified. |
+| Android | Vulkan Bindless; Android WSI builds | The Adreno 650 + pinned Turnip replacement-driver configuration passes the headless API suite on the physical phone runner. Android WSI presentation is not qualified, and the stock Qualcomm driver on that phone does not meet the profile. |
+| macOS | Headless Vulkan host build | Compile-only. The Metal backend and Metal WSI are not implemented. |
+| iOS | None | Planned; no runtime or build support claim. |
 
-## Certified device policy
+## What CI proves
 
-"Supported" requires a declared profile passing shared conformance on named
-physical hardware, with the capability report and validation logs archived.
-See docs/HardwareSupport.md for the exact tested matrix (Windows RTX 4080,
-WSL dzn rig; Lavapipe CI probe pending its first green run).
+The active matrix is defined in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and
+[`.github/workflows/android-phone-runner.yml`](../.github/workflows/android-phone-runner.yml).
+A green run proves only the jobs that actually executed:
+
+- hosted compiler and package-consumer coverage;
+- Bindless behavior on the selected Lavapipe software device when its profile
+  probe succeeds;
+- XCB and Wayland surface compilation, not presentation behavior;
+- the headless Bindless suite on the named physical Android/Turnip runner.
+
+It does not turn an untested GPU family or driver into a supported target.
+
+## Qualification policy
+
+A new hardware claim requires:
+
+1. the capability report;
+2. the complete API suite with the selected profile;
+3. driver identity and validation output;
+4. archived evidence tied to a commit.
+
+Use `tools/run_hardware_qualification.sh` and the hardware-qualification issue
+template. Claims are configuration-specific until enough evidence justifies a
+broader platform statement.

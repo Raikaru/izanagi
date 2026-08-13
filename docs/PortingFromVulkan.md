@@ -132,14 +132,15 @@ Dedicated uploads are the narrow multi-queue path:
 ```cpp
 Queue transfer = get_queue(device, QueueType::Transfer);
 Submission uploaded = queue_submit(transfer, uploadCommands);
-SubmissionWait ready{.submission = uploaded, .stage = StageFlags::Transfer};
+SubmissionWait ready{.submission = uploaded, .stage = StageFlags::VertexShader};
 Submission drawn = queue_submit(graphics, drawCommands, {}, {}, {&ready, 1});
 ```
 
 `QueueType::Transfer` aliases graphics when no transfer-only family exists.
-`SubmissionWait` is a GPU timeline wait; it does not block the CPU.
-Resources are created for both queue families when this path is available,
-so applications do not issue explicit ownership barriers.
+`SubmissionWait` is a GPU timeline wait; it does not block the CPU. Use the
+first stage that consumes the upload as the wait stage. Resources are created
+for both queue families when this path is available, so applications do not
+issue explicit ownership barriers.
 
 ## Swapchains and present modes → explicit surface policy
 

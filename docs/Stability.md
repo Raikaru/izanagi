@@ -17,12 +17,15 @@ here, so depending on it is a decision, not a gamble.
 ## How to depend on Izanagi
 
 **Pin a tag. Never `main`.** `main` is where breaking changes land first.
+Choose the current tag from the
+[releases page](https://github.com/Raikaru/izanagi/releases) and replace
+`vX.Y.Z` below:
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(izanagi
     GIT_REPOSITORY https://github.com/Raikaru/izanagi.git
-    GIT_TAG        v0.1.0)
+    GIT_TAG        vX.Y.Z)
 FetchContent_MakeAvailable(izanagi)
 target_link_libraries(your_app PRIVATE Izanagi::izanagi)
 ```
@@ -39,13 +42,14 @@ rename; undeclared instability is what actually hurts.
 - `shaders/izanagi.slang` — the shader-side prelude. Changes here are
   listed in the changelog too, because shaders and CPU code must upgrade
   together.
-- The **compiled profile** (`IZANAGI_PROFILE`, e.g. `IZANAGI_VK_NATIVE_1`)
-  is part of the API contract. Both profiles implement the same programming
-  model; a shader compiled for one profile is not usable with a library
-  built for the other. Select it at configure time:
+- The **compiled profile identity** (`IZANAGI_PROFILE`, for example
+  `IZANAGI_VK_NATIVE_1`) is part of the API contract. Both Vulkan profiles
+  implement the same programming model, but shaders compiled for one profile
+  are not usable with a library built for the other. Select the profile with
+  `IZANAGI_VK_PROFILE`:
 
   ```sh
-  cmake -S . -B build -DIZANAGI_PROFILE=IZANAGI_VK_BINDLESS_1
+  cmake -S . -B build -DIZANAGI_VK_PROFILE=BINDLESS
   ```
 
   Defaults and per-platform behavior are documented in

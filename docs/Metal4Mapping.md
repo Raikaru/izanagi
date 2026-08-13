@@ -5,8 +5,8 @@ Implementation and conformance testing against Metal remain future work — the
 Vulkan 1.4 backend is the only implemented backend. Nothing here is proof of
 full portability; treat the Metal columns as design intent.
 
-Every public Izanagi API entry, its Vulkan 1.4 implementation (v1, this repo),
-and the designed Metal 4 mapping.
+The tables below map every public Izanagi API entry to its current Vulkan
+Native implementation and the designed Metal 4 equivalent.
 
 References: [Understanding the Metal 4 core API](https://developer.apple.com/documentation/metal/understanding-the-metal-4-core-api),
 [MTL4ArgumentTable](https://developer.apple.com/documentation/metal/mtl4argumenttable),
@@ -32,7 +32,7 @@ accident:
 
 ## Core type mappings
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `GpuPtr` (uint64) | `vkGetBufferDeviceAddress` of a VMA allocation (heap or dedicated) | `MTLBuffer.gpuAddress`; allocations from one `MTLHeap`, registered in a device `MTLResidencySet`, committed once; every command buffer calls `useResidencySet` |
 | `TextureView` (uint64) | low 32 = descriptor-heap index, high 32 = 0; unpacked with `uint2(v, v>>32)` | `MTLTexture.gpuResourceID` (from the texture-view pool) — a 64-bit value, stored as-is |
@@ -46,7 +46,7 @@ accident:
 
 ## Root arguments
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | Root args = raw pointers | `vkCmdPushDataEXT` writes `VkDeviceAddress` pairs (offset 0 = vertex/compute data pointer, offset 8 = fragment data pointer) | `MTL4ArgumentTable` with 2 buffer slots (0 = compute/vertex, 1 = fragment) — loon-proven on Metal 3, unchanged in Metal 4 |
 | Push-constant `Args` struct | `uniform Args { T* vert; T* frag; }` via `[[vk::push_constant]]` | `mtl4argumenttable.setBuffer(slot, ptr, 0)` with the same struct layout |
@@ -57,7 +57,7 @@ entire binding interface on both backends.
 
 ## Global resource heap
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | One device-global indexable heap for textures + samplers | `VK_EXT_descriptor_heap`: device buffers backed by `VkBindHeapInfoEXT`, written via `vkWriteDescriptorSet2`/`vkWriteSamplerDescriptorsEXT`; shaders index via handles from the `getTexture2D`/`getSampler` prelude helpers | Metal manages resource identity natively: `MTLResourceID` values are indexable from shaders without a CPU-side heap object; the residency set is the device-global "heap" |
 
@@ -66,12 +66,12 @@ does not guarantee contiguous range allocation — `MTLResourceID`s are opaque
 and the compiler assigns them. Therefore the **public API never promises
 adjacent indices for separately created views**, and never exposes heap-base
 arithmetic. Callers must store the handles they create; there is no
-`heap_base + i` pattern. (This is already true of the v1 Vulkan API surface:
+`heap_base + i` pattern. (This is already true of the public Vulkan API:
 `create_texture_view` returns an opaque `TextureView`, not an index.)
 
 ## Sync
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `cmd_barrier(before, after)` | `vkCmdPipelineBarrier2` with stage masks bridged from `StageFlags` (memory barrier; images stay GENERAL) | MTL4 barrier scopes (`MTL4BarrierScope`) — stage-granular only, which is exactly what the API exposes; no per-resource hazard tracking |
 | `create_semaphore(init)` | timeline `VkSemaphore` | `MTLSharedEvent` + `newSharedEventWithOptions` |
@@ -83,8 +83,8 @@ arithmetic. Callers must store the handles they create; there is no
 **Design constraint Metal imposes:** barrier granularity is stage-pair only —
 Metal has no per-resource layout transitions. The API's `StageFlags`-only
 barrier (`cmd_barrier`) is the exact shape Metal supports; there is no
-`cmd_image_transition` in the public surface, and v1's Vulkan impl keeps images
-in GENERAL layout for the same reason.
+`cmd_image_transition` in the public surface, and the Vulkan implementation
+keeps images in GENERAL layout for the same reason.
 
 **Render-pass resolve:** `RenderAttachment.resolve_texture` maps to
 `MTLRenderPassColorAttachmentDescriptor.resolveTexture` with
@@ -92,7 +92,7 @@ in GENERAL layout for the same reason.
 
 ## Memory
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `malloc(dev, bytes, Memory)` | VMA: `Memory::Gpu` = device-local, `Memory::Default` = host-visible + device-address, `Memory::Readback` = host-visible readback | `MTLHeap.newBufferWithLength` (Gpu); `MTLBuffer` with storage mode `Shared` (Default) / `Managed` or explicit readback staging (Readback) |
 | `get_host_pointer` | VMA mapped pointer | `MTLBuffer.contents` (Shared/Managed) |
@@ -101,7 +101,7 @@ in GENERAL layout for the same reason.
 
 ## Textures, views, samplers
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `create_texture` | `VkImage` + VMA, `UNDEFINED→GENERAL` on first use | `MTLHeap.newTextureWithDescriptor` |
 | `create_texture_view` | descriptor-heap write (`imageDescriptorSize` layout) → indexable handle | view pool returning `MTLResourceID`; `MTL4ArgumentTable` slot write |
@@ -112,13 +112,13 @@ in GENERAL layout for the same reason.
 | `cmd_generate_mipmaps` | `vkCmdBlitImage2` chain, mip i-1 → i, linear filter, GENERAL layout | `MTL4BlitCommandEncoder.generateMipmaps(for:)` |
 
 **Format note:** the `Format` enum keeps ETC2/ASTC entries for the future Metal
-backend; the v1 Vulkan backend logs an error and returns a null handle for
+backend; the Vulkan backend logs an error and returns a null handle for
 unsupported formats at `create_texture`. Metal's `MTLPixelFormat` covers the
 full enum including ETC2/ASTC, so the enum set ports 1:1.
 
 ## Pipelines & draw
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `create_compute_pipeline` | `vkCreateComputePipelines2` + `VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT`, no layout object | `MTL4Compiler` compile from MSL (Slang cross-compiles via slangc `-target metal`) |
 | `create_graphics_pipeline` | `vkCreateGraphicsPipelines2`, `VkPipelineRenderingCreateInfo` (dynamic rendering — no render pass objects) | `MTL4Compiler`; Metal 4's dynamic rendering model (`MTL4RenderPassDescriptor` built per frame) |
@@ -131,7 +131,7 @@ full enum including ETC2/ASTC, so the enum set ports 1:1.
 
 ### Blend factors (incl. dual-source)
 
-| Izanagi `Factor` | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi `Factor` | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `Zero` / `One` | `VK_BLEND_FACTOR_ZERO` / `ONE` | `MTLBlendFactorZero` / `One` |
 | `SrcColor` / `OneMinusSrcColor` | `SRC_COLOR` / `ONE_MINUS_SRC_COLOR` | `SourceColor` / `OneMinusSourceColor` |
@@ -151,7 +151,7 @@ Vulkan `Location 0, Index 1` output used by the Vulkan backend.
 
 ## Surface / present
 
-| Izanagi | Vulkan 1.4 impl (v1) | Metal 4 mapping |
+| Izanagi | Vulkan Native implementation | Metal 4 mapping |
 |---|---|---|
 | `configure_surface` | `VkSwapchainKHR` (images owned by the device, used as render targets, one transition GENERAL→PRESENT_SRC at frame end) | `CAMetalLayer` drawable pool; `MTLTexture` from `nextDrawable` |
 | `get_current_texture` | acquire image + wait on frame-slot timeline value before `vkAcquireNextImage2KHR` | `CAMetalLayer.nextDrawable` — the drawable IS the texture; no acquire needed |

@@ -1,166 +1,156 @@
 # Building Izanagi
 
+This page is the source of truth for build configuration. Capability and
+device requirements are documented separately in
+[VulkanProfiles.md](VulkanProfiles.md).
+
+## Requirements
+
+- CMake 3.28 or newer.
+- A C++20 compiler.
+- A Vulkan loader and a driver satisfying the selected capability profile at
+  runtime.
+
+Vulkan-Headers, volk, VMA, and the required host shader tools are acquired by
+CMake. A system Vulkan SDK is optional; install it only when Vulkan validation
+layers are required.
+
 ## CMake options
 
-| Option | Values | Default | Meaning |
+| Option | Values | Default | Purpose |
 |---|---|---|---|
-| `IZANAGI_BACKEND` | `VULKAN_NATIVE` (others declared) | `VULKAN_NATIVE` | Private backend implementation. One backend per compiled library. `VULKAN_COMPAT` and `METAL` are declared but rejected at configure with a clear message until their phases land. |
-| `IZANAGI_WSI` | `AUTO`, `HEADLESS`, `WIN32`, `XCB`, `WAYLAND`, `ANDROID`, `METAL` | `AUTO` | Window-system integration. `HEADLESS` requires no desktop window system. `AUTO` resolves per host (Windows→`WIN32`, everything else→`HEADLESS` until those hosts land). Unsupported host/WSI combinations fail configure — never silently remapped. |
-| `IZANAGI_BUILD_TESTS` | ON/OFF | top-level: ON | API test suite + GPU-independent common tests. |
-| `IZANAGI_BUILD_EXAMPLES` | ON/OFF | top-level: ON | Example programs. Built only when a WSI host exists for the current platform. |
-| `IZANAGI_BUILD_CAPABILITY_REPORT` | ON/OFF | top-level: ON | `izanagi_capability_report` tool (JSON capability output). |
-| `IZANAGI_SLANGC` | path | empty | Explicit host `slangc` path; wins over PATH and the downloaded package. |
-| `IZANAGI_PROFILE` | string | `IZANAGI_VK_NATIVE_1` | Capability profile name reported by the report tool. |
+| `IZANAGI_VK_PROFILE` | `NATIVE`, `BINDLESS` | `NATIVE` | Selects the Vulkan capability profile and shader ABI. |
+| `IZANAGI_WSI` | `AUTO`, `HEADLESS`, `WIN32`, `XCB`, `WAYLAND`, `ANDROID`, `METAL` | `AUTO` | Selects window-system integration. Unsupported host/WSI pairs fail configuration. |
+| `IZANAGI_BUILD_TESTS` | `ON`, `OFF` | top level: `ON`; subproject: `OFF` | Builds API and GPU-independent tests. |
+| `IZANAGI_BUILD_EXAMPLES` | `ON`, `OFF` | top level: `ON`; subproject: `OFF` | Builds examples when a host exists; currently Win32 only. |
+| `IZANAGI_BUILD_CAPABILITY_REPORT` | `ON`, `OFF` | top level: `ON`; subproject: `OFF` | Builds `izanagi_capability_report`. |
+| `IZANAGI_SLANGC` | executable path | auto-discovered | Overrides host `slangc` discovery. |
+| `IZANAGI_BACKEND` | `VULKAN_NATIVE` | `VULKAN_NATIVE` | Selects the private backend. Other declared values are rejected until implemented. |
+
+`IZANAGI_PROFILE` is a derived artifact identity such as
+`IZANAGI_VK_BINDLESS_1`; do not use it to select a profile. Use
+`IZANAGI_VK_PROFILE=BINDLESS` or `NATIVE`.
+
+`IZANAGI_WSI=AUTO` resolves to Win32 on Windows, Android on Android, and
+headless elsewhere. Linux desktop builds must select `XCB` or `WAYLAND`
+explicitly.
 
 ## Presets
 
-- `dev-windows-msvc` — Windows MSVC, WIN32 WSI (existing default).
-- `windows-headless` — Windows, no WSI (surface APIs fail cleanly).
-- `linux-clang-debug`, `linux-gcc-release`, `linux-clang-asan` — Linux headless; ASan/UBSan preset targets the GPU-independent common tests.
+| Preset | Configuration |
+|---|---|
+| `dev-windows-msvc` | Visual Studio 2022, Win32 WSI, Debug build preset |
+| `windows-headless` | Visual Studio 2022, no WSI |
+| `linux-clang-debug` | Clang + Ninja, headless Debug |
+| `linux-gcc-release` | GCC + Ninja, headless Release |
+| `linux-clang-asan` | Clang + Ninja, ASan/UBSan, GPU-independent tests |
 
-## Host shader tool
-
-`slangc` is a **build-host** executable. Discovery (in order): explicit `IZANAGI_SLANGC` → `slangc` on PATH → a repository-managed host package downloaded for `CMAKE_HOST_SYSTEM_NAME`/`CMAKE_HOST_SYSTEM_PROCESSOR`. Cross-compiling for Android/iOS never executes a target binary — the host package is selected by host, not target, properties. A missing tool is a clear configure error.
-
-## Examples
+The Vulkan profile can be appended to any configure preset:
 
 ```sh
-# Windows (default)
-cmake -S . -B build --preset dev-windows-msvc
-cmake --build build --config Debug
+cmake --preset dev-windows-msvc -DIZANAGI_VK_PROFILE=BINDLESS
+cmake --build --preset dev-windows-msvc
+```
+
+## Common builds
+
+### Windows with examples
+
+```sh
+cmake --preset dev-windows-msvc -DIZANAGI_VK_PROFILE=BINDLESS
+cmake --build --preset dev-windows-msvc
 ctest --test-dir build -C Debug --output-on-failure
-
-# Windows headless (no WSI; surface APIs report errors)
-cmake -S . -B build-headless --preset windows-headless
-cmake --build build-headless --config Debug
-
-# Linux headless (Clang Debug)
-cmake -S . -B out/linux-native-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DIZANAGI_BACKEND=VULKAN_NATIVE -DIZANAGI_WSI=HEADLESS \
-  -DIZANAGI_BUILD_TESTS=ON -DIZANAGI_BUILD_EXAMPLES=OFF
-cmake --build out/linux-native-debug
-ctest --test-dir out/linux-native-debug --output-on-failure
 ```
 
-## Android CI
+Executables are written to `build/bin/Debug`. The Win32 example host supports
+interactive, screenshot, resize-cycle, present-mode, and frame-latency smoke
+runs; use `--help` for its current command-line options.
 
-The normal CI workflow cross-compiles the library for `arm64-v8a` with the
-Android NDK (`android-26`), `IZANAGI_WSI=ANDROID`, and the bindless Vulkan
-profile. This is a compile check, not a support claim; Android physical-device
-conformance is still experimental.
-
-The manually triggered `android-wireless-device` workflow runs on a Linux
-self-hosted runner tagged `android-device`. The runner must have CMake 3.28 or
-newer, Ninja, Git, a JDK, and `adb` available, and must be able to reach the
-phone over the same LAN or VPN. On the phone, open **Developer options →
-Wireless debugging → Pair device with pairing code**, then provide all three
-values to the workflow:
-
-- `adb_pair_address`: the temporary pairing `IP address & Port`;
-- `adb_pairing_code`: the six-digit Wi-Fi pairing code;
-- `adb_device_address`: the debugging `IP address & Port` used by `adb connect`.
-The phone workflow builds and runs the GPU-independent common tests, verifies
-the pinned Mesa Turnip Vulkan driver, and runs the Vulkan API suite on every
-`main` push. Manual dispatch can also opt into the API suite. The stock
-Qualcomm Vulkan driver is not used for conformance because this phone reports
-an older Vulkan profile than Izanagi's bindless requirements.
-
-## Android phone as a GitHub runner
-
-The `android-phone-runner` workflow is for the phone itself acting as a
-GitHub Actions ARM64 runner. It runs inside a Debian userspace provided by
-Termux/proot and uses the labels `self-hosted`, `linux`, and `android-phone`.
-The phone must remain awake, charging, online, and exempted from Samsung
-battery optimization for Termux.
-
-### Fast lane: native bionic tests (default)
-
-The Android test host is cross-compiled with the NDK on a GitHub-hosted
-x86_64 runner, packaged with the pinned adrenotools Turnip driver and the
-adrenotools hook libraries, and uploaded as an artifact. The phone only
-downloads and runs it, so it never compiles.
-
-Those binaries are bionic, and bionic Vulkan does not work inside proot: the
-Android loader reports `Loading vulkan.adreno.so from current namespace
-instead of sphal namespace`, adrenotools' hook never engages, and
-`vkEnumeratePhysicalDevices` returns zero devices. The run is therefore
-dispatched to the Termux uid outside proot:
-
-- `tools/phone_exec_daemon.sh` runs in Termux (outside proot) and watches a
-  spool directory inside the Debian rootfs;
-- `tools/phone_exec.sh` runs inside the job, submits a script, and returns its
-  output and exit code.
-
-Start the daemon once per boot from a Termux session:
+### Linux headless
 
 ```sh
-bash ~/bin/phone_exec_daemon.sh &
+cmake --preset linux-clang-debug -DIZANAGI_VK_PROFILE=BINDLESS
+cmake --build out/linux-clang-debug
+ctest --test-dir out/linux-clang-debug --output-on-failure
 ```
 
-### Unattended recovery after reboot
+Set `IZANAGI_TESTS_ALLOW_SKIP=1` only on a build runner where the absence of a
+Vulkan device is expected. It does not turn a failing GPU test into a pass.
 
-`tools/termux_boot_izanagi.sh` restores the whole rig with no interaction:
-the wake lock, the phone-exec daemon, and the GitHub runner itself. Install
-the `Termux:Boot` app (the build must be signed with the same key as the
-installed Termux — a GitHub debug Termux needs the GitHub debug Termux:Boot,
-not the F-Droid one), launch it once so Android leaves the stopped state,
-then install the script:
+### Linux XCB or Wayland
 
 ```sh
-mkdir -p ~/.termux/boot
-cp tools/termux_boot_izanagi.sh ~/.termux/boot/00-izanagi.sh
-chmod +x ~/.termux/boot/00-izanagi.sh
+cmake -S . -B build-wayland -G Ninja \
+  -DIZANAGI_WSI=WAYLAND -DIZANAGI_VK_PROFILE=BINDLESS \
+  -DIZANAGI_BUILD_EXAMPLES=OFF
+cmake --build build-wayland
 ```
 
-The script is idempotent: the daemon is detected through its heartbeat file
-and the runner through a procfs scan, so running it twice never starts a
-duplicate. Liveness must not be probed with `kill -0` (denied under `run-as`)
-or `pgrep -f` (matches its own invoking shell).
+Use `XCB` instead of `WAYLAND` for the XCB path. These configurations build
+the surface implementation; the repository does not yet provide a Linux
+example host.
 
-Note that Wireless debugging itself does not survive a reboot; re-enable it
-in Developer options if `adb` access is needed afterwards.
+### Android
 
-proot's `root` is the same Android uid as Termux, so the dispatcher grants a
-job no privileges it did not already have — but it does let job code run
-outside the proot view, so keep the workflow limited to reviewed `main`
-pushes.
+Android uses the NDK toolchain, `arm64-v8a`, `IZANAGI_WSI=ANDROID`, and the
+Bindless profile. The maintained command line and artifact checks live in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml). Physical Adreno
+testing lives in
+[`.github/workflows/android-phone-runner.yml`](../.github/workflows/android-phone-runner.yml);
+the workflow, not this guide, owns runner setup and replacement-driver details.
 
-Replacement drivers are selected with `IZANAGI_ADRENOTOOLS_DRIVER_DIR`,
-`IZANAGI_ADRENOTOOLS_DRIVER_NAME`, and `IZANAGI_ADRENOTOOLS_HOOK_DIR`; build
-the hosts with `-DIZANAGI_ADRENOTOOLS_ROOT=<libadrenotools checkout>`.
+## Shader tool and artifacts
 
-### Legacy lane: glibc/proot Turnip (manual)
+`slangc` is always a build-host executable. Discovery order is:
 
-The original lane builds on the phone under Debian and runs the suite against
-the pinned Debian ARM64 Mesa Turnip package with the KGSL backend. It is now
-manual only (`run_glibc_lane` input); native ARM64 Linux build coverage moved
-to GitHub's free `ubuntu-24.04-arm` runners.
+1. `IZANAGI_SLANGC`;
+2. `slangc` on `PATH`;
+3. the repository-managed package for the host OS and architecture.
 
-Register the runner with the ARM64 Linux runner package and a repository runner
-token generated in **Settings → Actions → Runners → New self-hosted runner**.
+Cross-compiling never executes a target-architecture shader compiler. Shader
+artifacts are profile-specific and are not interchangeable; see
+[ShaderABI.md](ShaderABI.md) and [VulkanProfiles.md](VulkanProfiles.md).
 
-When running the official ARM64 runner inside `proot`, set
-`DOTNET_GCHeapHardLimit=1C0000000` before `config.sh` and `run.sh`; otherwise
-CoreCLR may fail its default heap reservation with error `0x8007000E`.
+## Consume with CMake
 
-### Self-hosted runner security
+### FetchContent
 
-- Keep the phone workflow limited to reviewed `main` pushes and manual runs.
-  Do not route `pull_request` or unreviewed branch jobs to the phone.
-- Use the unique `android-phone` label and a repository-scoped runner group;
-  never use a generic self-hosted label by itself.
-- Do not place repository secrets, signing keys, personal SSH keys, or cloud
-  credentials on the phone. A job runs as the same unprivileged user that owns
-  the runner credentials.
-- Actions are pinned to immutable commit SHAs in the workflows. The phone job
-  removes its build directory after every run.
-- The runner process uses the unprivileged `runner` account inside Debian;
-  registration must never be performed as root.
+Replace `vX.Y.Z` with a release from the
+[releases page](https://github.com/Raikaru/izanagi/releases):
 
-## Consumer target
+```cmake
+include(FetchContent)
+FetchContent_Declare(izanagi
+    GIT_REPOSITORY https://github.com/Raikaru/izanagi.git
+    GIT_TAG        vX.Y.Z)
+FetchContent_MakeAvailable(izanagi)
 
-`Izanagi::Izanagi` (and the existing `Izanagi::izanagi`) resolve to the selected backend implementation.
+target_link_libraries(your_app PRIVATE Izanagi::izanagi)
+```
 
-## Platform status
+### Install and find_package
 
-See `docs/PlatformSupport.md`. Only Windows is certified today; other platforms are in incremental phases and must not be treated as supported merely because they compile.
+```sh
+cmake --preset dev-windows-msvc
+cmake --build --preset dev-windows-msvc
+cmake --install build --config Debug --prefix <install-prefix>
+```
+
+```cmake
+find_package(Izanagi CONFIG REQUIRED)
+target_link_libraries(your_app PRIVATE Izanagi::izanagi)
+```
+
+The exported target carries the include directory and C++20 requirement. The
+public header has no Vulkan-header dependency. CI builds an external
+`find_package` consumer against the installed package.
+
+## Verification coverage
+
+The maintained matrix is encoded in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml): Windows Debug and
+Release tests, Linux Clang/GCC and ARM64 builds, a Bindless Lavapipe run,
+Android cross-compilation, macOS host compilation, XCB/Wayland compilation,
+and installed-package consumer integration. Named physical-device evidence is
+tracked in [HardwareSupport.md](HardwareSupport.md), not inferred from a green
+compile job.

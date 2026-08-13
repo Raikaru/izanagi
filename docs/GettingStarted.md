@@ -1,186 +1,174 @@
 # Getting Started
 
-This walkthrough takes you from a fresh checkout to a working triangle with
-diagnostics. It assumes you know C++ and CMake; it does not assume Vulkan.
+This walkthrough covers a release checkout, a Windows example build, the
+smallest submission skeleton, and the three contracts new users need to know.
+It assumes C++ and CMake knowledge, not Vulkan.
 
-## 0. Check your GPU (30 seconds)
+## 1. Pin a release
 
-Izanagi needs either:
+Izanagi is pre-1.0. Choose a tag from the
+[releases page](https://github.com/Raikaru/izanagi/releases) and replace
+`vX.Y.Z` below:
 
-| Profile | Requirement |
-|---|---|
-| `IZANAGI_VK_NATIVE_1` | Vulkan 1.4 + `VK_EXT_descriptor_heap` + `VK_KHR_shader_untyped_pointers` + `VK_KHR_unified_image_layouts` (modern NVIDIA/AMD/Intel drivers) |
-| `IZANAGI_VK_BINDLESS_1` | Vulkan 1.2+ with the descriptor-indexing feature set (nearly everything else: dzn, Turnip, RADV, …) |
+```sh
+git clone --branch vX.Y.Z https://github.com/Raikaru/izanagi.git
+cd izanagi
+```
 
-The build includes `izanagi_capability_report`, which prints exactly what
-your device provides and which profile it satisfies:
+Do not ship against `main`; breaking changes land there before the next
+release. See [Stability.md](Stability.md).
+
+## 2. Choose a Vulkan profile
+
+| Build selection | Compiled profile | Use when |
+|---|---|---|
+| `-DIZANAGI_VK_PROFILE=NATIVE` | `IZANAGI_VK_NATIVE_1` | The device provides Vulkan 1.4, descriptor heaps, untyped pointers, and unified image layouts. |
+| `-DIZANAGI_VK_PROFILE=BINDLESS` | `IZANAGI_VK_BINDLESS_1` | The device satisfies the Vulkan 1.2+ descriptor-indexing profile. |
+
+Neither Vulkan version nor GPU generation is sufficient by itself. The
+capability report evaluates exact features and limits:
 
 ```sh
 build/bin/Debug/izanagi_capability_report.exe
 ```
 
-If you see `bindless profile: supported`, you are good with the default
-profile. If you see a missing-requirement list, that is the complete answer
-— see [VulkanProfiles.md](VulkanProfiles.md) for the definitions and
-[HardwareSupport.md](HardwareSupport.md) for the qualified-device table.
+The full definitions are in [VulkanProfiles.md](VulkanProfiles.md); named test
+evidence is in [HardwareSupport.md](HardwareSupport.md).
 
-## 1. Get the code — pin a tag
+## 3. Build and run
 
-Never build from `main` (see [Stability.md](Stability.md)):
-
-```sh
-git clone --branch v0.2.0 https://github.com/Raikaru/izanagi.git
-cd izanagi
-```
-
-## 2. Build
+Requirements: CMake 3.28+, Visual Studio 2022 with C++20 support, and a Vulkan
+loader. The Bindless profile is used here because it covers the broader class
+of existing drivers:
 
 ```sh
-cmake -S . -B build --preset dev-windows-msvc
-cmake --build build --config Debug
-```
-
-No Vulkan SDK needed: Vulkan-Headers, volk, VMA and slangc are fetched
-automatically. Full details (other generators, Android, WSL/Linux,
-validation layers) are in [Build.md](Build.md).
-
-## 3. Run the triangle
-
-```sh
+cmake --preset dev-windows-msvc -DIZANAGI_VK_PROFILE=BINDLESS
+cmake --build --preset dev-windows-msvc
+ctest --test-dir build -C Debug --output-on-failure
 build/bin/Debug/izanagi_examples.exe
 ```
 
-Keys: `M`/`N` cycle examples, `ESC` quits. Headless verification:
+CMake acquires Vulkan-Headers, volk, VMA, and the host `slangc` tool. A Vulkan
+SDK is needed only for validation layers. Other platforms, WSI choices, and
+install builds are covered by [Build.md](Build.md).
+
+The Win32 host can run a deterministic presentation smoke:
 
 ```sh
-build/bin/Debug/izanagi_examples.exe --example hello_triangle --screenshot out.png --frames 30
+build/bin/Debug/izanagi_examples.exe --cycle-test 1 --no-vsync --frame-latency 1
 ```
 
-Presentation controls are available directly in the Win32 harness:
+Use `--help` for the current harness options rather than copying a fixed list
+from documentation.
 
-```sh
-build/bin/Debug/izanagi_examples.exe --no-vsync --frame-latency 1
-build/bin/Debug/izanagi_examples.exe --vsync --frame-latency 2
-```
-
-Applications use the same policy explicitly:
-
-```cpp
-SurfaceCapabilities caps = get_surface_capabilities(device);
-SurfaceConfiguration surface{
-    .format        = caps.formats[0],
-    .usages        = UsageFlags::ColorAttachment,
-    .width         = width,
-    .height        = height,
-    .present_mode  = choose_present_mode(caps.present_modes, vsync),
-    .frame_latency = 2,
-};
-configure_surface(device, surface);
-```
-
-## 4. Your first app
-
-A minimal device + submit loop:
+## 4. Minimal submission
 
 ```cpp
 #include <izanagi/gpu.h>
-#include <cstdio>
 
 using namespace gpu;
 
 int main() {
-    // Diagnostics: every deterministic failure is reported here.
     DeviceDesc desc{};
-    desc.log_callback = [](LogLevel lvl, Span<const char> msg, uint32_t line,
-                           Span<const char> file, void*) {
-        std::printf("[%d] %.*s:%u: %.*s\n", (int)lvl, (int)file.size(), file.data(),
-                    line, (int)msg.size(), msg.data());
+    desc.log_callback = [](LogLevel level, Span<const char> message,
+                           uint32_t line, Span<const char> file, void*) {
+        // Route level, file, line, and message to your logger.
     };
     desc.log_level = LogLevel::Debug;
 
     Device device = create_device(desc);
-    if (device == nullptr) { return 1; }
-
-    // GPU memory is malloc: a 64-bit device address.
-    GpuPtr vertices = malloc(device, sizeof(float) * 3 * 3, Memory::Gpu);
+    if (device == nullptr) {
+        return 1;
+    }
 
     Queue queue = get_queue(device);
-    CommandBuffer cb = queue_start_command_recording(queue);
+    CommandBuffer commands = queue_start_command_recording(queue);
 
-    // ... record commands (see the examples) ...
+    // Record copies, dispatches, or draws.
 
-    cmd_finalize(cb);
-    Submission s = queue_submit(queue, Span<const CommandBuffer>(&cb, 1));
-    wait_submission(s);   // loading-phase style; see below for frame pacing
+    cmd_finalize(commands);
+    Submission submitted = queue_submit(queue, {&commands, 1});
+    if (submitted.status != SubmitStatus::Success ||
+        !wait_submission(submitted)) {
+        destroy_device(device);
+        return 1;
+    }
 
-    free(device, vertices);
     destroy_device(device);
     return 0;
 }
 ```
 
-The three things every new user should internalize before writing real
-code:
+The examples are the executable reference for pipeline creation, shader
+arguments, rendering, presentation, and readback.
 
-1. **There are no descriptor sets or bindings.** Textures and samplers are
-   indices into a device-global heap; shaders resolve them through the
-   `izanagi.slang` prelude. See [PortingFromVulkan.md](PortingFromVulkan.md).
-2. **Pipelines compile asynchronously.** Use `request_graphics_pipeline` +
-   `cmd_set_pipeline`'s false return (bind a fallback or skip) for frame
-   code; use blocking `create_graphics_pipeline` only for loading screens.
-3. **Lifetime is explicit.** `free` is only safe when the GPU cannot touch
-   the resource; `free_after(resource, submission)` is the normal path for
-   anything reachable by GPU pointers.
+## 5. Core contracts
 
-For streaming uploads, request `get_queue(device, QueueType::Transfer)`.
-It returns a transfer-only queue when the device exposes one and otherwise
-aliases the default queue. Pass the upload `Submission` back to a graphics
-`queue_submit` as a `SubmissionWait`; this performs the GPU-side ownership
-and memory handoff without blocking the CPU.
+### Resources are pointer- or handle-addressed
 
-The examples (`examples/hello_triangle`, `examples/compute_texture`,
-`examples/textured_cube`) are the reference for every pattern above.
+`gpu::malloc` returns a `GpuPtr`, not a public buffer object. Textures,
+texture views, samplers, and pipelines use generation-checked opaque handles.
+Shaders resolve texture and sampler handles through `shaders/izanagi.slang`.
+There are no public descriptor sets or binding layouts.
+
+### Pipelines compile asynchronously
+
+Use `request_compute_pipeline` or `request_graphics_pipeline` in frame-facing
+code. `cmd_set_pipeline` returns `false` while a pipeline is pending or after
+it fails; the application binds an explicit fallback or skips the work.
+Blocking `create_*_pipeline` calls are for loading paths.
+
+### Lifetime follows submissions
+
+Immediate `free` is valid only when no recorded, pending, in-flight, or future
+GPU access exists. For resources reachable through GPU pointers or descriptor
+handles, use `free_after(..., submission)` with their last successful
+submission. See [Architecture.md](Architecture.md) and
+[IntegrationPatterns.md](IntegrationPatterns.md).
+
+## Transfer uploads
+
+```cpp
+Queue upload_queue = get_queue(device, QueueType::Transfer);
+Submission uploaded = queue_submit(upload_queue, {&upload_commands, 1});
+
+SubmissionWait ready{
+    .submission = uploaded,
+    .stage = StageFlags::VertexShader, // first stage that consumes the upload
+};
+Submission rendered =
+    queue_submit(graphics_queue, {&draw_commands, 1}, {}, {}, {&ready, 1});
+```
+
+`QueueType::Transfer` selects a dedicated transfer queue when available and
+aliases the graphics queue otherwise. `SubmissionWait` performs the GPU-side
+cross-queue memory and ownership handoff without a CPU wait.
+
+## Presentation
+
+Query `get_surface_capabilities`, choose a reported format and present mode,
+then pass both through `SurfaceConfiguration`. The helper
+`choose_present_mode(caps.present_modes, vsync)` provides deterministic
+fallback when the preferred mode is unavailable. `frame_latency` must be in
+the public in-flight range and is capped by the swapchain image count.
 
 ## Diagnostics
 
-Set `log_level = LogLevel::Debug` and keep the callback on during
-development. Failure messages are actionable and specific:
+Keep a `ProcLogCallback` enabled during development. Deterministic failures
+report their source location and relevant handle, command, or retained object
+name. `enable_validation = true` forwards Vulkan validation messages through
+the same callback when `VK_LAYER_KHRONOS_validation` is installed.
 
-```
-[ERROR] resources.cpp:464: free_after(texture): invalid or stale handle
-[ERROR] commands.cpp:138: command references a pointer outside a live allocation
-```
-
-Every message carries `file:line`. Handle failures report the handle value
-and the generation mismatch. `enable_validation = true` additionally
-forwards driver validation messages through the same callback (requires the
-Vulkan SDK validation layer installed).
-
-Use `set_debug_name` on buffers, textures, and pipelines, and bracket passes
-with `cmd_push_debug_group` / `cmd_pop_debug_group`. Izanagi retains the
-names for deterministic errors and forwards them to RenderDoc through
-`VK_EXT_debug_utils` when available.
-
-## Troubleshooting
-
-- **"Failed to create Vulkan instance"** — no loader/driver, or the driver
-  is below the profile floor. Run `izanagi_capability_report`.
-- **"bindless profile missing requirement:" followed by names** — this is
-  the complete, precise list; each name maps to a Vulkan feature or limit
-  documented in [VulkanProfiles.md](VulkanProfiles.md).
-- **Command buffer rejected at submit** — a command recorded a
-  deterministic failure; the log callback names the exact reason.
-- **A stale-handle error you don't understand** — you freed something
-  twice, or used a handle after `free_after` invalidated it. Handles are
-  generation-checked: the second use is always the bug.
+Use `set_debug_name` for buffers, textures, and pipelines. Bracket passes with
+`cmd_push_debug_group` and `cmd_pop_debug_group`. The Vulkan backend forwards
+those names and regions through `VK_EXT_debug_utils` when available.
 
 ## Next
 
-- [PortingFromVulkan.md](PortingFromVulkan.md) — the mental-model map.
-- [Architecture.md](Architecture.md) — retirement, pools, the compiler
-  worker.
-- [IntegrationPatterns.md](IntegrationPatterns.md) — renderer-owned frame
-  transactions, transient rings, and indirect resource lifetimes.
-- [PipelineCompilation.md](PipelineCompilation.md) — async compile and the
-  persistent cache.
-- [ShaderABI.md](ShaderABI.md) — the shader side of the pointer model.
+- [PortingFromVulkan.md](PortingFromVulkan.md): mental-model translation.
+- [Architecture.md](Architecture.md): threading, submissions, and retirement.
+- [IntegrationPatterns.md](IntegrationPatterns.md): renderer ownership and
+  transient data.
+- [PipelineCompilation.md](PipelineCompilation.md): async compilation and
+  persistent caches.
+- [ShaderABI.md](ShaderABI.md): CPU/shader layout and profile artifact rules.

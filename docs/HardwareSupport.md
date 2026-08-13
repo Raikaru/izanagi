@@ -1,83 +1,65 @@
 # Hardware support
 
-Support policy: **feature-based, never generation-name or Vulkan-version
-based**. A device is supported when the exact capability profile's feature
-bits, limits, shader ABI, and conformance tests pass. A GPU generation name is
-only a *testing* label, used to organize which devices were actually run.
+Izanagi support is feature-based and evidence-based. A Vulkan version or GPU
+generation is useful context, but it is never a support guarantee. The
+selected profile's feature bits, limits, shader ABI, and complete test suite
+decide.
 
-## Tested hardware
+See [PlatformSupport.md](PlatformSupport.md) for the meaning of certified,
+qualified, CI-exercised, and compile-only.
 
-| Device | OS / driver | API | Profile | Result |
-|---|---|---|---|---|
-| NVIDIA GeForce RTX 4080 Laptop GPU | Windows 11, NVIDIA driver 610.88 | 1.4.341 | Native + Bindless | Full suite passes (both profiles) |
-| NVIDIA GeForce RTX 4080 via D3D12 (**dzn**) | WSL Ubuntu / mesa 26.2.0 dzn | 1.2.354 | Bindless | Full suite passes (43/43, Debug + Release) |
-| Lavapipe (mesa, CPU) | CI runner (ubuntu-latest, headless) | 1.x (CPU) | Bindless | Probe job added; qualification pending first successful CI run (non-authoritative) |
-| Qualcomm Adreno 650 (Galaxy S20+ 5G) via Mesa **Turnip** | Debian arm64 (Termux/proot), mesa 26.2.0-devel Turnip/KGSL | 1.3.354 | Bindless | Full suite passes |
+## Evidence matrix
 
-**Physical hardware tested: the RTX 4080 rig and the Adreno 650 phone.** No Maxwell, Polaris,
-Skylake, GCN, or Intel device has been qualified. The bindless profile's
-legacy fallbacks are now **runtime-exercised**: the legacy copy/blit path and
-the private static graphics-state fallback run the full suite on the RTX 4080
-Windows rig (both profiles, forced configurations) and on the WSL dzn rig
-(the dzn configuration selects exactly those fallbacks). RADV/NVK/ANV remain
-**unqualified** (no hardware; the `tools/run_hardware_qualification.sh`
-bundle + hardware-qualification issue template exist for volunteered
-reports).
+| Configuration | Profile | Evidence | Scope |
+|---|---|---|---|
+| NVIDIA GeForce RTX 4080 Laptop GPU; Windows 11; NVIDIA driver 610.88; Vulkan 1.4.341 | Native and Bindless | Complete suite passes on both profiles, including forced legacy-copy and static-graphics-state routes. | Certified Windows baseline. |
+| NVIDIA GeForce RTX 4080 exposed through D3D12; WSL Ubuntu; Mesa dzn 26.2.0; Vulkan 1.2.354 | Bindless | Dated qualification run passed the then-current complete suite and archived capability output. | Qualified dzn configuration; not native Linux GPU-driver coverage. |
+| Qualcomm Adreno 650; Android/bionic; pinned Turnip replacement driver loaded through adrenotools | Bindless | The physical phone CI runner executes the capability report and headless API suite on `main`. | Qualified physical-GPU API configuration; Android presentation remains unqualified. |
+| Lavapipe on the GitHub Linux runner | Bindless | Capability-gated complete-suite CI run and archived report. | Software-device CI coverage only; not physical-hardware qualification. |
 
-### dzn (Vulkan-on-D3D12 in WSL) — qualified on the test rig — 2026-08-12
+The active phone and Lavapipe jobs are the current evidence for their rows.
+The dzn record is dated; it should not be read as proof for public contracts
+added after that qualification run.
 
-mesa 26.2.0's dzn (RTX 4080 through D3D12, api 1.2.354): **every
-bindless-required capability is present** (BDA, int64, scalar block layout,
-non-uniform indexing, sampled/storage update-after-bind, partially-bound,
-runtime + variable-count arrays, update-unused-while-pending, timeline
-semaphores, draw-indirect-count; 1M descriptor capacities), plus dynamic
-rendering + synchronization2 (KHR forms). Missing: `VK_KHR_copy_commands2`
-and `VK_EXT_extended_dynamic_state` — the dispatch route selects the private
-legacy-copy fallback and the private static graphics-state fallback, and the
-**full 43-test suite passes** (compute, copies, graphics draws with private
-static variants, variant Pending/recovery, and the baked-state readback
-matrix — cull, front-face, depth-compare, stencil-compare, viewport —
-verified through pixel readbacks). The stencil pipeline uses a single
-combined Depth24PlusStencil8 format (dzn has no standalone S8 image format
-and no separate depth/stencil DSV formats).
-Caveats: the experimental dzn driver traps the process on any malformed
-SPIR-V (the bad-shader failure-injection test is gated off on the
-limited-1.2 dispatch signature), and dzn's `WARNING: dzn is not a conformant
-Vulkan implementation` banner is expected. "Qualified" here means
-suite-green on this test rig — not a driver-conformance claim.
+No RADV, NVK, ANV, Maxwell, Polaris, Skylake, Vega, or other GCN configuration
+has been qualified. Use `tools/run_hardware_qualification.sh` and the
+hardware-qualification issue template to contribute a report.
 
-## Tiers
+## dzn qualification record
 
-- **Supported**: a family is listed only after its oldest claimed
-  representative passes the complete profile + conformance + stress suites on
-  physical hardware. None besides the RTX 4080 (Windows) are claimed.
-- **Experimental** (best effort, profile must still pass, no performance
-  promise): no devices yet.
-- **Unsupported / rejected**: devices lacking real shader-addressable GPU
-  pointers, usable non-uniform global indexing, the shader ABI, sufficient
-  descriptor capacity, or reliable submission/lifetime semantics. Rejection is
-  feature-based with a complete reason list — no hardcoded blacklist.
+The 2026-08-12 WSL run used Mesa dzn 26.2.0 on the RTX 4080 through D3D12. It
+reported the complete Bindless requirement set: buffer device address,
+shader int64, scalar block layout, required non-uniform and update-after-bind
+features, timeline semaphores, draw-indirect-count, and sufficient descriptor
+capacities. Dynamic rendering and synchronization2 were available through
+KHR routes.
+
+`VK_KHR_copy_commands2` and `VK_EXT_extended_dynamic_state` were absent, so
+the run exercised both private fallbacks: legacy copy/blit commands and
+asynchronously compiled static graphics-state variants. Pixel readbacks
+covered culling, front face, depth, stencil, and viewport behavior.
+
+dzn identifies itself as non-conformant Vulkan and can terminate on malformed
+SPIR-V. “Qualified” here means the Izanagi suite passed on this exact rig; it
+is not a Vulkan conformance claim.
 
 ## Descriptor capacities
 
-The bindless profile allocates the global arrays from the update-after-bind
-ceilings (per-stage and per-set) and the shared combined budget
-(`maxPerStageUpdateAfterBindResources` /
-`maxUpdateAfterBindDescriptorsInAllPools`). On the RTX 4080 the practical
-capacities are the public constants 65536 sampled / 65536 storage / 4096
-samplers; the exact numbers per device are reported by
-`izanagi_capability_report` and `device_limits`.
+The Bindless profile sizes its global sampled-image, storage-image, and
+sampler arrays from the device's update-after-bind limits and shared combined
+budget. The profile minimums are documented in
+[VulkanProfiles.md](VulkanProfiles.md). Exact capacities for a device come
+from `izanagi_capability_report` and `device_limits`; do not copy numbers from
+another GPU.
 
-## Known driver limitations
+## Known limits
 
-- The initial bindless slice requires dynamic rendering + synchronization2 +
-  update-unused-while-pending (gated with a logged reason). Devices without
-  `VK_KHR_copy_commands2` get the legacy copy/blit fallback; devices without
-  `VK_EXT_extended_dynamic_state` get the private static graphics-state
-  fallback (static pipeline variants + the `request_graphics_state` prewarm).
-  Both are selected by capability, never by vendor or generation name.
-- Validation-layer runs require the Vulkan SDK's `VK_LAYER_KHRONOS_validation`
-  (test 33 reports when the layer is absent).
-- No guarantee is based on the Vulkan version alone; no guarantee is based on
-  a GPU generation name. A family is advertised only after the exact test
-  matrix above passes on physical hardware.
+- Bindless requires dynamic rendering, synchronization2, and
+  update-unused-while-pending. A missing required capability rejects device
+  creation with a complete reason list.
+- Devices without `VK_KHR_copy_commands2` use the legacy copy/blit route.
+- Devices without `VK_EXT_extended_dynamic_state` use private static pipeline
+  variants; applications can prewarm them with `request_graphics_state`.
+- Validation runs require `VK_LAYER_KHRONOS_validation`.
+- The stock Qualcomm driver on the qualified phone does not meet the Bindless
+  profile. The passing Android row uses the pinned Turnip replacement driver.
