@@ -28,6 +28,8 @@ The modern path. Private mechanisms:
 Required extensions/features: see `src/vk/device.cpp`
 (`kRequiredDeviceExtensions`, the feature chain, and the post-creation
 verification).
+GPUInfo's live per-feature observations and their limits are summarized in
+[HardwareSupport.md](HardwareSupport.md#gpuinfo-extension-observations).
 
 ### IZANAGI_VK_BINDLESS_1 (BackendProfile::VulkanBindless)
 

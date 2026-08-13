@@ -8,6 +8,45 @@ decide.
 See [PlatformSupport.md](PlatformSupport.md) for the meaning of certified,
 qualified, CI-exercised, and compile-only.
 
+## GPUInfo extension observations
+
+The Native profile's distinguishing feature bits can be checked against
+GPUInfo's live extension database:
+
+- [`descriptorHeap`](https://vulkan.gpuinfo.org/listdevicescoverage.php?extensionname=VK_EXT_descriptor_heap&extensionfeature=descriptorHeap&platform=all)
+- [`shaderUntypedPointers`](https://vulkan.gpuinfo.org/listdevicescoverage.php?extensionname=VK_KHR_shader_untyped_pointers&extensionfeature=shaderUntypedPointers&platform=all)
+- [`unifiedImageLayouts`](https://vulkan.gpuinfo.org/listdevicescoverage.php?extensionname=VK_KHR_unified_image_layouts&extensionfeature=unifiedImageLayouts&platform=all)
+
+The table below is a 2026-08-13 snapshot of positive feature reports. “Yes”
+means GPUInfo contains a report with that feature set to true for the named
+device or group; “partial” means only some named members have a positive
+report; “none” means the positive-results page contains no member of that
+group. Absence is not proof that a newer driver cannot support the feature.
+
+GPUInfo reports are user-submitted: stale drivers coexist with current ones,
+and one GPU can appear under several names. The grouping below is only a
+readable index into those reports, never a family-wide guarantee.
+
+| GPUInfo device or driver group | Descriptor heap | Untyped pointers | Unified layouts | Native-profile reading |
+|---|---:|---:|---:|---|
+| NVIDIA proprietary: listed GTX 1650/1660, RTX 20/30/40/50, MX450/550, and Quadro/RTX workstation entries | Yes | Yes | Yes | Native candidates. Same-report examples include [GTX 1650](https://vulkan.gpuinfo.org/displayreport.php?id=50905) and [RTX 4080](https://vulkan.gpuinfo.org/displayreport.php?id=50636). |
+| NVIDIA proprietary Maxwell/Pascal, including GTX 10 series | None | Yes | Yes | Current reports fail the Native trio at descriptor heap. This does not rule out Bindless. |
+| NVK | Partial: [RTX 4070 / AD104](https://vulkan.gpuinfo.org/displayreport.php?id=49497) | Yes on AD104 | Yes on AD104 and some older GPUs | The AD104 report is a Native candidate; older NVK reports lack descriptor heap. |
+| AMD RADV RDNA 3/4 and recent APUs | Partial | Yes | Partial | Same-report Native candidates exist for [Phoenix 780M](https://vulkan.gpuinfo.org/displayreport.php?id=50941), Strix1 890M, Navi33 RX 7600, Navi31 RX 7900 GRE/XT, and [GFX1201 RX 9070 XT](https://vulkan.gpuinfo.org/displayreport.php?id=50696). Do not generalize to every RDNA 3/4 name. |
+| AMD RADV GCN, Vega, RDNA 1, and RDNA 2 | Partial | Yes | None | Current reports fail the Native trio at unified layouts. Examples with descriptor heap include Renoir, Polaris 12, Navi 21/22/24; this does not establish Bindless support or capacity. |
+| Intel ANV: CFL, TGL, DG2, MTL, ARL, and BMG reports | Yes | Yes | None | Current reports fail the Native trio at unified layouts. |
+| Qualcomm proprietary 512.863 reports represented by [Xiaomi 23049RAD8C](https://vulkan.gpuinfo.org/displayreport.php?id=50034) | Yes | Yes | Yes | The same report has all three bits but exposes Vulkan 1.3.295, below Izanagi Native's Vulkan 1.4 gate. |
+| Apple/MoltenVK M1 through M5 reports | None | Yes | Yes | Current reports fail the Native trio at descriptor heap. |
+| Mesa llvmpipe 26.2.0 reports | Yes | Yes | Yes | Native candidate and CI-exercised; see the evidence matrix. [Representative report](https://vulkan.gpuinfo.org/displayreport.php?id=50906). |
+
+Three green feature cells still do **not** mean “supported by Izanagi.” They
+must occur on the same current device/driver report, and Native additionally
+requires Vulkan 1.4, maintenance5/6, the required commands, limits, and shader
+ABI. Run `izanagi_capability_report`, then the complete suite. The three
+GPUInfo pages also cannot determine Bindless support: that profile has a
+larger feature-and-capacity requirement set documented in
+[VulkanProfiles.md](VulkanProfiles.md).
+
 ## Evidence matrix
 
 | Configuration | Profile | Evidence | Scope |

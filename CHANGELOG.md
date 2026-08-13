@@ -42,6 +42,10 @@ changes are permitted in every 0.x release and are always listed under
 - Swapchain reconfiguration creates a fresh frame-pacing timeline, avoiding
   non-monotonic timeline values after `frame_idx` resets.
 
+### Documentation
+- Added a dated GPUInfo feature matrix for Native-profile candidates, with
+  per-driver caveats and a strict separation from qualified support.
+
 ## [0.2.0] — 2026-08-13
 
 ### Breaking (from 0.1.0)
