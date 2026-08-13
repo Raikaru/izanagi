@@ -144,7 +144,7 @@ target_include_directories(izanagi
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-
+target_compile_features(izanagi PUBLIC cxx_std_20)
 # volk_headers / VMA are compile-time-only deps of the .cpp files; their code
 # is baked into the static lib and the public header (gpu.h) is Vulkan-free,
 # so the installed export must not reference them. $<BUILD_INTERFACE:...>

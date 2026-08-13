@@ -185,3 +185,45 @@ jobs:
       - name: Verify Android artifact
         shell: bash
         run: test -f build-android/lib/libizanagi.a
+
+  consumer-integration:
+    # Stranger test: install a built Izanagi and consume it via
+    # find_package exactly as an external project would. Proves the
+    # install/export path (IzanagiConfig + IzanagiTargets) on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Configure (headless, install-ready)
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/izanagi-prefix
+          -DIZANAGI_WSI=HEADLESS -DIZANAGI_BUILD_TESTS=OFF
+          -DIZANAGI_BUILD_EXAMPLES=OFF
+      - name: Build and install
+        run: |
+          cmake --build build
+          cmake --install build
+      - name: Configure consumer project
+        run: |
+          mkdir -p /tmp/consumer
+          cat > /tmp/consumer/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.28)
+          project(izanagi_consumer CXX)
+          find_package(Izanagi CONFIG REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE Izanagi::izanagi)
+          EOF
+          cat > /tmp/consumer/main.cpp <<'EOF'
+          #include <izanagi/gpu.h>
+          int main() {
+              gpu::DeviceDesc desc{};
+              desc.log_level = gpu::LogLevel::Off;
+              gpu::Device d = gpu::create_device(desc);
+              if (d != nullptr) { gpu::destroy_device(d); }
+              return 0;
+          }
+          EOF
+          cmake -S /tmp/consumer -B /tmp/consumer/build -G Ninja \
+                -DCMAKE_PREFIX_PATH=${{ runner.temp }}/izanagi-prefix
+      - name: Build consumer
+        run: cmake --build /tmp/consumer/build
