@@ -139,7 +139,7 @@ FetchContent_MakeAvailable(izanagi)
 target_link_libraries(your_app PRIVATE Izanagi::izanagi)
 ```
 
-Pin the newest tag from the [releases](https://github.com/Raikaru/izanagi/tags)
+Pin the newest tag from the [releases](https://github.com/Raikaru/izanagi/releases)
 page and read the `### Breaking` entries in [CHANGELOG.md](CHANGELOG.md)
 between your current tag and the new one when upgrading.
 
