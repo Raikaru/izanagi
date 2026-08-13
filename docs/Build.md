@@ -149,7 +149,7 @@ public header has no Vulkan-header dependency. CI builds an external
 
 The maintained matrix is encoded in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml): Windows Debug and
-Release tests, Linux Clang/GCC and ARM64 builds, a Bindless Lavapipe run,
+Release tests, Linux Clang/GCC and ARM64 builds, a Native Mesa llvmpipe run,
 Android cross-compilation, macOS host compilation, XCB/Wayland compilation,
 and installed-package consumer integration. Named physical-device evidence is
 tracked in [HardwareSupport.md](HardwareSupport.md), not inferred from a green

@@ -33,6 +33,8 @@ changes are permitted in every 0.x release and are always listed under
   `get_gpu_timer_result`.
 - Installed-package consumer CI now builds a standalone `find_package`
   application, including enforcement of the exported C++20 requirement.
+- The Linux software-device lane now runs the complete Native profile suite
+  on current Mesa llvmpipe and archives its capability report.
 
 ### Fixed
 - Multi-draw indirect count now validates device limits, count/argument/index

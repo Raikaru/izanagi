@@ -15,9 +15,9 @@ qualified, CI-exercised, and compile-only.
 | NVIDIA GeForce RTX 4080 Laptop GPU; Windows 11; NVIDIA driver 610.88; Vulkan 1.4.341 | Native and Bindless | Complete suite passes on both profiles, including forced legacy-copy and static-graphics-state routes. | Certified Windows baseline. |
 | NVIDIA GeForce RTX 4080 exposed through D3D12; WSL Ubuntu; Mesa dzn 26.2.0; Vulkan 1.2.354 | Bindless | Dated qualification run passed the then-current complete suite and archived capability output. | Qualified dzn configuration; not native Linux GPU-driver coverage. |
 | Qualcomm Adreno 650; Android/bionic; pinned Turnip replacement driver loaded through adrenotools | Bindless | The physical phone CI runner executes the capability report and headless API suite on `main`. | Qualified physical-GPU API configuration; Android presentation remains unqualified. |
-| Lavapipe on the GitHub Linux runner | Bindless | Capability-gated complete-suite CI run and archived report. | Software-device CI coverage only; not physical-hardware qualification. |
+| llvmpipe (LLVM 22.1.8, 256 bits); openSUSE Tumbleweed; Mesa 26.2.0; Vulkan 1.4.354 | Native | Complete-suite CI run and archived capability report (`profile_supported: true`, no missing features). | Software-device CI coverage only; not physical-hardware qualification. |
 
-The active phone and Lavapipe jobs are the current evidence for their rows.
+The active phone and llvmpipe jobs are the current evidence for their rows.
 The dzn record is dated; it should not be read as proof for public contracts
 added after that qualification run.
 
