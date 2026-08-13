@@ -8,7 +8,11 @@
 
 namespace gpu {
 
-static void cmd_record_fail(CommandBufferImpl* cb, const char* reason);
+static void cmd_record_fail_impl(CommandBufferImpl* cb, uint32_t line, const char* file,
+                                 const char* reason);
+// Deterministic recording failure with the failing command's ordinal and
+// the call-site file:line in the log message.
+#define cmd_record_fail(cb, reason) cmd_record_fail_impl(cb, __LINE__, __FILE__, reason)
 
 // Vulkan 1.3 commands are available on 1.2 devices only through their KHR/EXT
 // extensions. There are NO compile-time aliases: dispatch is route-aware
@@ -114,8 +118,12 @@ static void reset_command_pool(DeviceImpl* d, CommandPool* pool) {
 // the public handle. Returns null (and marks the recording failed) for
 // invalid or stale handles.
 static TextureImpl* retain_texture(CommandBufferImpl* cmd, Handle<Texture> tex) {
-    TextureImpl* rec = cmd->device->texture_pool.try_get(handle_cast<TextureImpl>(tex));
+    const char* why = nullptr;
+    TextureImpl* rec = cmd->device->texture_pool.try_get_ex(handle_cast<TextureImpl>(tex), &why);
     if (rec == nullptr) {
+        log_fmt(cmd->device, LogLevel::Error, __LINE__, __FILE__,
+                "command #%u: invalid texture handle 0x%016llx (%s)",
+                cmd->command_index, (unsigned long long)tex.h, why ? why : "rejected");
         cmd_record_fail(cmd, "command references an invalid or stale texture handle");
         return nullptr;
     }
@@ -136,6 +144,9 @@ static bool retain_buffer(CommandBufferImpl* cmd, GpuPtr ptr, VkDeviceSize size,
     if (ptr == 0) { return size == 0; }   // zero is a legal "no data" pointer only when no range is required
     BufferRange r = find_buffer_range(cmd->device, ptr, size);
     if (r.handle.h == 0) {
+        log_fmt(cmd->device, LogLevel::Error, __LINE__, __FILE__,
+                "command #%u: pointer 0x%016llx (range %llu bytes) is outside a live allocation",
+                cmd->command_index, (unsigned long long)ptr, (unsigned long long)size);
         cmd_record_fail(cmd, "command references a pointer outside a live allocation");
         return false;
     }
@@ -226,6 +237,7 @@ CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool) {
     CommandBufferImpl* result        = &pool->command_buffers[pool->buffer_free_idx];
     result->wait_for_surface_texture = false;
     result->signal_surface_texture   = false;
+    result->command_index            = 0;
     pool->buffer_free_idx++;
     pool->outstanding++;   // the pool stays checked out until this cb is submitted
     return result;
@@ -434,14 +446,22 @@ Submission queue_submit(Queue                     q,
     // semaphore concurrently with a submit that uses it remains an
     // application lifetime error.
     for (uint32_t i = 0; i < wait_semaphores.size(); ++i) {
-        if (d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(wait_semaphores[i].semaphore)) == nullptr) {
-            IZ_LOG(d, LogLevel::Error, "queue_submit: invalid or stale wait semaphore handle");
+        const char* why = nullptr;
+        if (d->semaphore_pool.try_get_ex(handle_cast<SemaphoreImpl>(wait_semaphores[i].semaphore),
+                                         &why) == nullptr) {
+            log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                    "queue_submit: invalid wait semaphore handle 0x%016llx (%s)",
+                    (unsigned long long)wait_semaphores[i].semaphore.h, why ? why : "rejected");
             return Submission{.queue = q, .value = q->timeline_value + 1, .status = SubmitStatus::Error};
         }
     }
     for (uint32_t i = 0; i < signal_semaphores.size(); ++i) {
-        if (d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(signal_semaphores[i].semaphore)) == nullptr) {
-            IZ_LOG(d, LogLevel::Error, "queue_submit: invalid or stale signal semaphore handle");
+        const char* why = nullptr;
+        if (d->semaphore_pool.try_get_ex(handle_cast<SemaphoreImpl>(signal_semaphores[i].semaphore),
+                                         &why) == nullptr) {
+            log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                    "queue_submit: invalid signal semaphore handle 0x%016llx (%s)",
+                    (unsigned long long)signal_semaphores[i].semaphore.h, why ? why : "rejected");
             return Submission{.queue = q, .value = q->timeline_value + 1, .status = SubmitStatus::Error};
         }
     }
@@ -942,10 +962,15 @@ static void backend_set_scissor_with_count(DeviceImpl* d, VkCommandBuffer cmd, u
 // regions; any failure marks the command buffer failed deterministically
 // (no Vulkan command is issued with mismatched data).
 
-static void cmd_record_fail(CommandBufferImpl* cb, const char* reason) {
+// Marks the command buffer failed; the log line carries the failing command's
+// ordinal and the call-site file:line (invoked through the cmd_record_fail
+// macro).
+static void cmd_record_fail_impl(CommandBufferImpl* cb, uint32_t line, const char* file,
+                                 const char* reason) {
     cb->recording_failed = true;
     cb->fail_reason      = reason;
-    IZ_LOG(cb->device, LogLevel::Error, reason);
+    log_fmt(cb->device, LogLevel::Error, line, file, "%s (command #%u)", reason,
+            cb->command_index);
 }
 
 void convert_buffer_copy_regions(const VkBufferCopy2* src, uint32_t count, VkBufferCopy* dst) {
@@ -1133,6 +1158,7 @@ static bool texture_copy_buffer_bytes(const BufferTextureCopyInfo& info, Format 
 }
 
 void cmd_memcpy(CommandBuffer cmd, GpuPtr destGpu, GpuPtr srcGpu, size_t size) {
+    cmd->command_index++;
 
     if (srcGpu == 0 || destGpu == 0) {
         cmd_record_fail(cmd, "cmd_memcpy: null source/destination pointer");
@@ -1162,6 +1188,7 @@ void cmd_copy_to_texture(CommandBuffer                cmd,
                          GpuPtr                       srcPtr,
                          Handle<Texture>              texture,
                          const BufferTextureCopyInfo& info) {
+    cmd->command_index++;
 
     TextureImpl* tex = retain_texture(cmd, texture);
     if (tex == nullptr) { return; }
@@ -1213,6 +1240,7 @@ void cmd_copy_from_texture(CommandBuffer                cmd,
                            Handle<Texture>              texture,
                            GpuPtr                       destGpu,
                            const BufferTextureCopyInfo& info) {
+    cmd->command_index++;
 
     TextureImpl* tex = retain_texture(cmd, texture);
     if (tex == nullptr) { return; }
@@ -1305,6 +1333,7 @@ void cmd_barrier(CommandBuffer cmd, StageFlags before, StageFlags after) {
 }
 
 void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
+    cmd->command_index++;
 
     TextureImpl* tex = retain_texture(cmd, texture);
     if (tex == nullptr) { return; }
@@ -1362,6 +1391,7 @@ void cmd_generate_mipmaps(CommandBuffer cmd, Handle<Texture> texture) {
 }
 
 bool cmd_set_pipeline(CommandBuffer cmd, Handle<Pipeline> pipeline) {
+    cmd->command_index++;
     auto* d = cmd->device;
     PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
     if (impl == nullptr) { return false; }
@@ -1434,6 +1464,7 @@ bool prepare_static_graphics(CommandBufferImpl* cb) {
 }
 
 void cmd_set_depth_stencil_state(CommandBuffer cmd, Handle<DepthStencilState> state) {
+    cmd->command_index++;
     auto* d = cmd->device;
     DepthStencilState* ds = d->depth_stencil_pool.try_get(state);
     if (ds == nullptr) {
@@ -1571,12 +1602,14 @@ static void push_graphics_ptrs(DeviceImpl* d, VkCommandBuffer buf, GpuPtr vertex
 }
 
 void cmd_dispatch(CommandBuffer cmd, GpuPtr dataGpu, const Dimension3D& gridDimensions) {
+    cmd->command_index++;
     if (!retain_buffer(cmd, dataGpu, 0, nullptr)) { return; }
     push_compute_ptr(cmd->device, cmd->buffer, dataGpu);
     vkCmdDispatch(cmd->buffer, gridDimensions.x, gridDimensions.y, gridDimensions.z);
 }
 
 void cmd_dispatch_indirect(CommandBuffer cmd, GpuPtr dataGpu, GpuPtr gridDimensionsGpu) {
+    cmd->command_index++;
     if (!retain_buffer(cmd, dataGpu, 0, nullptr)) { return; }
     BufferRange dim{};
     if (!retain_buffer(cmd, gridDimensionsGpu, sizeof(VkDispatchIndirectCommand), &dim)) { return; }
@@ -1630,6 +1663,7 @@ static VkImageView get_attachment_view(DeviceImpl* d, TextureImpl* t, uint16_t m
 }
 
 void cmd_begin_render_pass(CommandBuffer cmd, const RenderPassDesc& desc) {
+    cmd->command_index++;
     auto* d = cmd->device;
     // Vulkan requires pDepthAttachment and pStencilAttachment to reference
     // the same image view when both are set (a combined depth/stencil
@@ -1794,6 +1828,7 @@ void cmd_end_render_pass(CommandBuffer cmd) {
 
 void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
               uint32_t vertexCount, uint32_t instanceCount) {
+    cmd->command_index++;
     if (!prepare_static_graphics(cmd)) { return; }
     if (!retain_buffer(cmd, vertexDataGpu, 0, nullptr)) { return; }
     if (!retain_buffer(cmd, fragmentDataGpu, 0, nullptr)) { return; }
@@ -1802,6 +1837,7 @@ void cmd_draw(CommandBuffer cmd, GpuPtr vertexDataGpu, GpuPtr fragmentDataGpu,
 }
 
 void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInfo& args) {
+    cmd->command_index++;
     if (!prepare_static_graphics(cmd)) { return; }
     if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
     if (!retain_buffer(cmd, args.fragmentDataGpu, 0, nullptr)) { return; }
@@ -1824,6 +1860,7 @@ void cmd_draw_indexed_instanced(CommandBuffer cmd, const DrawIndexedInstancedInf
 }
 
 void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedIndirectInfo& args) {
+    cmd->command_index++;
     if (!prepare_static_graphics(cmd)) { return; }
     if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
     if (!retain_buffer(cmd, args.fragmentDataGpu, 0, nullptr)) { return; }
@@ -1847,6 +1884,7 @@ void cmd_draw_indexed_instanced_indirect(CommandBuffer cmd, const DrawIndexedInd
 }
 
 void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer cmd, const MultiDrawIndirectInfo& args) {
+    cmd->command_index++;
     if (!prepare_static_graphics(cmd)) { return; }
     if (!retain_buffer(cmd, args.vertexDataGpu, 0, nullptr)) { return; }
     if (!retain_buffer(cmd, args.pixelDataGpu, 0, nullptr)) { return; }
@@ -1877,6 +1915,7 @@ void cmd_draw_indexed_instanced_indirect_multi(CommandBuffer cmd, const MultiDra
 // --- Surface texture commands ----------------------------------------------------------
 
 void cmd_wait_for_surface_texture(CommandBuffer cmd) {
+    cmd->command_index++;
     cmd->wait_for_surface_texture = true;
     auto* d = cmd->device;
     const auto current_image = d->surface.swapchain_images[d->surface.current_image_idx];
@@ -1919,6 +1958,7 @@ void cmd_wait_for_surface_texture(CommandBuffer cmd) {
 }
 
 void cmd_signal_surface_texture(CommandBuffer cmd) {
+    cmd->command_index++;
     cmd->signal_surface_texture = true;
     auto* d = cmd->device;
     const auto current_image = d->surface.swapchain_images[d->surface.current_image_idx];

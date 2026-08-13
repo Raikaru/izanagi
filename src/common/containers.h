@@ -399,6 +399,11 @@ class SlotMap {
     // Public-handle-consuming paths MUST use this; operator[] is reserved
     // for internally trusted handles.
     T* try_get(Handle<T> h);
+    // Fallible access with failure classification for diagnostics: on
+    // failure `reason` receives a static string describing why the handle
+    // was rejected ("out of range", "slot not allocated", or "generation
+    // mismatch").
+    T* try_get_ex(Handle<T> h, const char** reason);
 
    private:
     static constexpr uint32_t kSmallSegmentsToSkip = 6;
@@ -672,6 +677,11 @@ bool SlotMap<T>::invalidate(Handle<T> h) {
 
 template <class T>
 T* SlotMap<T>::try_get(Handle<T> h) {
+    return try_get_ex(h, nullptr);
+}
+
+template <class T>
+T* SlotMap<T>::try_get_ex(Handle<T> h, const char** reason) {
     mutex_lock(&m_mutex);
     T* result = nullptr;
     const auto [idx, gen] = decompose_handle(h);
@@ -679,11 +689,20 @@ T* SlotMap<T>::try_get(Handle<T> h) {
     // a forged 32-bit index can address past the segment array.
     if (idx < capacity_for_segment_count(m_used_segments)) {
         Entry* entry = get(idx);
-        if (entry->next == kNotInFreelist && entry->gen == gen) { result = &entry->data; }
+        if (entry->next != kNotInFreelist) {
+            if (reason) { *reason = "slot not allocated"; }
+        } else if (entry->gen != gen) {
+            if (reason) { *reason = "generation mismatch"; }
+        } else {
+            result = &entry->data;
+        }
+    } else if (reason) {
+        *reason = "out of range";
     }
     mutex_unlock(&m_mutex);
     return result;
 }
+
 
 template <class T>
 typename SlotMap<T>::Entry* SlotMap<T>::get(uint32_t idx) {

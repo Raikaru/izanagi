@@ -82,18 +82,7 @@ static VkSpecializationInfo construct_specialization_info(
     };
 }
 
-// --- Formatted logging (arena-backed) ---------------------------------------------------
 
-static void log_fmt(DeviceImpl* d, LogLevel lvl, uint32_t line, const char* file, const char* fmt, ...) {
-    Arena* arena = get_thread_local_arena(d);
-    char*  buf   = static_cast<char*>(arena->alloc(256));
-    if (buf == nullptr) { return; }
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, 256, fmt, args);
-    va_end(args);
-    log_impl(d, lvl, Span<const char>(buf, strlen(buf)), line, Span<const char>(file, strlen(file)));
-}
 
 // --- Owned canonical keys ----------------------------------------------------------------
 // The key is a full copy of every input that reaches pipeline creation — shader
@@ -1220,8 +1209,14 @@ Handle<Pipeline> request_graphics_pipeline(Device                             de
 
 PipelineStatus get_pipeline_status(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
-    if (impl == nullptr) { return PipelineStatus::Failed; }
+    const char* why = nullptr;
+    PipelineImpl* impl = d->pipeline_pool.try_get_ex(handle_cast<PipelineImpl>(pipeline), &why);
+    if (impl == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "get_pipeline_status: invalid pipeline handle 0x%016llx (%s)",
+                (unsigned long long)pipeline.h, why ? why : "rejected");
+        return PipelineStatus::Failed;
+    }
     PipelineRecord* rec = impl->record;
     switch (rec->state.load(std::memory_order_acquire)) {
         case InternalPipelineState::Ready:  return PipelineStatus::Ready;
@@ -1264,8 +1259,14 @@ static bool wait_record_state(Rec* rec, uint64_t timeout_ms) {
 
 bool wait_pipeline(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
-    if (impl == nullptr) { return false; }
+    const char* why = nullptr;
+    PipelineImpl* impl = d->pipeline_pool.try_get_ex(handle_cast<PipelineImpl>(pipeline), &why);
+    if (impl == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "wait_pipeline: invalid pipeline handle 0x%016llx (%s)",
+                (unsigned long long)pipeline.h, why ? why : "rejected");
+        return false;
+    }
     PipelineRecord* rec = impl->record;
     const double t0 = monotonic_seconds();
 
@@ -1331,8 +1332,14 @@ static PipelineStatus record_status(const PipelineRecord* rec) {
 PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
                                       const GraphicsStateDesc& desc) {
     auto* d = reinterpret_cast<DeviceImpl*>(device);
-    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
-    if (impl == nullptr) { return PipelineStatus::Failed; }
+    const char* why = nullptr;
+    PipelineImpl* impl = d->pipeline_pool.try_get_ex(handle_cast<PipelineImpl>(pipeline), &why);
+    if (impl == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "request_graphics_state: invalid pipeline handle 0x%016llx (%s)",
+                (unsigned long long)pipeline.h, why ? why : "rejected");
+        return PipelineStatus::Failed;
+    }
     PipelineRecord* rec = impl->record;
     if (!d->dispatch.use_static_graphics_state ||
         rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -1342,8 +1349,14 @@ PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
     gs.front_face = desc.front_face;
     gs.cull       = desc.cull;
     if (desc.depth_stencil.h != 0) {
-        DepthStencilState* ds = d->depth_stencil_pool.try_get(desc.depth_stencil);
-        if (ds == nullptr) { return PipelineStatus::Failed; }
+        const char* why = nullptr;
+        DepthStencilState* ds = d->depth_stencil_pool.try_get_ex(desc.depth_stencil, &why);
+        if (ds == nullptr) {
+            log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                    "request_graphics_state: invalid depth-stencil handle 0x%016llx (%s)",
+                    (unsigned long long)desc.depth_stencil.h, why ? why : "rejected");
+            return PipelineStatus::Failed;
+        }
         apply_depth_stencil_to_shadow(ds->desc, gs);
     }
     if (is_default_baked_state(gs)) { return record_status(rec); }   // base IS the variant
@@ -1360,8 +1373,14 @@ PipelineStatus request_graphics_state(Device device, Handle<Pipeline> pipeline,
 bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const GraphicsStateDesc& desc,
                          uint64_t timeout_ms) {
     auto* d = reinterpret_cast<DeviceImpl*>(device);
-    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
-    if (impl == nullptr) { return false; }
+    const char* why = nullptr;
+    PipelineImpl* impl = d->pipeline_pool.try_get_ex(handle_cast<PipelineImpl>(pipeline), &why);
+    if (impl == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "wait_graphics_state: invalid pipeline handle 0x%016llx (%s)",
+                (unsigned long long)pipeline.h, why ? why : "rejected");
+        return false;
+    }
     PipelineRecord* rec = impl->record;
     if (!d->dispatch.use_static_graphics_state ||
         rec->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -1371,8 +1390,14 @@ bool wait_graphics_state(Device device, Handle<Pipeline> pipeline, const Graphic
     gs.front_face = desc.front_face;
     gs.cull       = desc.cull;
     if (desc.depth_stencil.h != 0) {
-        DepthStencilState* ds = d->depth_stencil_pool.try_get(desc.depth_stencil);
-        if (ds == nullptr) { return false; }
+        const char* why = nullptr;
+        DepthStencilState* ds = d->depth_stencil_pool.try_get_ex(desc.depth_stencil, &why);
+        if (ds == nullptr) {
+            log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                    "wait_graphics_state: invalid depth-stencil handle 0x%016llx (%s)",
+                    (unsigned long long)desc.depth_stencil.h, why ? why : "rejected");
+            return false;
+        }
         apply_depth_stencil_to_shadow(ds->desc, gs);
     }
     if (is_default_baked_state(gs)) { return wait_record_state(rec, timeout_ms); }
@@ -1441,9 +1466,12 @@ Handle<Pipeline> create_graphics_pipeline(Device                             dev
 
 void free(Device dev, Handle<Pipeline> pipeline) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    const char* why = nullptr;
+    PipelineImpl* impl = d->pipeline_pool.try_get_ex(handle_cast<PipelineImpl>(pipeline), &why);
     if (impl == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "free(pipeline): invalid or stale handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free(pipeline): invalid handle 0x%016llx (%s)",
+                (unsigned long long)pipeline.h, why ? why : "rejected");
         return;
     }
     PipelineRecord* rec = impl->record;
@@ -1456,9 +1484,12 @@ void free_after(Device dev, Handle<Pipeline> pipeline, Submission s) {
     QueueImpl* q = s.queue ? reinterpret_cast<QueueImpl*>(s.queue) : d->default_queue;
     if (q == nullptr) { return; }
     const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
-    PipelineImpl* impl = d->pipeline_pool.try_get(handle_cast<PipelineImpl>(pipeline));
+    const char* why = nullptr;
+    PipelineImpl* impl = d->pipeline_pool.try_get_ex(handle_cast<PipelineImpl>(pipeline), &why);
     if (impl == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "free_after(pipeline): invalid or stale handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free_after(pipeline): invalid handle 0x%016llx (%s)",
+                (unsigned long long)pipeline.h, why ? why : "rejected");
         return;
     }
     PipelineRecord* rec = impl->record;
@@ -1499,8 +1530,11 @@ Handle<DepthStencilState> create_depth_stencil_state(Device dev, const DepthSten
 
 void free_depth_stencil_state(Device dev, Handle<DepthStencilState> state) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    if (d->depth_stencil_pool.try_get(state) == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "free_depth_stencil_state: invalid or stale handle");
+    const char* why = nullptr;
+    if (d->depth_stencil_pool.try_get_ex(state, &why) == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free_depth_stencil_state: invalid handle 0x%016llx (%s)",
+                (unsigned long long)state.h, why ? why : "rejected");
         return;
     }
     d->depth_stencil_pool.erase(state);

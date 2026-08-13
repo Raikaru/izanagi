@@ -4,7 +4,7 @@
 
 #include "internal.h"
 
-#include <cstdio>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 
@@ -102,7 +102,18 @@ void log_vk_impl(DeviceImpl* d, VkResult res, Span<const char> msg, uint32_t lin
                         line, file, d->log_userdata);
     }
 }
-
+void log_fmt(DeviceImpl* d, LogLevel lvl, uint32_t line, const char* file, const char* fmt, ...) {
+    if (!d->log_callback || lvl > d->log_level) { return; }
+    Arena* arena = get_thread_local_arena(d);
+    if (arena == nullptr) { return; }
+    char* buf = static_cast<char*>(arena->alloc(256));
+    if (buf == nullptr) { return; }
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, 256, fmt, args);
+    va_end(args);
+    log_impl(d, lvl, Span<const char>(buf, strlen(buf)), line, Span<const char>(file, strlen(file)));
+}
 // --- Thread-local arena ----------------------------------------------------------------
 Arena* get_thread_local_arena(DeviceImpl* d) {
     auto state = reinterpret_cast<ThreadLocalState*>(tls_get_data(d->thread_local_key));
@@ -2013,9 +2024,12 @@ Handle<Semaphore> create_semaphore(Device dev, uint64_t init_value) {
 
 void wait_semaphore(Device dev, Handle<Semaphore> sema, uint64_t value) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    SemaphoreImpl* rec = d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(sema));
+    const char* why = nullptr;
+    SemaphoreImpl* rec = d->semaphore_pool.try_get_ex(handle_cast<SemaphoreImpl>(sema), &why);
     if (rec == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "wait_semaphore: invalid or stale semaphore handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "wait_semaphore: invalid handle 0x%016llx (%s)",
+                (unsigned long long)sema.h, why ? why : "rejected");
         return;
     }
     VkSemaphoreWaitInfo wait_info{
@@ -2031,8 +2045,11 @@ void wait_semaphore(Device dev, Handle<Semaphore> sema, uint64_t value) {
 
 void free(Device dev, Handle<Semaphore> sema) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    if (d->semaphore_pool.try_get(handle_cast<SemaphoreImpl>(sema)) == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "free(semaphore): invalid or stale handle");
+    const char* why = nullptr;
+    if (d->semaphore_pool.try_get_ex(handle_cast<SemaphoreImpl>(sema), &why) == nullptr) {
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free(semaphore): invalid handle 0x%016llx (%s)",
+                (unsigned long long)sema.h, why ? why : "rejected");
         return;
     }
     d->semaphore_pool.erase(handle_cast<SemaphoreImpl>(sema));

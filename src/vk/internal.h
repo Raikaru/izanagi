@@ -571,6 +571,9 @@ struct CommandBufferImpl {
     // Failed). cmd_finalize preserves the state; queue_submit rejects the
     // command buffer without submitting or advancing the timeline.
     bool        recording_failed = false;
+    // Command ordinal within this recording (reset at checkout); reported
+    // in deterministic failure messages to locate the failing cmd_* call.
+    uint32_t    command_index = 0;
     const char* fail_reason      = nullptr;
 
     // Logical graphics-state shadow (reset at recording start).
@@ -614,7 +617,7 @@ void   log_vk_impl(DeviceImpl* d, VkResult res, Span<const char> msg, uint32_t l
 BufferRange find_buffer_range(DeviceImpl* d, GpuPtr ptr, VkDeviceSize size);
 
 // Command pool management (commands.cpp)
-CommandPool*  get_command_pool(QueueImpl* queue);
+void   log_fmt(DeviceImpl* d, LogLevel lvl, uint32_t line, const char* file, const char* fmt, ...);
 CommandBuffer get_command_buffer(QueueImpl* q, CommandPool* pool);
 
 // Surface helpers (surface.cpp)

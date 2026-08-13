@@ -127,22 +127,25 @@ Shaders are compiled at build time by `slangc` to SPIR-V and loaded from
 `<exe_dir>/shaders/` — the executables are self-contained relative to their
 own directory (no CWD dependence).
 
-## Using Izanagi in your project
-
 **Option A — FetchContent** (simplest; pulls the source, builds the static lib):
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(izanagi
     GIT_REPOSITORY https://github.com/Raikaru/izanagi.git
-    GIT_TAG        main)
+    GIT_TAG        v0.1.0)   # pin a tag — never main (see docs/Stability.md)
 FetchContent_MakeAvailable(izanagi)
 
 target_link_libraries(your_app PRIVATE Izanagi::izanagi)
 ```
 
+Pin the newest tag from the [releases](https://github.com/Raikaru/izanagi/tags)
+page and read the `### Breaking` entries in [CHANGELOG.md](CHANGELOG.md)
+between your current tag and the new one when upgrading.
+
 As a subproject, `IZANAGI_BUILD_TESTS` and `IZANAGI_BUILD_EXAMPLES` default to
 OFF — only the library is built, and slangc is not downloaded.
+
 
 **Option B — install + find_package**:
 
@@ -227,16 +230,24 @@ slot generations, bitset bounds, enum bitwise operators.
 
 ```
 CMakeLists.txt / CMakePresets.json   build config + install/export rules
-cmake/                               CompileSlangShader.cmake, IzanagiConfig.cmake.in
+cmake/                               CompileSlangShader.cmake, IzanagiCompileShader.cmake, IzanagiConfig.cmake.in
 include/izanagi/gpu.h                full public API (Vulkan-free header)
 src/common/                          containers (Span, SlotMap, TwoLevelBitset)
 src/vk/                              Vulkan 1.4 backend
 shaders/izanagi.slang                shared prelude (heap access helpers)
 examples/                            three examples + win32 framework
 tests/                               headless API tests
-docs/Metal4Mapping.md                API → Metal 4 mapping (v2 backend design)
+docs/                                architecture, profiles, Stability.md, GettingStarted.md,
+                                     PortingFromVulkan.md, Metal4Mapping.md (v2 backend design)
 third_party/                         FetchContent deps (volk, VMA, Vulkan-Headers, slangc)
 ```
+
+New to the project? Start at
+[docs/GettingStarted.md](docs/GettingStarted.md), then the
+[porting map](docs/PortingFromVulkan.md). Consuming it from another
+project? Read [docs/Stability.md](docs/Stability.md) first. The
+[ROADMAP.md](ROADMAP.md) is public and honest; contributions follow
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Notes
 

@@ -417,9 +417,12 @@ void release_texture_ref(DeviceImpl* d, Handle<Texture> tex) {
     // the init-list removal under texture_init_lock: a concurrent submit can
     // claim a still-listed record in that gap, so the list must never hold a
     // pointer to a record whose refs reached zero.
-    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(tex));
+    const char* why = nullptr;
+    TextureImpl* rec = d->texture_pool.try_get_ex(handle_cast<TextureImpl>(tex), &why);
     if (rec == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "release_texture_ref: stale texture handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "release_texture_ref: stale texture handle 0x%016llx (%s)",
+                (unsigned long long)tex.h, why ? why : "rejected");
         return;
     }
     mutex_lock(&d->texture_init_lock);
@@ -440,9 +443,12 @@ void release_texture_ref(DeviceImpl* d, Handle<Texture> tex) {
 }
 void free(Device dev, Handle<Texture> t) {
     auto* d = reinterpret_cast<DeviceImpl*>(dev);
-    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(t));
+    const char* why = nullptr;
+    TextureImpl* rec = d->texture_pool.try_get_ex(handle_cast<TextureImpl>(t), &why);
     if (rec == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "free(texture): invalid or stale handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free(texture): invalid handle 0x%016llx (%s)",
+                (unsigned long long)t.h, why ? why : "rejected");
         return;
     }
     remove_uninitialized_texture(d, rec);
@@ -464,9 +470,12 @@ void free_after(Device dev, Handle<Texture> tex, Submission s) {
     const uint64_t value = s.status == SubmitStatus::Success ? s.value : q->timeline_value;
     // Invalidate the public handle immediately; the stable record survives
     // via the deferred user reference until the submission completes.
-    TextureImpl* rec = d->texture_pool.try_get(handle_cast<TextureImpl>(tex));
+    const char* why = nullptr;
+    TextureImpl* rec = d->texture_pool.try_get_ex(handle_cast<TextureImpl>(tex), &why);
     if (rec == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "free_after(texture): invalid or stale handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "free_after(texture): invalid handle 0x%016llx (%s)",
+                (unsigned long long)tex.h, why ? why : "rejected");
         return;
     }
     if (!d->texture_pool.invalidate(handle_cast<TextureImpl>(tex))) { return; }
@@ -528,9 +537,12 @@ static VkImageViewCreateInfo make_view_info(const TextureImpl& texture, const Te
 // native descriptor write fails.
 static TextureView desc_allocate_image_view(DeviceImpl* d, RetireKind kind, uint64_t type,
                                             const TextureViewDesc& desc) {
-    TextureImpl* owner = d->texture_pool.try_get(handle_cast<TextureImpl>(desc.texture));
+    const char* why = nullptr;
+    TextureImpl* owner = d->texture_pool.try_get_ex(handle_cast<TextureImpl>(desc.texture), &why);
     if (owner == nullptr) {
-        IZ_LOG(d, LogLevel::Error, "create_texture_view: invalid or stale texture handle");
+        log_fmt(d, LogLevel::Error, __LINE__, __FILE__,
+                "create_texture_view: invalid texture handle 0x%016llx (%s)",
+                (unsigned long long)desc.texture.h, why ? why : "rejected");
         return 0;
     }
     atomic_fetch_add(&owner->refs, 1);   // descriptor owns the texture until retirement
